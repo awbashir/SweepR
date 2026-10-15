@@ -5,10 +5,14 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default",
     {
       "identifier": "opener:allow-open-url",
-      "allow": [{ "url": "ssh://*" }, { "url": "telnet://*" }]
+      "allow": [
+        { "url": "http://*" },
+        { "url": "https://*" },
+        { "url": "ssh://*" },
+        { "url": "telnet://*" }
+      ]
     },
     "allow-list-interfaces",
     "allow-start-scan",

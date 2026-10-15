@@ -8,13 +8,17 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::{Arc, OnceLock},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, PoisonError,
+    },
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use directories::ProjectDirs;
 use tokio::{
     net::{TcpStream, UdpSocket},
@@ -24,12 +28,21 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    limits::{self, SocketBudget},
     models::{
         format_mac, now_ms, parse_mac, sanitize_override, sanitize_text, Device, DeviceOverride,
         DeviceRole, DiscoverySource, ScanConfig, ScanEvent, MAX_CONCURRENCY,
     },
     progress::ProgressScope,
 };
+
+/// Attempts for a socket operation that fails with `EMFILE` / `ENFILE` (with backoff).
+const FD_RETRIES: u32 = 6;
+
+/// Backoff before retry `attempt` after a descriptor-exhaustion error.
+fn fd_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(20u64 << attempt.min(6))
+}
 
 // ---------------------------------------------------------------------------------------------
 // Embedded IEEE OUI vendor database
@@ -203,38 +216,118 @@ pub fn parse_nbstat_response(resp: &[u8]) -> Option<NetbiosInfo> {
     (!info.is_empty()).then_some(info)
 }
 
-/// Send an NBSTAT query to `ip:137` and parse the reply within `timeout`.
-pub async fn netbios_query(ip: IpAddr, timeout: Duration) -> Option<NetbiosInfo> {
+/// `true` when `resp` is an NBSTAT *response* to the query with transaction id `txn`.
+pub fn nbstat_reply_matches(resp: &[u8], txn: u16) -> bool {
+    resp.len() >= 4 && resp[0..2] == txn.to_be_bytes() && resp[2] & 0x80 != 0
+}
+
+/// Send an NBSTAT query to `ip:137` and parse the reply within `timeout`. The socket is
+/// connected to the target (the kernel drops datagrams from anyone else) and replies whose
+/// transaction id does not match the query are ignored.
+pub async fn netbios_query(
+    ip: IpAddr,
+    timeout: Duration,
+    budget: &SocketBudget,
+) -> Option<NetbiosInfo> {
     let bind: SocketAddr = match ip {
         IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         IpAddr::V6(_) => return None, // NetBIOS name service is IPv4-only
     };
-    let sock = UdpSocket::bind(bind).await.ok()?;
-    let txn = (now_ms() as u16) ^ (std::process::id() as u16);
+    let _permit = budget.acquire().await?;
+    let sock = bind_udp(bind, "NetBIOS lookup").await?;
+    sock.connect(SocketAddr::new(ip, 137)).await.ok()?;
+    let txn = (now_ms() as u16) ^ (std::process::id() as u16) ^ nbstat_salt();
     let query = build_nbstat_query(txn);
-    sock.send_to(&query, SocketAddr::new(ip, 137)).await.ok()?;
+    sock.send(&query).await.ok()?;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = [0u8; 2048];
-    let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-    parse_nbstat_response(&buf[..n])
+    loop {
+        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        if nbstat_reply_matches(&buf[..n], txn) {
+            return parse_nbstat_response(&buf[..n]);
+        }
+        // Stale or forged datagram: keep waiting for the real reply until the deadline.
+    }
+}
+
+/// Per-query variation so concurrent lookups do not share transaction ids.
+fn nbstat_salt() -> u16 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    (SEQ.fetch_add(0x9e37, Ordering::Relaxed) & 0xffff) as u16
+}
+
+/// Bind a UDP socket, retrying with backoff when the process is out of descriptors.
+async fn bind_udp(addr: SocketAddr, context: &str) -> Option<UdpSocket> {
+    for attempt in 0..FD_RETRIES {
+        match UdpSocket::bind(addr).await {
+            Ok(sock) => return Some(sock),
+            Err(e) if limits::is_fd_exhausted(&e) => {
+                limits::warn_fd_exhausted_once(context);
+                tokio::time::sleep(fd_backoff(attempt)).await;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------------------------
 // DNS PTR
 // ---------------------------------------------------------------------------------------------
 
-/// Build a Tokio DNS resolver from the system configuration, falling back to Cloudflare's
-/// public resolver, with bounded per-query timeout and attempts.
+/// The `nameserver` addresses of a resolv.conf that parse as plain IP addresses. Scoped IPv6
+/// link-local entries (`fe80::1%en0`) cannot be expressed as an `IpAddr` and are skipped.
+pub fn resolv_conf_nameservers(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.split(['#', ';']).next()?.trim();
+            let mut parts = l.split_whitespace();
+            (parts.next()? == "nameserver")
+                .then(|| parts.next()?.parse::<IpAddr>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Build a Tokio DNS resolver from the system configuration with bounded per-query timeout
+/// and attempts.
+///
+/// When the system configuration cannot be parsed as a whole (hickory rejects, for example,
+/// a scoped link-local IPv6 `nameserver fe80::1%en0` line, which macOS writes routinely), the
+/// usable `nameserver` lines of `/etc/resolv.conf` are used instead. When there are none,
+/// returns `None`: PTR lookups for internal addresses are then skipped rather than sent to a
+/// public resolver, which could neither answer them nor be trusted with the scanned hosts.
 fn build_resolver(timeout: Duration, attempts: usize) -> Option<hickory_resolver::TokioResolver> {
-    use hickory_resolver::{config::ResolverConfig, net::runtime::TokioRuntimeProvider};
+    use hickory_resolver::{
+        config::{NameServerConfig, ResolverConfig},
+        net::runtime::TokioRuntimeProvider,
+    };
     let mut builder = match hickory_resolver::TokioResolver::builder_tokio() {
         Ok(b) => b,
-        Err(_) => hickory_resolver::TokioResolver::builder_with_config(
-            ResolverConfig::udp_and_tcp(&hickory_resolver::config::CLOUDFLARE),
-            TokioRuntimeProvider::default(),
-        ),
+        Err(e) => {
+            let servers = std::fs::read_to_string("/etc/resolv.conf")
+                .map(|t| resolv_conf_nameservers(&t))
+                .unwrap_or_default();
+            if servers.is_empty() {
+                tracing::debug!("cannot read the system DNS configuration: {e}");
+                return None;
+            }
+            tracing::debug!(
+                "system DNS configuration only partly readable ({e}); using {servers:?}"
+            );
+            hickory_resolver::TokioResolver::builder_with_config(
+                ResolverConfig::from_name_servers(
+                    servers
+                        .into_iter()
+                        .map(NameServerConfig::udp_and_tcp)
+                        .collect(),
+                ),
+                TokioRuntimeProvider::default(),
+            )
+        }
     };
     {
         let opts = builder.options_mut();
@@ -242,12 +335,24 @@ fn build_resolver(timeout: Duration, attempts: usize) -> Option<hickory_resolver
         opts.attempts = attempts;
         opts.use_hosts_file = hickory_resolver::config::ResolveHosts::Auto;
     }
-    builder.build().ok()
+    match builder.build() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::debug!("cannot build the system DNS resolver: {e}");
+            None
+        }
+    }
 }
 
-/// Reverse-resolve `ip` to a single PTR hostname (trailing dot stripped, sanitized).
-async fn dns_ptr(resolver: &hickory_resolver::TokioResolver, ip: IpAddr) -> Option<String> {
+/// Reverse-resolve `ip` to a single PTR hostname (trailing dot stripped, sanitized). Holds
+/// one socket permit for the lookup.
+async fn dns_ptr(
+    resolver: &hickory_resolver::TokioResolver,
+    ip: IpAddr,
+    budget: &SocketBudget,
+) -> Option<String> {
     use hickory_resolver::proto::rr::RData;
+    let _permit = budget.acquire().await?;
     let lookup = resolver.reverse_lookup(ip).await.ok()?;
     for record in lookup.answers() {
         if let RData::PTR(ptr) = &record.data {
@@ -325,18 +430,64 @@ pub fn mdns_discover_blocking(duration: Duration) -> HashMap<IpAddr, String> {
 /// Largest number of ports a single [`scan_ports`] call will probe (bounds GUI input).
 pub const MAX_SCAN_PORTS: usize = 65_535;
 
-/// TCP connect scan of `ports` on `ip` with at most `concurrency` connects in flight, each
-/// bounded by `per_timeout`. Returns the open ports, sorted. Banner-free.
+/// Result of a TCP connect scan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PortScan {
+    /// Ports that accepted a connection, sorted.
+    pub open: Vec<u16>,
+    /// Ports whose state could not be determined because the process kept running out of file
+    /// descriptors (`EMFILE` / `ENFILE`) even after retries. They are *not* closed.
+    pub unverified: Vec<u16>,
+}
+
+/// Sorted, de-duplicated, non-zero ports.
+pub fn dedupe_ports(ports: &[u16]) -> Vec<u16> {
+    let mut unique: Vec<u16> = ports.iter().copied().filter(|p| *p != 0).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    unique
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortState {
+    Open,
+    Closed,
+    Unverified,
+}
+
+/// One TCP connect probe holding a socket permit from `budget`. Descriptor exhaustion is
+/// retried with backoff and, if it persists, reported as [`PortState::Unverified`].
+async fn probe_port(addr: SocketAddr, timeout: Duration, budget: &SocketBudget) -> PortState {
+    for attempt in 0..FD_RETRIES {
+        let Some(permit) = budget.acquire().await else {
+            return PortState::Unverified;
+        };
+        // The connect timeout starts once we hold a permit, so queueing is not "closed".
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(_stream)) => return PortState::Open,
+            Ok(Err(e)) if limits::is_fd_exhausted(&e) => {
+                limits::warn_fd_exhausted_once("TCP port scan");
+                drop(permit);
+                tokio::time::sleep(fd_backoff(attempt)).await;
+            }
+            _ => return PortState::Closed,
+        }
+    }
+    PortState::Unverified
+}
+
+/// TCP connect scan of `ports` on `ip` with at most `concurrency` connects in flight for this
+/// call, every socket also drawing from the shared `budget`. Each connect is bounded by
+/// `per_timeout`. Banner-free.
 pub async fn scan_ports(
     ip: IpAddr,
     ports: &[u16],
     concurrency: usize,
     per_timeout: Duration,
     cancel: &CancellationToken,
-) -> Vec<u16> {
-    let mut unique: Vec<u16> = ports.iter().copied().filter(|p| *p != 0).collect();
-    unique.sort_unstable();
-    unique.dedup();
+    budget: &SocketBudget,
+) -> PortScan {
+    let mut unique = dedupe_ports(ports);
     unique.truncate(MAX_SCAN_PORTS);
 
     let semaphore = Arc::new(Semaphore::new(concurrency.clamp(1, MAX_CONCURRENCY)));
@@ -349,56 +500,109 @@ pub async fn scan_ports(
         let Ok(permit) = semaphore.clone().acquire_owned().await else {
             break;
         };
-        let cancel = cancel.clone();
+        let (cancel, budget) = (cancel.clone(), budget.clone());
         tasks.spawn(async move {
             let _permit = permit;
             tokio::select! {
-                _ = cancel.cancelled() => None,
-                res = tokio::time::timeout(timeout, TcpStream::connect(SocketAddr::new(ip, port))) => {
-                    matches!(res, Ok(Ok(_))).then_some(port)
-                }
+                _ = cancel.cancelled() => (port, PortState::Closed),
+                state = probe_port(SocketAddr::new(ip, port), timeout, &budget) => (port, state),
             }
         });
         while tasks.try_join_next().is_some() {}
     }
-    let mut open = Vec::new();
+    let mut out = PortScan::default();
     while let Some(res) = tasks.join_next().await {
-        if let Ok(Some(port)) = res {
-            open.push(port);
+        match res {
+            Ok((port, PortState::Open)) => out.open.push(port),
+            Ok((port, PortState::Unverified)) => out.unverified.push(port),
+            _ => {}
         }
     }
-    open.sort_unstable();
-    open
+    out.open.sort_unstable();
+    out.unverified.sort_unstable();
+    out
 }
 
 // ---------------------------------------------------------------------------------------------
 // Management-port fingerprint
 // ---------------------------------------------------------------------------------------------
 
-/// Best-effort role from the OUI vendor plus the set of open management ports, used only when
-/// no SNMP / CDP / LLDP evidence exists. Conservative: it only ever returns an infrastructure
+/// `true` when an OUI vendor name belongs to a maker of managed network equipment (switches,
+/// routers, firewalls, APs). Used to pick SNMP poll candidates, not to assign a role.
+pub fn is_network_vendor(vendor: &str) -> bool {
+    const VENDORS: &[&str] = &[
+        "cisco",
+        "meraki",
+        "juniper",
+        "aruba",
+        "hewlett packard enterprise",
+        "arista",
+        "extreme networks",
+        "brocade",
+        "ruckus",
+        "fortinet",
+        "palo alto",
+        "ubiquiti",
+        "mikrotik",
+        "routerboard",
+        "h3c",
+        "huawei",
+        "allied telesis",
+        "netgear",
+        "zyxel",
+        "d-link",
+        "tp-link",
+        "sonicwall",
+        "watchguard",
+        "sophos",
+        "edgecore",
+        "cambium",
+        "mellanox",
+        "dell emc networking",
+    ];
+    let v = vendor.to_ascii_lowercase();
+    VENDORS.iter().any(|n| v.contains(n))
+}
+
+/// Ports that mark a general-purpose host or a printer (SMB, RDP, VNC, AFP, NetBIOS session,
+/// raw/IPP/LPD printing). Their presence vetoes a "network gear" fingerprint.
+const HOST_PORTS: &[u16] = &[139, 445, 548, 3389, 5900, 515, 631, 9100];
+
+/// Best-effort role from the OUI vendor plus the set of open TCP ports, used only when no
+/// SNMP / CDP / LLDP evidence exists. Conservative: it only ever returns an infrastructure
 /// role on strong vendor + port evidence (never `Host`), so the [`Device::merge`] priority
 /// rules can never let it downgrade a better-sourced role.
+///
+/// The OUI alone is never enough: Fortinet's OUI also covers FortiSwitch / FortiAP / phones,
+/// Ubiquiti's covers UniFi switches, gateways, cameras and APs, and HP's covers printers.
 pub fn fingerprint_role(vendor: Option<&str>, open_ports: &[u16]) -> Option<DeviceRole> {
     let v = vendor?.to_ascii_lowercase();
     let has = |p: u16| open_ports.contains(&p);
+    if HOST_PORTS.iter().any(|p| has(*p)) {
+        return None;
+    }
 
-    if v.contains("fortinet") || v.contains("fortigate") || v.contains("palo alto") {
+    // FortiGate: the SSL-VPN / admin port 10443 is a FortiGate-only service (FortiSwitch and
+    // FortiAP expose plain 22/80/443).
+    if (v.contains("fortinet") || v.contains("fortigate")) && has(10443) {
         return Some(DeviceRole::Firewall);
     }
-    if (v.contains("mikrotik") || v.contains("routerboard")) && (has(8291) || has(8728) || has(80))
-    {
+    // Palo Alto Networks hardware is firewalls; still require its management plane.
+    if v.contains("palo alto") && (has(443) || has(22)) {
+        return Some(DeviceRole::Firewall);
+    }
+    // MikroTik Winbox (8291) / RouterOS API (8728) only run on RouterOS devices.
+    if (v.contains("mikrotik") || v.contains("routerboard")) && (has(8291) || has(8728)) {
         return Some(DeviceRole::Router);
     }
-    if v.contains("ubiquiti") && (has(443) || has(8443)) {
-        return Some(DeviceRole::AccessPoint);
-    }
+    // Vendors whose OUIs are (almost) only network gear: CLI management (SSH / Telnet).
+    // Generic HP / HPE OUIs are left out: they also cover printers and ProLiant iLO.
     let networking = v.contains("aruba")
-        || v.contains("hewlett")
-        || v.contains("hpe")
         || v.contains("juniper")
-        || v.contains("cisco");
-    if networking && has(161) && (has(22) || has(23) || has(443)) {
+        || v.contains("cisco")
+        || v.contains("arista")
+        || v.contains("extreme networks");
+    if networking && (has(22) || has(23)) {
         return Some(DeviceRole::Switch);
     }
     None
@@ -415,6 +619,8 @@ pub fn fingerprint_role(vendor: Option<&str>, open_ports: &[u16]) -> Option<Devi
 ///
 /// Each emitted [`Device`] carries the original `ip` + `vlanId` so the aggregator upserts it
 /// onto the right row by [`Device::key`]. One unit of `progress` is counted per device.
+/// Every socket (TCP connect, NetBIOS, DNS) draws from the process-wide
+/// [`SocketBudget::global`].
 pub async fn enrich_devices(
     devices: Vec<Device>,
     cfg: &ScanConfig,
@@ -422,14 +628,35 @@ pub async fn enrich_devices(
     cancel: CancellationToken,
     progress: ProgressScope,
 ) {
+    enrich_devices_with(devices, cfg, tx, cancel, progress, SocketBudget::global()).await;
+}
+
+/// [`enrich_devices`] with an explicit socket budget (tests use a deliberately small one).
+pub async fn enrich_devices_with(
+    devices: Vec<Device>,
+    cfg: &ScanConfig,
+    tx: Sender<ScanEvent>,
+    cancel: CancellationToken,
+    progress: ProgressScope,
+    budget: &SocketBudget,
+) {
     let resolve = cfg.resolve_names;
-    let ports = cfg.ports.clone();
+    let ports = Arc::new(dedupe_ports(&cfg.ports));
     let name_timeout = Duration::from_millis(cfg.timeout_ms.clamp(200, 5_000));
     let connect_timeout = Duration::from_millis(cfg.timeout_ms.clamp(100, 5_000));
 
     // Shared, built once: the DNS resolver and the mDNS host map.
     let resolver = if resolve {
-        build_resolver(name_timeout, 2).map(Arc::new)
+        let r = build_resolver(name_timeout, 2).map(Arc::new);
+        if r.is_none() {
+            let _ = tx
+                .send(ScanEvent::warn(
+                    "DNS PTR lookups skipped: the system resolver configuration could not be \
+                     read",
+                ))
+                .await;
+        }
+        r
     } else {
         None
     };
@@ -444,7 +671,9 @@ pub async fn enrich_devices(
     };
     let mdns = Arc::new(mdns);
 
+    // Devices enriched concurrently; the sockets they open are bounded by `budget`.
     let semaphore = Arc::new(Semaphore::new(cfg.concurrency.clamp(1, 256)));
+    let unverified = Arc::new(AtomicUsize::new(0));
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     for device in devices {
@@ -454,7 +683,12 @@ pub async fn enrich_devices(
         let Ok(permit) = semaphore.clone().acquire_owned().await else {
             break;
         };
-        let (tx, cancel) = (tx.clone(), cancel.clone());
+        let (tx, cancel, budget, unverified) = (
+            tx.clone(),
+            cancel.clone(),
+            budget.clone(),
+            unverified.clone(),
+        );
         let (resolver, mdns, ports, progress) = (
             resolver.clone(),
             mdns.clone(),
@@ -467,18 +701,21 @@ pub async fn enrich_devices(
                 progress.add(1);
                 return;
             }
-            if let Some(update) = enrich_one(
-                &device,
+            let ctx = EnrichCtx {
                 resolve,
-                resolver.as_deref(),
-                &mdns,
-                &ports,
+                resolver: resolver.as_deref(),
+                mdns: &mdns,
+                ports: &ports,
                 connect_timeout,
                 name_timeout,
-                &cancel,
-            )
-            .await
-            {
+                cancel: &cancel,
+                budget: &budget,
+            };
+            let (update, missed) = enrich_one(&device, &ctx).await;
+            if missed > 0 {
+                unverified.fetch_add(missed, Ordering::Relaxed);
+            }
+            if let Some(update) = update {
                 let _ = tx.send(ScanEvent::device(update)).await;
             }
             progress.add(1);
@@ -486,25 +723,42 @@ pub async fn enrich_devices(
         while tasks.try_join_next().is_some() {}
     }
     while tasks.join_next().await.is_some() {}
+
+    let missed = unverified.load(Ordering::Relaxed);
+    if missed > 0 {
+        let _ = tx
+            .send(ScanEvent::warn(format!(
+                "{missed} TCP port probe(s) could not be completed because the process ran out \
+                 of file descriptors; those ports are unknown, not closed (raise `ulimit -n`)"
+            )))
+            .await;
+    }
 }
 
-/// Enrich one device; returns a sparse [`Device`] (same key) carrying only new data, or `None`
-/// when nothing was learned.
-#[allow(clippy::too_many_arguments)]
-async fn enrich_one(
-    device: &Device,
+/// Shared, per-pass settings for [`enrich_one`].
+struct EnrichCtx<'a> {
     resolve: bool,
-    resolver: Option<&hickory_resolver::TokioResolver>,
-    mdns: &HashMap<IpAddr, String>,
-    ports: &[u16],
+    resolver: Option<&'a hickory_resolver::TokioResolver>,
+    mdns: &'a HashMap<IpAddr, String>,
+    ports: &'a [u16],
     connect_timeout: Duration,
     name_timeout: Duration,
-    cancel: &CancellationToken,
-) -> Option<Device> {
+    cancel: &'a CancellationToken,
+    budget: &'a SocketBudget,
+}
+
+/// Concurrent connects per device during enrichment (the global budget caps the total).
+const PORTS_PER_DEVICE: usize = 64;
+
+/// Enrich one device; returns a sparse [`Device`] (same key) carrying only new data, or `None`
+/// when nothing was learned, plus the number of ports that could not be verified.
+async fn enrich_one(device: &Device, ctx: &EnrichCtx<'_>) -> (Option<Device>, usize) {
+    let cancel = ctx.cancel;
     let mut update = Device::new(device.ip);
     update.vlan_id = device.vlan_id;
     update.sources.clear();
     let mut changed = false;
+    let mut missed = 0;
 
     // Vendor from the MAC (local, always when a usable MAC exists and none is set yet).
     if device.vendor.is_none() {
@@ -514,12 +768,12 @@ async fn enrich_one(
         }
     }
 
-    if resolve && !cancel.is_cancelled() {
+    if ctx.resolve && !cancel.is_cancelled() {
         // DNS PTR on the primary IP and any extra IPs until one resolves.
         if device.dns_name.is_none() {
-            if let Some(resolver) = resolver {
+            if let Some(resolver) = ctx.resolver {
                 for ip in std::iter::once(device.ip).chain(device.extra_ips.iter().copied()) {
-                    if let Some(name) = dns_ptr(resolver, ip).await {
+                    if let Some(name) = dns_ptr(resolver, ip, ctx.budget).await {
                         update.dns_name = Some(name);
                         update.add_source(DiscoverySource::Dns);
                         changed = true;
@@ -532,7 +786,7 @@ async fn enrich_one(
         if device.mdns_name.is_none() {
             let hit = std::iter::once(&device.ip)
                 .chain(&device.extra_ips)
-                .find_map(|ip| mdns.get(ip).cloned());
+                .find_map(|ip| ctx.mdns.get(ip).cloned());
             if let Some(name) = hit {
                 update.mdns_name = Some(name);
                 update.add_source(DiscoverySource::Mdns);
@@ -541,7 +795,7 @@ async fn enrich_one(
         }
         // NetBIOS node status (IPv4 only).
         if device.smb_name.is_none() && device.ip.is_ipv4() && !cancel.is_cancelled() {
-            if let Some(nb) = netbios_query(device.ip, name_timeout).await {
+            if let Some(nb) = netbios_query(device.ip, ctx.name_timeout, ctx.budget).await {
                 if nb.name.is_some() || nb.workgroup.is_some() {
                     update.smb_name = nb.name;
                     update.smb_domain = nb.workgroup;
@@ -556,24 +810,35 @@ async fn enrich_one(
     }
 
     // TCP connect scan + no-SNMP management-port fingerprint.
-    if !ports.is_empty() && !cancel.is_cancelled() {
-        let open = scan_ports(device.ip, ports, 64, connect_timeout, cancel).await;
-        if !open.is_empty() {
-            update.open_ports = open;
+    if !ctx.ports.is_empty() && !cancel.is_cancelled() {
+        let scan = scan_ports(
+            device.ip,
+            ctx.ports,
+            PORTS_PER_DEVICE,
+            ctx.connect_timeout,
+            cancel,
+            ctx.budget,
+        )
+        .await;
+        missed = scan.unverified.len();
+        if !scan.open.is_empty() {
+            update.open_ports = scan.open;
             update.add_source(DiscoverySource::Tcp);
             changed = true;
         }
         // Only fingerprint when the device has no stronger role yet (still a plain Host).
         if device.role == DeviceRole::Host {
             let vendor = update.vendor.as_deref().or(device.vendor.as_deref());
-            if let Some(role) = fingerprint_role(vendor, &update.open_ports) {
+            let mut all_open = device.open_ports.clone();
+            all_open.extend(&update.open_ports);
+            if let Some(role) = fingerprint_role(vendor, &all_open) {
                 update.role = role;
                 changed = true;
             }
         }
     }
 
-    changed.then_some(update)
+    (changed.then_some(update), missed)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -585,27 +850,50 @@ async fn enrich_one(
 const MAX_OVERRIDE_ENTRIES: usize = 10_000;
 const MAX_OVERRIDE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Serializes every load-modify-write of the store within this process (GUI commands run on
+/// a thread pool, so two saves can race).
+static OVERRIDES_LOCK: Mutex<()> = Mutex::new(());
+/// Distinguishes temp files of concurrent writers.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Path of the local overrides store (`<data-dir>/overrides.json`).
 pub fn overrides_path() -> Option<PathBuf> {
     ProjectDirs::from("com", "SweepR", "SweepR").map(|d| d.data_dir().join("overrides.json"))
 }
 
-/// Load the device-override store. Missing / unreadable / oversized / corrupt files yield an
-/// empty map rather than an error, so a bad file never blocks a scan.
-pub fn load_overrides() -> HashMap<String, DeviceOverride> {
-    let Some(path) = overrides_path() else {
-        return HashMap::new();
+/// Why the store could not be read.
+#[derive(Debug)]
+enum StoreError {
+    /// The file exists but is not a usable store (unparsable, too large, not a file).
+    Corrupt(String),
+    /// I/O failure (permissions, ...): the file is left alone.
+    Io(anyhow::Error),
+}
+
+/// Read and re-sanitize the store at `path`. A missing file is an empty store.
+fn read_store(path: &Path) -> Result<HashMap<String, DeviceOverride>, StoreError> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => {
+            return Err(StoreError::Io(
+                anyhow::Error::from(e).context(format!("cannot read {}", path.display())),
+            ))
+        }
     };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return HashMap::new();
-    };
-    if !meta.is_file() || meta.len() > MAX_OVERRIDE_FILE_BYTES {
-        return HashMap::new();
+    if !meta.is_file() {
+        return Err(StoreError::Corrupt("not a regular file".into()));
     }
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    let mut map: HashMap<String, DeviceOverride> = serde_json::from_str(&text).unwrap_or_default();
+    if meta.len() > MAX_OVERRIDE_FILE_BYTES {
+        return Err(StoreError::Corrupt(format!(
+            "larger than {MAX_OVERRIDE_FILE_BYTES} bytes"
+        )));
+    }
+    let bytes = std::fs::read(path).map_err(|e| {
+        StoreError::Io(anyhow::Error::from(e).context(format!("cannot read {}", path.display())))
+    })?;
+    let mut map: HashMap<String, DeviceOverride> =
+        serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     // Re-sanitize on load (the file could have been hand-edited).
     map.retain(|k, _| !k.is_empty());
     for ov in map.values_mut() {
@@ -621,12 +909,62 @@ pub fn load_overrides() -> HashMap<String, DeviceOverride> {
             map.remove(&k);
         }
     }
-    map
+    Ok(map)
 }
 
-/// Insert / update / clear one override, then persist atomically (temp file + rename). A
-/// cleared override (both fields empty) is removed. Returns the full, updated map.
+/// Load the store at `path`, failing (without touching the file) when it is unreadable or
+/// corrupt. A missing file is an empty store.
+pub fn load_overrides_from(path: &Path) -> Result<HashMap<String, DeviceOverride>> {
+    let _guard = OVERRIDES_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    read_store(path).map_err(|e| match e {
+        StoreError::Corrupt(reason) => anyhow!(
+            "{} is not a valid overrides store ({reason}); it is left untouched",
+            path.display()
+        ),
+        StoreError::Io(e) => e,
+    })
+}
+
+/// Load the device-override store, reporting unreadable / corrupt files as errors (the GUI's
+/// `load_overrides` command). A missing file or data directory is an empty store.
+pub fn load_overrides_strict() -> Result<HashMap<String, DeviceOverride>> {
+    match overrides_path() {
+        Some(path) => load_overrides_from(&path),
+        None => Ok(HashMap::new()),
+    }
+}
+
+/// Load the device-override store for a scan. Missing / unreadable / oversized / corrupt
+/// files yield an empty map (logged), so a bad file never blocks a scan.
+pub fn load_overrides() -> HashMap<String, DeviceOverride> {
+    load_overrides_strict().unwrap_or_else(|e| {
+        tracing::warn!("ignoring device overrides: {e:#}");
+        HashMap::new()
+    })
+}
+
+/// Insert / update / clear one override in the default store. See [`save_override_at`].
 pub fn save_override(
+    key: String,
+    hostname: Option<String>,
+    comments: Option<String>,
+) -> Result<HashMap<String, DeviceOverride>> {
+    let path = overrides_path().ok_or_else(|| anyhow!("no application data directory"))?;
+    save_override_at(&path, key, hostname, comments)
+}
+
+/// Insert / update / clear one override in the store at `path`, then persist it durably
+/// (unique temp file, fsync, rename, directory fsync). A cleared override (both fields empty)
+/// is removed. The whole load-modify-write runs under a process-wide lock, so concurrent saves
+/// never lose each other's entries.
+///
+/// A store that exists but cannot be parsed is never silently replaced: it is moved aside to
+/// `<name>.corrupt-<unix-ms>` and the save fails with an error naming the backup (retrying
+/// then starts a fresh store). Returns the full, updated map.
+pub fn save_override_at(
+    path: &Path,
     key: String,
     hostname: Option<String>,
     comments: Option<String>,
@@ -635,7 +973,22 @@ pub fn save_override(
     if key.is_empty() {
         return Err(anyhow!("empty device key"));
     }
-    let mut map = load_overrides();
+    let _guard = OVERRIDES_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut map = match read_store(path) {
+        Ok(map) => map,
+        Err(StoreError::Io(e)) => return Err(e),
+        Err(StoreError::Corrupt(reason)) => {
+            let backup = backup_corrupt_store(path)?;
+            bail!(
+                "the overrides store {} could not be read ({reason}); it was moved to {} and \
+                 nothing was saved. Retry to start a new store.",
+                path.display(),
+                backup.display()
+            );
+        }
+    };
     match DeviceOverride::sanitized(hostname, comments) {
         Some(ov) => {
             if map.len() >= MAX_OVERRIDE_ENTRIES && !map.contains_key(&key) {
@@ -649,19 +1002,78 @@ pub fn save_override(
             map.remove(&key);
         }
     }
-    write_overrides(&map)?;
+    write_store(path, &map)?;
     Ok(map)
 }
 
-fn write_overrides(map: &HashMap<String, DeviceOverride>) -> Result<()> {
-    let path = overrides_path().ok_or_else(|| anyhow!("no application data directory"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+/// Move a corrupt store aside (`<name>.corrupt-<unix-ms>[-n]`); returns the backup path.
+fn backup_corrupt_store(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "overrides.json".into());
+    let stamp = now_ms();
+    for n in 0..100u32 {
+        let suffix = if n == 0 {
+            format!("{name}.corrupt-{stamp}")
+        } else {
+            format!("{name}.corrupt-{stamp}-{n}")
+        };
+        let backup = path.with_file_name(suffix);
+        if std::fs::symlink_metadata(&backup).is_ok() {
+            continue;
+        }
+        std::fs::rename(path, &backup).with_context(|| {
+            format!(
+                "cannot move the corrupt store {} aside to {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+        tracing::warn!("corrupt overrides store moved to {}", backup.display());
+        return Ok(backup);
     }
+    bail!("cannot find a free backup name for {}", path.display())
+}
+
+/// Atomically replace the store: write a uniquely named temp file (`create_new`), fsync it,
+/// rename it over the store, then fsync the directory (best effort).
+fn write_store(path: &Path, map: &HashMap<String, DeviceOverride>) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let json = serde_json::to_vec_pretty(map).context("serialize overrides")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json).with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "overrides.json".into());
+    let tmp = dir.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| -> Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("cannot create {}", tmp.display()))?;
+        f.write_all(&json)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("cannot sync {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written?;
+    // Make the rename itself durable (best effort; not every platform/filesystem supports it).
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -729,10 +1141,21 @@ mod tests {
 
     #[test]
     fn ma_s_assignment_wins_over_parent() {
-        // 00:55:DA is a MA-M/MA-S parent block delegated to small assignees; a full MAC under
-        // 0055DA1 must resolve to the /36 assignee, not a /24 owner.
-        let v = vendor_for_mac("00:55:da:10:00:00");
-        assert!(v.is_some());
+        // 00:55:DA is an MA-L block held by the IEEE Registration Authority and delegated in
+        // MA-M (/28) pieces: 0055DA1 belongs to KoolPOS, not to the /24 holder.
+        assert_eq!(
+            vendor_for_mac("00:55:da:10:00:00").as_deref(),
+            Some("KoolPOS Inc.")
+        );
+        // 00:1B:C5 is delegated in MA-S (/36) pieces: 001BC5001 is OpenRB.com.
+        assert_eq!(
+            vendor_for_mac("00:1b:c5:00:10:00").as_deref(),
+            Some("OpenRB.com, Direct SIA")
+        );
+        assert_eq!(
+            vendor_for_mac("00:1b:c5:00:00:00").as_deref(),
+            Some("Converging Systems Inc.")
+        );
     }
 
     #[test]
@@ -813,21 +1236,47 @@ mod tests {
 
     #[test]
     fn fingerprint_is_conservative() {
+        // FortiGate: the FortiGate-only SSL-VPN/admin port is required.
         assert_eq!(
             fingerprint_role(Some("Fortinet, Inc."), &[443, 10443]),
             Some(DeviceRole::Firewall)
         );
+        // A Fortinet MAC alone, or FortiSwitch / FortiAP management ports, is not a firewall.
+        assert_eq!(fingerprint_role(Some("Fortinet, Inc."), &[]), None);
+        assert_eq!(fingerprint_role(Some("Fortinet, Inc."), &[22, 443]), None); // FortiSwitch
+        assert_eq!(fingerprint_role(Some("Fortinet, Inc."), &[80, 443]), None); // FortiAP
         assert_eq!(
             fingerprint_role(Some("Routerboard.com"), &[8291, 80]),
             Some(DeviceRole::Router)
         );
+        // SwOS switches only serve HTTP: not enough for "router".
+        assert_eq!(fingerprint_role(Some("Routerboard.com"), &[80]), None);
+        // Ubiquiti's OUI covers UniFi switches, gateways and cameras as well as APs.
+        assert_eq!(fingerprint_role(Some("Ubiquiti Inc"), &[443]), None);
+        assert_eq!(fingerprint_role(Some("Ubiquiti Inc"), &[22, 443]), None); // UniFi switch
         assert_eq!(
-            fingerprint_role(Some("Ubiquiti Inc"), &[443]),
-            Some(DeviceRole::AccessPoint)
+            fingerprint_role(Some("Cisco Systems, Inc"), &[22]),
+            Some(DeviceRole::Switch)
         );
         assert_eq!(
-            fingerprint_role(Some("Cisco Systems, Inc"), &[22, 161]),
+            fingerprint_role(Some("Juniper Networks"), &[23, 80]),
             Some(DeviceRole::Switch)
+        );
+        // SNMP is UDP: a TCP/161 result means nothing and is not required any more.
+        assert_eq!(fingerprint_role(Some("Cisco Systems, Inc"), &[161]), None);
+        // HP printers (JetDirect exposes telnet) are never network gear.
+        assert_eq!(
+            fingerprint_role(Some("HP Inc."), &[23, 80, 443, 9100]),
+            None
+        );
+        assert_eq!(
+            fingerprint_role(Some("Hewlett Packard"), &[22, 23, 80, 515, 631]),
+            None
+        );
+        // Host ports veto a network-gear guess (e.g. a Cisco UCS / Windows box).
+        assert_eq!(
+            fingerprint_role(Some("Cisco Systems, Inc"), &[22, 445]),
+            None
         );
         // Not enough evidence: no vendor, or no ports => leave it to better sources.
         assert_eq!(fingerprint_role(None, &[22, 443, 161]), None);
@@ -841,18 +1290,117 @@ mod tests {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
-        let open = scan_ports(
+        let res = scan_ports(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            &[port, port.wrapping_add(1).max(1)],
+            &[port, port, 0, port.wrapping_add(1).max(1)],
             16,
             Duration::from_millis(500),
             &CancellationToken::new(),
+            &SocketBudget::new(4),
         )
         .await;
         assert!(
-            open.contains(&port),
-            "expected {port} to be open, got {open:?}"
+            res.open.contains(&port),
+            "expected {port} to be open, got {res:?}"
         );
+        assert_eq!(res.open.iter().filter(|p| **p == port).count(), 1);
+        assert!(res.unverified.is_empty());
+        assert_eq!(dedupe_ports(&[443, 0, 22, 443]), vec![22, 443]);
+    }
+
+    /// Regression (H2): hundreds of devices x many ports used to open ~2300 sockets at once,
+    /// exceeding macOS's default RLIMIT_NOFILE of 256; connects then failed with EMFILE and
+    /// were reported as closed. With every socket drawing from one small budget, every
+    /// device must still see the listener as open, whatever `ulimit -n` is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enrichment_finds_open_ports_under_a_tight_socket_budget() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    drop(s);
+                }
+            }
+        });
+        let n: u16 = 300;
+        let devices: Vec<Device> = (1..=n)
+            .map(|v| {
+                let mut d = Device::new(IpAddr::V4(Ipv4Addr::LOCALHOST));
+                d.vlan_id = Some(v);
+                d
+            })
+            .collect();
+        let cfg = ScanConfig {
+            resolve_names: false,
+            ports: vec![port, 22, 23, 80, 443, 445, 8291, 8443, 10443],
+            ..ScanConfig::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10_000);
+        let budget = SocketBudget::new(8);
+        enrich_devices_with(
+            devices,
+            &cfg,
+            tx,
+            CancellationToken::new(),
+            ProgressScope::detached(u64::from(n)),
+            &budget,
+        )
+        .await;
+        accept.abort();
+        let mut found = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let ScanEvent::Device(d) = ev {
+                if d.open_ports.contains(&port) {
+                    found += 1;
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            usize::from(n),
+            "every device must report the open port"
+        );
+    }
+
+    #[test]
+    fn resolv_conf_nameservers_skip_unusable_lines() {
+        let conf = "# macOS\nnameserver fe80::8cec:7bff:fe28:7e64%en0\nnameserver 172.20.10.1\n\
+                    nameserver 2001:db8::53 # comment\nsearch corp.example\nnameserver\n";
+        assert_eq!(
+            resolv_conf_nameservers(conf),
+            vec![
+                "172.20.10.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::53".parse().unwrap()
+            ]
+        );
+        assert!(resolv_conf_nameservers("").is_empty());
+    }
+
+    #[test]
+    fn nbstat_replies_must_match_the_query() {
+        let resp = nbstat_response(&[("HOST", 0x00, false)], [0, 1, 2, 3, 4, 5]);
+        assert!(nbstat_reply_matches(&resp, 0x1234));
+        assert!(!nbstat_reply_matches(&resp, 0x1235)); // wrong transaction id
+        let mut query_echo = resp.clone();
+        query_echo[2] = 0x00; // not a response
+        assert!(!nbstat_reply_matches(&query_echo, 0x1234));
+        assert!(!nbstat_reply_matches(&[0x12], 0x1234));
+    }
+
+    #[tokio::test]
+    async fn netbios_query_fails_cleanly_without_a_responder() {
+        // Nothing listens on 127.0.0.1:137: the connected socket gets an ICMP error or times
+        // out, and the lookup yields nothing instead of hanging.
+        let res = netbios_query(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Duration::from_millis(200),
+            &SocketBudget::new(1),
+        )
+        .await;
+        assert!(res.is_none());
     }
 
     #[test]
@@ -863,6 +1411,83 @@ mod tests {
                 .unwrap();
         assert_eq!(ov.hostname.as_deref(), Some("lab-switch[2J"));
         assert_eq!(ov.comments.as_deref(), Some("rack 4"));
+    }
+
+    fn temp_store(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "sweepr-overrides-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("overrides.json")
+    }
+
+    /// Regression (H3): concurrent saves used to share one temp path and race the
+    /// load-modify-write, losing entries. Every distinct key must survive.
+    #[test]
+    fn concurrent_saves_keep_every_entry() {
+        let path = temp_store("concurrent");
+        let n = 32;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    save_override_at(&path, format!("10.0.0.{i}"), Some(format!("h{i}")), None)
+                        .map(|_| ())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        let map = load_overrides_from(&path).unwrap();
+        assert_eq!(map.len(), n);
+        for i in 0..n {
+            assert_eq!(
+                map[&format!("10.0.0.{i}")].hostname.as_deref(),
+                Some(format!("h{i}").as_str())
+            );
+        }
+        // No temp files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // Clearing both fields removes the entry.
+        let map = save_override_at(&path, "10.0.0.0".into(), None, Some("  ".into())).unwrap();
+        assert!(!map.contains_key("10.0.0.0"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn corrupt_store_is_backed_up_not_overwritten() {
+        let path = temp_store("corrupt");
+        std::fs::write(&path, b"{ not json").unwrap();
+        // Loading reports the problem and leaves the file alone.
+        assert!(load_overrides_from(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        // Saving moves it aside and fails loudly instead of replacing it with one entry.
+        let err = save_override_at(&path, "10.0.0.1".into(), Some("x".into()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("corrupt-"), "{err}");
+        let backups: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.to_string_lossy().contains("overrides.json.corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{ not json");
+        // A retry starts a fresh store.
+        let map = save_override_at(&path, "10.0.0.1".into(), Some("x".into()), None).unwrap();
+        assert_eq!(map.len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

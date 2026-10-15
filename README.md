@@ -45,13 +45,28 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
 - **Enrichment**: after discovery, resolved hosts are enriched: the IEEE OUI database
   (embedded) names the vendor, DNS PTR / mDNS / NetBIOS fill host names, a bounded TCP
   connect scan (`-p`) lists open ports, and a management-port fingerprint classifies gear
-  when nothing better is known. Name resolution is on by default (`--no-resolve` disables
-  it).
-- **SNMP** (`--snmp-community`, or the `sweepr snmp <IP>` subcommand): polls the system MIB,
-  VLAN tables (Q-BRIDGE and Cisco VTP) and the bridge / CAM tables (v1 GETNEXT, v2c/v3
-  GETBULK) to classify infrastructure by role and map endpoint MACs to named switch ports
-  (`Gi1/0/24`). Walks are bounded (row caps, per-device deadline, end-of-MIB / loop
-  detection) so a hostile agent cannot hang or exhaust memory.
+  when nothing better is known (it needs vendor *and* port evidence, e.g. a Fortinet MAC
+  is only a firewall with the FortiGate-only port 10443 open). Name resolution is on by
+  default (`--no-resolve` disables it). PTR lookups use the system resolver only; if its
+  configuration cannot be read they are skipped (never sent to a public resolver).
+  All enrichment and SNMP sockets share one process-wide budget sized from the open-file
+  limit, which SweepR raises at startup toward `min(hard limit, 10240)` (macOS defaults to
+  256). A connect that still fails with "too many open files" is retried and, if it keeps
+  failing, reported as unknown — never as closed.
+- **SNMP** (`--snmp-community` / `--snmp-version` / `--snmp-user`, or the
+  `sweepr snmp <IP>` subcommand): polls the system MIB, VLAN tables (Q-BRIDGE and Cisco
+  VTP) and the bridge / CAM tables (v1 GETNEXT, v2c/v3 GETBULK) to classify infrastructure
+  by role and map endpoint MACs to named switch ports (`Gi1/0/24`). During a scan only
+  likely infrastructure is polled (the default gateway, CDP/LLDP neighbors' management
+  addresses, devices already classified as infrastructure, network-vendor MACs and hosts
+  with TCP 22/23/80/443/8291 open) unless `--snmp-all` is given; each host first gets a
+  short reachability probe, and a summary line reports how many hosts answered, timed out
+  or failed authentication. Walks are bounded (row and byte caps, at most 50,000 MAC
+  entries per device, per-device deadline, end-of-MIB / loop detection) so a hostile agent
+  cannot hang or exhaust memory; a walk that fails part-way keeps what it collected and the
+  result is marked partial. A device's switch port ignores uplinks / trunks (ports that
+  learned more than 48 MACs, or that lead to another switch, router or firewall), prefers
+  the device's VLAN and then the port with the fewest MACs.
 
 ## CLI usage
 
@@ -72,6 +87,11 @@ sudo sweepr vlans -i en0 --timeout 30
 sweepr snmp 10.0.0.1 --snmp-community public
 sweepr snmp 10.0.0.1 --snmp-community public -o json
 
+# SNMPv3 (authPriv). Pass passwords through the environment, not argv (other local users
+# can read command lines)
+SWEEPR_SNMP_AUTH_PASS='...' SWEEPR_SNMP_PRIV_PASS='...' \
+  sweepr snmp 10.0.0.1 --snmp-user monitor --snmp-auth-proto sha256 --snmp-priv-proto aes128
+
 # Include IPv6 neighbors and export to Excel
 sudo sweepr scan -r 192.168.1.0/24 -6 -o xlsx -f devices.xlsx
 
@@ -91,7 +111,17 @@ Main `scan` flags:
 | `--vlan <IDS>` | 802.1Q VLAN IDs: `10,20,30`, `1-100`, `untagged,10,20` or `auto`. |
 | `--discover-vlans` | Sniff 802.1Q tags, VTP and DTP while scanning. |
 | `--cdp-lldp` | Listen for CDP/LLDP advertisements while scanning. |
-| `--snmp-community` | SNMP v2c community. Enables SNMP infrastructure polling. |
+| `--snmp-community` | SNMP v1/v2c community. Enables SNMP infrastructure polling. |
+| `--snmp-version 1\|2c\|3` | SNMP version (default `3` when `--snmp-user` is given, else `2c`). Enables SNMP polling. |
+| `--snmp-user` | SNMPv3 user name. Enables SNMPv3 polling. |
+| `--snmp-auth-proto`, `--snmp-priv-proto` | SNMPv3 protocols: `md5`, `sha1` (default), `sha224`, `sha256`, `sha384`, `sha512`; `des`, `aes128` (default), `aes192`, `aes256`. |
+| `--snmp-auth-pass`, `--snmp-priv-pass` | SNMPv3 passwords (at least 8 characters; privacy needs authentication). Also read from `SWEEPR_SNMP_AUTH_PASS` / `SWEEPR_SNMP_PRIV_PASS` — prefer those, since arguments are visible in the process list. |
+| `--snmp-all` | Poll every discovered host over SNMP, not only likely infrastructure (slow on large ranges). |
+
+AES-192 / AES-256 privacy with MD5 or SHA-1 authentication (and AES-256 with SHA-224) needs a
+privacy-key extension, which agents implement in one of two incompatible ways (Reeder,
+used by Cisco and most vendors, or Blumenthal). SweepR tries Reeder first and, if the first
+encrypted request fails or times out, repeats it once with Blumenthal.
 | `-6, --ipv6` | IPv6 neighbor discovery. |
 | `-p, --ports` | TCP ports to connect-scan, e.g. `22,80,443` or `1-1024`. |
 | `--no-resolve` | Disable DNS / mDNS / NetBIOS name resolution. |
@@ -179,11 +209,11 @@ The webview may call only the commands listed in `src-tauri/build.rs` and grante
 | `list_interfaces` | none | `InterfaceInfo[]` |
 | `start_scan` | `{ config: ScanConfig }` | `scanId` (number). Cancels any running job. |
 | `start_vlan_discovery` | `{ interface?: string, timeoutSecs?: number }` | `scanId` (number). Cancels any running job. |
-| `stop_scan` | `{ scanId?: number }` | `true` if a job was signalled. With `scanId`, only that job is stopped. |
+| `stop_scan` | `{ scanId?: number }` | `true` if a job was signalled. With `scanId`, only that job is stopped. Also cancels running `scan_ports` calls. |
 | `export_devices` | `{ devices: Device[], format: "csv" \| "json" \| "xlsx" }` | The written path, or `null` if the user cancelled. |
-| `load_overrides` | none | `Record<string, DeviceOverride>` (may be empty). |
-| `save_override` | `{ key: string, hostname: string \| null, comments: string \| null }` | `null`. Rejects on a write error. |
-| `scan_ports` | `{ ip: string, ports: number[] }` | `number[]` of open ports (sorted). Rejects on a bad IP or > 4096 ports. |
+| `load_overrides` | none | `Record<string, DeviceOverride>` (may be empty). Rejects when the store is unreadable or corrupt (the file is left untouched). |
+| `save_override` | `{ key: string, hostname: string \| null, comments: string \| null }` | `null`. Rejects on a write error or a corrupt store (which is moved aside first). |
+| `scan_ports` | `{ ip: string, ports: number[] }` | `number[]` of open ports (sorted). Rejects on a bad IP, > 4096 distinct ports, when 4 port scans are already running, when stopped by `stop_scan`, or when some ports could not be checked (out of file descriptors). |
 | `query_snmp` | `{ ip: string, snmp: SnmpConfig \| null }` | `SnmpDeviceInfo`. Rejects on a bad IP, invalid config or unreachable device. |
 
 Tauri maps Rust snake_case command arguments to camelCase in JS automatically (so
@@ -193,19 +223,31 @@ Tauri maps Rust snake_case command arguments to camelCase in JS automatically (s
 file path. The chosen file must have the format's extension (it is added when missing), and
 symbolic links and non-regular files are refused.
 
-`save_override` persists one record to a JSON file under the OS application-data directory
-(atomic temp-file + rename). Strings are sanitized and capped at 1024 characters; sending
-`null` (or a whitespace-only string) for a field clears it, and clearing both removes the
-entry. `load_overrides` returns the whole store, keyed by a device's `ip` (plus `@vlanId`
-when the device has a VLAN) — the same key the engine applies overrides by, filling a
-device's `hostname` / `comments` on emitted snapshots when they are otherwise empty.
+`save_override` persists one record to a JSON file under the OS application-data directory.
+Saves are serialized by a process-wide lock and written durably (uniquely named temp file,
+fsync, rename, directory fsync). Strings are sanitized and capped at 1024 characters;
+sending `null` (or a whitespace-only string) for a field clears it, and clearing both
+removes the entry. A store that exists but cannot be parsed is never overwritten: it is
+renamed to `overrides.json.corrupt-<unix-ms>` and the save rejects with a message naming
+the backup (a retry starts a new store). `load_overrides` returns the whole store, keyed by
+a device's `ip` (plus `@vlanId` when the device has a VLAN).
+
+Overrides are the GUI's to apply: scans started with `start_scan` never write them into
+`device.hostname` / `device.comments` (both stay `null` in `device` events), so the frontend
+shows the overrides it loaded and a cleared label disappears immediately. Exports carry the
+user's labels because the frontend fills `hostname` / `comments` from its overrides in the
+`devices` it passes to `export_devices`. The CLI, whose output is final, still fills them
+from the store.
 
 `scan_ports` and `query_snmp` are single-device helpers for the details drawer; they run
-independently of any scan job and do not emit `scan-event`s.
+independently of any scan job and do not emit `scan-event`s. `query_snmp` validates the
+configuration first (SNMPv3 passwords must be at least 8 characters, privacy needs an
+authentication password, port 1-65535) and returns partial results (`partial: true`) when
+some tables could not be walked completely.
 
-The webview may open `http`, `https`, `mailto` and `tel` URLs via the opener plugin
-(`opener:default`), plus `ssh://` and `telnet://` (a tight `opener:allow-open-url` scope);
-any other scheme is denied.
+The webview holds only `opener:allow-open-url`, scoped to `http://`, `https://`, `ssh://`
+and `telnet://` URLs; any other scheme, and every other opener command (such as revealing
+files), is denied.
 
 Scan progress arrives on the Tauri event `scan-event`. Every payload is wrapped with the id
 of the job that produced it:
@@ -225,9 +267,13 @@ of the job that produced it:
   (device: `ip` plus `vlanId`; VLAN: `id`). `neighbor` events are sent when a neighbor is
   new or its advertisement changed.
 - `port_mapping` events (`{ type: "port_mapping", data: SwitchPortMapping }`) carry one
-  SNMP-learned MAC→switch-port entry. The backend already applies each mapping to the
-  matching device row (setting `switchPort`) and re-emits that `device`; the raw
-  `port_mapping` events are also forwarded for callers that want the full CAM table.
+  SNMP-learned MAC→switch-port entry (at most 50,000 per polled device and 200,000 per
+  scan; exact duplicates are not re-sent). The backend picks each device's `switchPort`
+  from all of them — never an uplink / trunk (a port with more than 48 MACs or one leading
+  to another switch, router or firewall), the device's VLAN first, then the port with the
+  fewest MACs, ties broken by name — and re-emits the `device` when the choice changes (a
+  final, order-independent pass runs when polling ends). The raw `port_mapping` events are
+  forwarded for callers that want the full CAM table.
 - `progress` events report one combined `probesSent / probesTotal` for the whole scan. Both
   values only grow. After discovery the scan runs an enrichment phase
   (`progress.phase === "enriching"`) that streams further `device`, `vlan` and
@@ -269,7 +315,12 @@ interface SnmpDeviceInfo {
   vlans: VlanInfo[];
   portMappings: SwitchPortMapping[];
   portMacCounts: PortMacCount[];
+  partial: boolean;       // some walks failed / were cut short; data is what was collected
+  warnings: string[];     // why (one line per failed or truncated walk)
 }
+
+// ScanConfig.snmpAll (boolean, default false): poll every discovered host over SNMP instead
+// of only the gateway, CDP/LLDP neighbors and likely network gear.
 
 // Passed to query_snmp (and nested in ScanConfig.snmp). Omitted fields default
 // (v2c / "public" / port 161 / 2000 ms / 1 retry).

@@ -5,7 +5,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deviceKey, ipSortKey, ipv6Groups, urlHost } from "./ip.ts";
 import { formatPorts, parsePorts, parseRange, parseVlanSelection } from "./parse.ts";
-import { ScanStore, buildRow, exportDevice } from "./store.ts";
+import { MAX_MAPPINGS, ScanStore, buildRow, exportDevice, type DeviceRow } from "./store.ts";
+import { DEFAULT_SETTINGS, buildScanConfig, snmpV3Problem } from "../settings.ts";
 import { normalizePortMacCounts, neighborsForDevice } from "./infra.ts";
 import type { CdpLldpNeighbor, Device, ScanEventPayload } from "../types.ts";
 
@@ -140,6 +141,119 @@ test("device snapshots upsert by ip@vlan and keep user overrides", () => {
   store.setOverride("10.0.0.1@20", { hostname: null, comments: null });
   const after = store.flushNow().rows.find((r) => r.key === "10.0.0.1@20");
   assert.equal(after?.hostname, "");
+});
+
+// Regression (M7, from the Step 3 review): clearing a saved hostname must clear the cell at
+// once. The engine used to copy overrides into `device.hostname`, and `buildRow` fell back to
+// it, so the cleared label stayed until the next scan.
+test("clearing a hostname override takes effect immediately", () => {
+  const s = new ScanStore(() => 0);
+  s.setOverrides({ "10.0.0.5": { hostname: "printer-1", comments: "2nd floor" } });
+  const token = s.beginStart("scan");
+  s.startResolved(1, token);
+  // Even a snapshot that still carries the old label (an older backend) must not bring it back.
+  s.handlePayload({ scanId: 1, event: { type: "device", data: device("10.0.0.5", { hostname: "printer-1", comments: "2nd floor" }) } });
+  const only = (): DeviceRow => {
+    const r = s.flushNow().rows[0];
+    assert.ok(r);
+    return r;
+  };
+  assert.equal(only().hostname, "printer-1");
+
+  s.setOverride("10.0.0.5", { hostname: null, comments: "2nd floor" });
+  let row = only();
+  assert.equal(row.hostname, "");
+  assert.equal(row.comments, "2nd floor");
+  assert.equal(exportDevice(row).hostname, null);
+  assert.equal(exportDevice(row).comments, "2nd floor");
+
+  s.setOverride("10.0.0.5", { hostname: null, comments: null });
+  row = only();
+  assert.equal(row.comments, "");
+  assert.equal(exportDevice(row).comments, null);
+  // A later snapshot of the same device does not resurrect it either.
+  s.handlePayload({ scanId: 1, event: { type: "device", data: device("10.0.0.5", { vendor: "HP" }) } });
+  assert.equal(only().hostname, "");
+});
+
+test("two rapid starts keep the second job's early events", () => {
+  const s = new ScanStore(() => 0);
+  const ev = (scanId: number, ip: string): ScanEventPayload => ({ scanId, event: { type: "device", data: device(ip) } });
+  const a = s.beginStart("scan");
+  const b = s.beginStart("scan"); // user pressed Start again before the first reply
+  s.handlePayload(ev(2, "10.0.0.20")); // job 2 streams before either start resolves
+  s.startResolved(1, a); // the stale reply must not adopt job 1 or drop job 2's events
+  s.handlePayload(ev(2, "10.0.0.21"));
+  s.handlePayload(ev(1, "10.0.0.10")); // superseded job
+  assert.equal(s.flushNow().starting, true);
+  s.startResolved(2, b);
+  s.handlePayload(ev(2, "10.0.0.22"));
+  const snap = s.flushNow();
+  assert.equal(snap.scanId, 2);
+  assert.deepEqual(snap.rows.map((r) => r.key).sort(), ["10.0.0.20", "10.0.0.21", "10.0.0.22"]);
+
+  // If the newer start fails before superseding the older job, the older job is adopted.
+  const s2 = new ScanStore(() => 0);
+  const a2 = s2.beginStart("scan");
+  const b2 = s2.beginStart("scan");
+  s2.handlePayload(ev(5, "10.0.0.50"));
+  s2.startResolved(5, a2);
+  s2.startFailed("Scan failed to start: bad range", b2);
+  const snap2 = s2.flushNow();
+  assert.equal(snap2.scanId, 5);
+  assert.equal(snap2.running, true);
+  assert.deepEqual(snap2.rows.map((r) => r.key), ["10.0.0.50"]);
+});
+
+test("CAM entries are capped with a single warning", () => {
+  const s = new ScanStore(() => 0);
+  const mapping = (i: number) => ({
+    switchName: "sw",
+    switchIp: null,
+    portName: `p${i % 48}`,
+    portIndex: null,
+    vlanId: null,
+    mac: `02:00:${((i >> 16) & 255).toString(16)}:${((i >> 8) & 255).toString(16)}:${(i & 255).toString(16)}:01`,
+  });
+  for (let i = 0; i < MAX_MAPPINGS + 50; i++) s.apply({ type: "port_mapping", data: mapping(i) });
+  const snap = s.flushNow();
+  assert.equal(snap.portMappings.length, MAX_MAPPINGS);
+  assert.equal(snap.logs.filter((l) => l.level === "warn").length, 1);
+});
+
+test("removed rows can be restored", () => {
+  const s = new ScanStore(() => 0);
+  s.apply({ type: "device", data: device("10.0.0.1", { vendor: "old" }) });
+  s.apply({ type: "device", data: device("10.0.0.2") });
+  const removed = s.removeDevices(["10.0.0.1", "10.0.0.99"]);
+  assert.equal(removed.length, 1);
+  assert.deepEqual(s.flushNow().rows.map((r) => r.key), ["10.0.0.2"]);
+  s.restoreDevices(removed);
+  assert.deepEqual(s.flushNow().rows.map((r) => r.key).sort(), ["10.0.0.1", "10.0.0.2"]);
+  // A row re-emitted by the scan after removal keeps the newer data on undo.
+  const again = s.removeDevices(["10.0.0.1"]);
+  s.apply({ type: "device", data: device("10.0.0.1", { vendor: "new" }) });
+  s.restoreDevices(again);
+  assert.equal(s.getDevice("10.0.0.1")?.vendor, "new");
+});
+
+test("SNMP settings mirror backend validation and carry snmpAll", () => {
+  const v3 = (authPassword: string | null, privPassword: string | null) => ({
+    ...DEFAULT_SETTINGS.snmp,
+    version: "v3" as const,
+    v3: { username: "mon", authProtocol: "sha1" as const, authPassword, privProtocol: "aes128" as const, privPassword },
+  });
+  assert.equal(snmpV3Problem(v3(null, null)), null);
+  assert.equal(snmpV3Problem(v3("authpass1", "privpass1")), null);
+  assert.match(snmpV3Problem(v3("short", null)) ?? "", /8 characters/);
+  assert.match(snmpV3Problem(v3(null, "privpass1")) ?? "", /authentication/);
+  const built = buildScanConfig({ ...DEFAULT_SETTINGS, snmpEnabled: true, snmpAll: true });
+  assert.ok(built.ok);
+  if (built.ok) assert.equal(built.value.config.snmpAll, true);
+  const off = buildScanConfig({ ...DEFAULT_SETTINGS, snmpEnabled: false, snmpAll: true });
+  assert.ok(off.ok);
+  if (off.ok) assert.equal(off.value.config.snmpAll, false);
+  assert.equal(buildScanConfig({ ...DEFAULT_SETTINGS, snmpEnabled: true, snmp: v3("short", null) }).ok, false);
 });
 
 test("row search text includes all visible columns", () => {

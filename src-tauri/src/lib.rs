@@ -4,6 +4,7 @@ pub mod arp_vlan;
 pub mod engine;
 pub mod enricher;
 pub mod export;
+pub mod limits;
 pub mod models;
 pub mod progress;
 pub mod snmp_infra;

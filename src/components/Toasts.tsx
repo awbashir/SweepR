@@ -4,15 +4,21 @@ import { cx } from "./ui.tsx";
 
 export type ToastKind = "error" | "warn" | "info" | "success";
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface Toast {
   id: number;
   kind: ToastKind;
   title: string;
   detail?: string;
+  action?: ToastAction;
 }
 
 interface ToastApi {
-  push: (kind: ToastKind, title: string, detail?: string) => void;
+  push: (kind: ToastKind, title: string, detail?: string, action?: ToastAction) => void;
 }
 
 const ToastContext = createContext<ToastApi>({ push: () => undefined });
@@ -36,10 +42,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const dismiss = useCallback((id: number) => setToasts((t) => t.filter((x) => x.id !== id)), []);
 
   const push = useCallback(
-    (kind: ToastKind, title: string, detail?: string) => {
+    (kind: ToastKind, title: string, detail?: string, action?: ToastAction) => {
       const id = ++seq.current;
-      setToasts((t) => [...t.slice(-4), { id, kind, title, detail }]);
-      window.setTimeout(() => dismiss(id), kind === "error" ? 9000 : 5000);
+      setToasts((t) => [...t.slice(-4), { id, kind, title, detail, action }]);
+      window.setTimeout(() => dismiss(id), kind === "error" || action ? 9000 : 5000);
     },
     [dismiss],
   );
@@ -67,6 +73,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 <div className="font-medium">{t.title}</div>
                 {t.detail && <div className="selectable mt-0.5 break-words text-muted">{t.detail}</div>}
               </div>
+              {t.action && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    t.action?.onClick();
+                    dismiss(t.id);
+                  }}
+                  className="rounded px-1.5 py-0.5 font-medium text-accent hover:bg-chrome-2"
+                >
+                  {t.action.label}
+                </button>
+              )}
               <button
                 type="button"
                 aria-label="Dismiss"

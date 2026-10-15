@@ -287,6 +287,13 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
           <KV k="Uptime">{formatUptime(p.snmp.sysUptimeTicks)}</KV>
           <KV k="sysObjectID">{p.snmp.sysObjectId ? <span className="font-mono">{p.snmp.sysObjectId}</span> : null}</KV>
           <KV k="Role">{ROLE_LABEL[p.snmp.role]}</KV>
+          {p.snmp.partial && (
+            <KV k="Partial">
+              <span className="text-warn" title={(p.snmp.warnings ?? []).join("\n")}>
+                Some tables could not be read completely: {(p.snmp.warnings ?? []).join("; ")}
+              </span>
+            </KV>
+          )}
         </dl>
       ) : (
         p.snmpQuery?.status !== "error" && <p className="text-muted">Not queried yet.</p>

@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import type { SnmpAuthProtocol, SnmpConfig, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion } from "../types.ts";
-import { DEFAULT_SNMP } from "../settings.ts";
+import { DEFAULT_SNMP, snmpV3Problem } from "../settings.ts";
 import { Modal } from "./Modal.tsx";
 import { Button, Select, TextInput, Toggle } from "./ui.tsx";
 
@@ -27,16 +27,19 @@ const EMPTY_V3: SnmpV3Credentials = {
 
 export function SnmpDialog({
   enabled,
+  pollAll,
   config,
   onSave,
   onClose,
 }: {
   enabled: boolean;
+  pollAll: boolean;
   config: SnmpConfig;
-  onSave: (enabled: boolean, config: SnmpConfig) => void;
+  onSave: (enabled: boolean, pollAll: boolean, config: SnmpConfig) => void;
   onClose: () => void;
 }) {
   const [on, setOn] = useState(enabled);
+  const [all, setAll] = useState(pollAll);
   const [c, setC] = useState<SnmpConfig>(config);
   const [showSecrets, setShowSecrets] = useState(false);
   const v3 = c.v3 ?? EMPTY_V3;
@@ -45,7 +48,11 @@ export function SnmpDialog({
   const authLen = (v3.authPassword ?? "").length;
   const privLen = (v3.privPassword ?? "").length;
   const pwInvalid = (n: number): boolean => n > 0 && n < 8;
-  const invalid = v3Invalid || (c.version === "v3" && (pwInvalid(authLen) || pwInvalid(privLen)));
+  const privWithoutAuth = c.version === "v3" && authLen === 0 && privLen > 0;
+  const problem = snmpV3Problem({ ...c, v3 });
+  // A v3 profile without a username may be saved while polling is off; anything else the
+  // backend would reject blocks saving.
+  const invalid = v3Invalid || (problem !== null && !(problem.includes("username") && !on));
   const secretType = showSecrets ? "text" : "password";
 
   return (
@@ -63,7 +70,7 @@ export function SnmpDialog({
             variant="primary"
             disabled={invalid}
             onClick={() => {
-              onSave(on, { ...c, v3: c.version === "v3" ? v3 : c.v3 });
+              onSave(on, all, { ...c, v3: c.version === "v3" ? v3 : c.v3 });
               onClose();
             }}
           >
@@ -79,6 +86,18 @@ export function SnmpDialog({
       >
         <Row label="">
           <Toggle checked={on} onChange={setOn} label="Poll infrastructure over SNMP during scans" />
+        </Row>
+        <Row label="">
+          <label className="flex items-center gap-1.5 text-muted">
+            <input
+              type="checkbox"
+              checked={all}
+              disabled={!on}
+              onChange={(e) => setAll(e.target.checked)}
+              className="accent-[var(--accent)]"
+            />
+            Poll all hosts (slow; default: gateway, CDP/LLDP neighbors and likely network gear only)
+          </label>
         </Row>
         <fieldset className="contents">
           <Row label="Version" htmlFor="snmp-version">
@@ -155,6 +174,9 @@ export function SnmpDialog({
               </Row>
               {(pwInvalid(authLen) || pwInvalid(privLen)) && (
                 <p className="pl-[142px] text-[11px] text-danger">SNMPv3 passwords must be at least 8 characters.</p>
+              )}
+              {privWithoutAuth && (
+                <p className="pl-[142px] text-[11px] text-danger">A privacy password needs an authentication password.</p>
               )}
             </>
           )}

@@ -16,8 +16,8 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Mutex, PoisonError,
     },
     time::{Duration, Instant},
 };
@@ -28,12 +28,15 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, ContentArrangement, Table};
 use serde::Serialize;
 use sweepr_core::{
     arp_vlan::{self, L2Error, PassiveResults},
-    engine, enricher,
+    engine::{self, ScanOptions},
+    enricher,
     export::{self, ExportFormat},
+    limits::{self, SocketBudget},
     models::{
         parse_ports, sanitize_text, CdpLldpNeighbor, Device, DeviceOverride, InterfaceInfo,
-        LogLevel, ScanConfig, ScanEvent, ScanPhase, ScanSummary, SnmpConfig, SnmpDeviceInfo,
-        VlanInfo, VlanSelection, VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
+        LogLevel, ScanConfig, ScanEvent, ScanPhase, ScanSummary, SnmpAuthProtocol, SnmpConfig,
+        SnmpDeviceInfo, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, VlanInfo, VlanSelection,
+        VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
     },
     snmp_infra::SnmpClient,
 };
@@ -159,9 +162,13 @@ struct ScanArgs {
     #[arg(long)]
     cdp_lldp: bool,
 
-    /// SNMP v2c community for infrastructure polling
-    #[arg(long, value_name = "COMMUNITY")]
-    snmp_community: Option<String>,
+    /// SNMP settings; giving a community, version or user enables infrastructure polling
+    #[command(flatten)]
+    snmp: SnmpCliArgs,
+
+    /// Poll every discovered host over SNMP, not only likely infrastructure (slow)
+    #[arg(long)]
+    snmp_all: bool,
 
     /// Also discover IPv6 neighbors (ICMPv6 all-nodes echo / NDP)
     #[arg(short = '6', long)]
@@ -225,15 +232,147 @@ enum SnmpOutput {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliSnmpVersion {
+    #[value(name = "1", alias = "v1")]
+    V1,
+    #[value(name = "2c", alias = "v2c")]
+    V2c,
+    #[value(name = "3", alias = "v3")]
+    V3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliAuthProto {
+    Md5,
+    Sha1,
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliPrivProto {
+    Des,
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+/// SNMP version / credential flags shared by `scan` and `snmp`.
+#[derive(Args, Debug, Clone, Default)]
+struct SnmpCliArgs {
+    /// SNMP v1/v2c community string
+    #[arg(long, value_name = "COMMUNITY")]
+    snmp_community: Option<String>,
+
+    /// SNMP version [default: 3 when --snmp-user is given, else 2c]
+    #[arg(long, value_enum, value_name = "VERSION")]
+    snmp_version: Option<CliSnmpVersion>,
+
+    /// SNMPv3 user name
+    #[arg(long, value_name = "USER")]
+    snmp_user: Option<String>,
+
+    /// SNMPv3 authentication protocol [default: sha1]
+    #[arg(long, value_enum, value_name = "PROTO")]
+    snmp_auth_proto: Option<CliAuthProto>,
+
+    /// SNMPv3 authentication password (8+ characters). Prefer the environment variable:
+    /// command-line arguments are visible to other local users
+    #[arg(
+        long,
+        value_name = "PASS",
+        env = "SWEEPR_SNMP_AUTH_PASS",
+        hide_env_values = true
+    )]
+    snmp_auth_pass: Option<String>,
+
+    /// SNMPv3 privacy protocol [default: aes128]
+    #[arg(long, value_enum, value_name = "PROTO")]
+    snmp_priv_proto: Option<CliPrivProto>,
+
+    /// SNMPv3 privacy password (8+ characters; needs an authentication password). Prefer the
+    /// environment variable: command-line arguments are visible to other local users
+    #[arg(
+        long,
+        value_name = "PASS",
+        env = "SWEEPR_SNMP_PRIV_PASS",
+        hide_env_values = true
+    )]
+    snmp_priv_pass: Option<String>,
+}
+
+impl SnmpCliArgs {
+    /// `true` when the user asked for SNMP (the password environment variables alone do not
+    /// count, so having them exported does not turn polling on for every scan).
+    fn requested(&self) -> bool {
+        self.snmp_community.is_some() || self.snmp_version.is_some() || self.snmp_user.is_some()
+    }
+
+    /// Build and validate the SNMP configuration. `None` when SNMP was not requested and
+    /// `always` is false.
+    fn to_config(&self, always: bool) -> Result<Option<SnmpConfig>> {
+        if !always && !self.requested() {
+            return Ok(None);
+        }
+        let version = match self.snmp_version {
+            Some(CliSnmpVersion::V1) => SnmpVersion::V1,
+            Some(CliSnmpVersion::V2c) => SnmpVersion::V2c,
+            Some(CliSnmpVersion::V3) => SnmpVersion::V3,
+            None if self.snmp_user.is_some() => SnmpVersion::V3,
+            None => SnmpVersion::V2c,
+        };
+        let mut cfg = SnmpConfig {
+            version,
+            ..SnmpConfig::default()
+        };
+        if let Some(c) = &self.snmp_community {
+            cfg.community = c.clone();
+        }
+        if version == SnmpVersion::V3 {
+            let username = self
+                .snmp_user
+                .clone()
+                .filter(|u| !u.is_empty())
+                .context("SNMPv3 needs --snmp-user")?;
+            cfg.v3 = Some(SnmpV3Credentials {
+                username,
+                auth_protocol: match self.snmp_auth_proto.unwrap_or(CliAuthProto::Sha1) {
+                    CliAuthProto::Md5 => SnmpAuthProtocol::Md5,
+                    CliAuthProto::Sha1 => SnmpAuthProtocol::Sha1,
+                    CliAuthProto::Sha224 => SnmpAuthProtocol::Sha224,
+                    CliAuthProto::Sha256 => SnmpAuthProtocol::Sha256,
+                    CliAuthProto::Sha384 => SnmpAuthProtocol::Sha384,
+                    CliAuthProto::Sha512 => SnmpAuthProtocol::Sha512,
+                },
+                auth_password: self.snmp_auth_pass.clone(),
+                priv_protocol: match self.snmp_priv_proto.unwrap_or(CliPrivProto::Aes128) {
+                    CliPrivProto::Des => SnmpPrivProtocol::Des,
+                    CliPrivProto::Aes128 => SnmpPrivProtocol::Aes128,
+                    CliPrivProto::Aes192 => SnmpPrivProtocol::Aes192,
+                    CliPrivProto::Aes256 => SnmpPrivProtocol::Aes256,
+                },
+                priv_password: self.snmp_priv_pass.clone(),
+            });
+        } else if self.snmp_user.is_some() {
+            bail!("--snmp-user is an SNMPv3 setting; use --snmp-version 3");
+        }
+        cfg.validate()?;
+        Ok(Some(cfg))
+    }
+}
+
 #[derive(Args, Debug)]
 struct SnmpArgs {
     /// Device IP address to poll
     #[arg(value_name = "IP")]
     ip: String,
 
-    /// SNMP v2c community string
-    #[arg(long, value_name = "COMMUNITY", default_value = "public")]
-    snmp_community: String,
+    /// SNMP settings (v1/v2c community defaults to "public")
+    #[command(flatten)]
+    snmp: SnmpCliArgs,
 
     /// UDP port
     #[arg(long, value_name = "PORT", default_value_t = 161)]
@@ -262,14 +401,19 @@ fn parse_ports_arg(s: &str) -> Result<PortList, String> {
 }
 
 impl ScanArgs {
-    fn to_config(&self) -> ScanConfig {
-        ScanConfig {
+    fn to_config(&self) -> Result<ScanConfig> {
+        let snmp = self.snmp.to_config(false)?;
+        if self.snmp_all && snmp.is_none() {
+            bail!("--snmp-all needs SNMP settings (e.g. --snmp-community or --snmp-user)");
+        }
+        Ok(ScanConfig {
             interface: self.interface.clone(),
             range: self.range.clone(),
             vlans: self.vlan.clone().unwrap_or_default(),
             discover_vlans: self.discover_vlans,
             cdp_lldp: self.cdp_lldp,
-            snmp: self.snmp_community.clone().map(SnmpConfig::v2c),
+            snmp,
+            snmp_all: self.snmp_all,
             ipv6: self.ipv6,
             ports: self
                 .ports
@@ -281,7 +425,7 @@ impl ScanArgs {
             rate_pps: self.rate_pps,
             concurrency: self.concurrency,
             listen_secs: self.listen_secs,
-        }
+        })
     }
 }
 
@@ -290,6 +434,9 @@ impl ScanArgs {
 // ---------------------------------------------------------------------------------------------
 
 fn main() -> ExitCode {
+    // macOS starts processes with 256 descriptors; enrichment and SNMP need more. Raise the
+    // soft limit before anything sizes the shared socket budget from it.
+    let _ = limits::raise_nofile_limit();
     // Finder launches pass `-psn_0_12345` on older macOS; ignore it.
     let args: Vec<OsString> = std::env::args_os()
         .filter(|a| !a.to_string_lossy().starts_with("-psn_"))
@@ -620,7 +767,7 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
     if args.output == OutputFormat::Xlsx && args.file.is_none() {
         bail!("xlsx output requires --file <PATH>");
     }
-    let cfg = args.to_config();
+    let cfg = args.to_config()?;
     cfg.validate()?;
 
     let (tx, mut rx) = mpsc::channel(1024);
@@ -748,18 +895,26 @@ async fn cmd_snmp(args: SnmpArgs, cancel: CancellationToken) -> Result<()> {
         .ip
         .parse()
         .with_context(|| format!("'{}' is not an IP address", args.ip))?;
+    let base = args
+        .snmp
+        .to_config(true)?
+        .context("SNMP configuration missing")?;
     let cfg = SnmpConfig {
         port: args.snmp_port,
         timeout_ms: args.timeout_ms.clamp(1, MAX_TIMEOUT_MS),
         retries: args.retries,
-        ..SnmpConfig::v2c(&args.snmp_community)
+        ..base
     };
+    cfg.validate()?;
     let client = SnmpClient::new(cfg);
     let info = tokio::select! {
         _ = cancel.cancelled() => return Ok(()),
         res = client.poll_device(ip) => res.with_context(|| format!("SNMP poll of {ip} failed"))?,
     };
 
+    for w in &info.warnings {
+        diag!("warning: partial SNMP result: {}", sanitize_log(w));
+    }
     if args.output == SnmpOutput::Json {
         let mut out = io::stdout().lock();
         serde_json::to_writer_pretty(&mut out, &info)?;
@@ -1019,15 +1174,27 @@ async fn start_scan(
     config.validate().map_err(|e| e.to_string())?;
     let (id, cancel) = state.begin();
     spawn_job(app, id, cancel, move |tx, cancel| async move {
-        engine::run_scan(config, tx, cancel).await.map(|_| ())
+        // The GUI owns the user overrides (load_overrides / save_override) and applies them
+        // itself, so the engine must not bake them into device snapshots.
+        let opts = ScanOptions {
+            apply_overrides: false,
+        };
+        engine::run_scan_with(config, opts, tx, cancel)
+            .await
+            .map(|_| ())
     });
     Ok(id)
 }
 
 /// Stop the running job (only if it is `scan_id`, when given). Returns `true` if one was
-/// signalled; its `finished` event follows.
+/// signalled; its `finished` event follows. Running drawer port scans are cancelled too.
 #[tauri::command]
-fn stop_scan(state: State<'_, ScanManager>, scan_id: Option<u64>) -> bool {
+fn stop_scan(
+    state: State<'_, ScanManager>,
+    port_scans: State<'_, PortScans>,
+    scan_id: Option<u64>,
+) -> bool {
+    port_scans.cancel_all();
     state.stop(scan_id)
 }
 
@@ -1114,13 +1281,66 @@ async fn export_devices(
 
 /// Largest port count a single `scan_ports` command accepts (GUI drawer input bound).
 const SCAN_PORTS_CAP: usize = 4096;
+/// Drawer port scans allowed to run at once.
+const MAX_PORT_SCAN_JOBS: usize = 4;
+
+/// Drawer port scans: a shared cancellation token (cancelled by `stop_scan`) and a guard on
+/// how many run at once. Their sockets also draw from the global [`SocketBudget`].
+#[derive(Default)]
+struct PortScans {
+    token: Mutex<CancellationToken>,
+    running: AtomicUsize,
+}
+
+/// Holds one of the [`MAX_PORT_SCAN_JOBS`] slots until dropped.
+struct PortScanSlot<'a>(&'a AtomicUsize);
+
+impl Drop for PortScanSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl PortScans {
+    fn try_enter(&self) -> Option<PortScanSlot<'_>> {
+        let mut cur = self.running.load(Ordering::Acquire);
+        while cur < MAX_PORT_SCAN_JOBS {
+            match self.running.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(PortScanSlot(&self.running)),
+                Err(actual) => cur = actual,
+            }
+        }
+        None
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Cancel every running port scan; later scans get a fresh token.
+    fn cancel_all(&self) {
+        let mut token = self.token.lock().unwrap_or_else(PoisonError::into_inner);
+        token.cancel();
+        *token = CancellationToken::new();
+    }
+}
 
 /// Load the local device-override store (keyed by `Device::key()`); empty when none exist.
+/// Rejects when the store is unreadable or corrupt (the file is left untouched).
 #[tauri::command]
-async fn load_overrides() -> HashMap<String, DeviceOverride> {
-    tauri::async_runtime::spawn_blocking(enricher::load_overrides)
+async fn load_overrides() -> Result<HashMap<String, DeviceOverride>, String> {
+    tauri::async_runtime::spawn_blocking(enricher::load_overrides_strict)
         .await
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Insert / update / clear one device override, persisting it atomically. A field set to
@@ -1138,18 +1358,56 @@ async fn save_override(
         .map_err(|e| format!("{e:#}"))
 }
 
-/// TCP connect scan of `ports` on `ip` for the GUI details drawer. Validates the address and
-/// caps the number of ports.
+/// TCP connect scan of `ports` on `ip` for the GUI details drawer. Validates the address,
+/// de-duplicates and caps the ports, allows at most [`MAX_PORT_SCAN_JOBS`] concurrent calls,
+/// and stops early when `stop_scan` is called.
 #[tauri::command]
-async fn scan_ports(ip: String, ports: Vec<u16>) -> Result<Vec<u16>, String> {
+async fn scan_ports(
+    port_scans: State<'_, PortScans>,
+    ip: String,
+    ports: Vec<u16>,
+) -> Result<Vec<u16>, String> {
     let ip: IpAddr = ip
         .parse()
         .map_err(|_| format!("'{ip}' is not an IP address"))?;
+    let ports = enricher::dedupe_ports(&ports);
     if ports.len() > SCAN_PORTS_CAP {
         return Err(format!("too many ports (max {SCAN_PORTS_CAP})"));
     }
-    let cancel = CancellationToken::new();
-    Ok(enricher::scan_ports(ip, &ports, 128, Duration::from_millis(800), &cancel).await)
+    let _slot = port_scans.try_enter().ok_or_else(|| {
+        format!("{MAX_PORT_SCAN_JOBS} port scans are already running; wait for one to finish")
+    })?;
+    let cancel = port_scans.token();
+    let res = enricher::scan_ports(
+        ip,
+        &ports,
+        128,
+        Duration::from_millis(800),
+        &cancel,
+        SocketBudget::global(),
+    )
+    .await;
+    if cancel.is_cancelled() {
+        return Err("port scan stopped".into());
+    }
+    if !res.unverified.is_empty() {
+        return Err(format!(
+            "{} of {} port(s) could not be checked because the app ran out of file \
+             descriptors (open so far: {})",
+            res.unverified.len(),
+            ports.len(),
+            if res.open.is_empty() {
+                "none".to_string()
+            } else {
+                res.open
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+    }
+    Ok(res.open)
 }
 
 /// Poll one device over SNMP for the GUI details drawer. `snmp` defaults to the v2c `public`
@@ -1173,6 +1431,7 @@ fn run_gui() -> ExitCode {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ScanManager::default())
+        .manage(PortScans::default())
         .invoke_handler(tauri::generate_handler![
             list_interfaces,
             start_scan,
@@ -1228,11 +1487,14 @@ mod tests {
         let Some(Command::Scan(args)) = cli.command else {
             panic!("expected scan")
         };
-        let cfg = args.to_config();
+        let cfg = args.to_config().unwrap();
         assert_eq!(cfg.interface.as_deref(), Some("en0"));
         assert_eq!(cfg.vlans, VlanSelection::List(vec![10, 20, 30]));
         assert!(cfg.cdp_lldp && cfg.ipv6);
-        assert_eq!(cfg.snmp.unwrap().community, "public");
+        assert!(!cfg.snmp_all);
+        let snmp = cfg.snmp.unwrap();
+        assert_eq!(snmp.community, "public");
+        assert_eq!(snmp.version, SnmpVersion::V2c);
         assert_eq!(cfg.ports, vec![22, 443]);
         assert_eq!(args.output, OutputFormat::Csv);
     }
@@ -1315,12 +1577,14 @@ mod tests {
         let Some(Command::Scan(args)) = cli.command else {
             panic!("expected scan")
         };
-        assert!(!args.to_config().resolve_names);
+        assert!(!args.to_config().unwrap().resolve_names);
         let cli = Cli::try_parse_from(["sweepr", "scan"]).unwrap();
         let Some(Command::Scan(args)) = cli.command else {
             panic!("expected scan")
         };
-        assert!(args.to_config().resolve_names);
+        let cfg = args.to_config().unwrap();
+        assert!(cfg.resolve_names);
+        assert!(cfg.snmp.is_none(), "SNMP stays off unless requested");
     }
 
     #[test]
@@ -1339,8 +1603,127 @@ mod tests {
             panic!("expected snmp")
         };
         assert_eq!(args.ip, "10.0.0.1");
-        assert_eq!(args.snmp_community, "private");
+        assert_eq!(args.snmp.snmp_community.as_deref(), Some("private"));
         assert_eq!(args.output, SnmpOutput::Json);
+        // The `snmp` subcommand defaults to v2c "public".
+        let cli = Cli::try_parse_from(["sweepr", "snmp", "10.0.0.1"]).unwrap();
+        let Some(Command::Snmp(args)) = cli.command else {
+            panic!("expected snmp")
+        };
+        let cfg = args.snmp.to_config(true).unwrap().unwrap();
+        assert_eq!(
+            (cfg.version, cfg.community.as_str()),
+            (SnmpVersion::V2c, "public")
+        );
+    }
+
+    /// Serializes the tests that read (or set) the SNMP password environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn scan_snmp(args: &[&str]) -> Result<Option<SnmpConfig>> {
+        let cli = Cli::try_parse_from(["sweepr", "scan"].into_iter().chain(args.iter().copied()))?;
+        let Some(Command::Scan(args)) = cli.command else {
+            panic!("expected scan")
+        };
+        Ok(args.to_config()?.snmp)
+    }
+
+    #[test]
+    fn snmp_version_and_v3_credential_flags() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let cfg = scan_snmp(&[
+            "--snmp-version",
+            "3",
+            "--snmp-user",
+            "monitor",
+            "--snmp-auth-proto",
+            "sha256",
+            "--snmp-auth-pass",
+            "authpass1",
+            "--snmp-priv-proto",
+            "aes256",
+            "--snmp-priv-pass",
+            "privpass1",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(cfg.version, SnmpVersion::V3);
+        let v3 = cfg.v3.unwrap();
+        assert_eq!(v3.username, "monitor");
+        assert_eq!(v3.auth_protocol, SnmpAuthProtocol::Sha256);
+        assert_eq!(v3.auth_password.as_deref(), Some("authpass1"));
+        assert_eq!(v3.priv_protocol, SnmpPrivProtocol::Aes256);
+        assert_eq!(v3.priv_password.as_deref(), Some("privpass1"));
+        // A user implies v3; v1 by name or alias.
+        let cfg = scan_snmp(&["--snmp-user", "monitor"]).unwrap().unwrap();
+        assert_eq!(cfg.version, SnmpVersion::V3);
+        assert!(cfg.v3.unwrap().auth_password.is_none());
+        let cfg = scan_snmp(&["--snmp-version", "v1", "--snmp-community", "c"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (cfg.version, cfg.community.as_str()),
+            (SnmpVersion::V1, "c")
+        );
+        // Invalid combinations are rejected up front.
+        assert!(scan_snmp(&["--snmp-version", "3"]).is_err()); // no user
+        assert!(scan_snmp(&["--snmp-user", "u", "--snmp-auth-pass", "short"]).is_err());
+        assert!(scan_snmp(&["--snmp-user", "u", "--snmp-priv-pass", "privpass1"]).is_err());
+        assert!(scan_snmp(&["--snmp-version", "2c", "--snmp-user", "u"]).is_err());
+        assert!(scan_snmp(&["--snmp-version", "4"]).is_err());
+        assert!(
+            scan_snmp(&["--snmp-all"]).is_err(),
+            "--snmp-all needs SNMP settings"
+        );
+        let cli =
+            Cli::try_parse_from(["sweepr", "scan", "--snmp-community", "x", "--snmp-all"]).unwrap();
+        let Some(Command::Scan(args)) = cli.command else {
+            panic!("expected scan")
+        };
+        assert!(args.to_config().unwrap().snmp_all);
+    }
+
+    #[test]
+    fn snmp_passwords_come_from_the_environment() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        std::env::set_var("SWEEPR_SNMP_AUTH_PASS", "env-auth-pass");
+        std::env::set_var("SWEEPR_SNMP_PRIV_PASS", "env-priv-pass");
+        let res = scan_snmp(&["--snmp-user", "monitor"]);
+        let snmp = Cli::try_parse_from(["sweepr", "snmp", "10.0.0.1", "--snmp-user", "u"]);
+        std::env::remove_var("SWEEPR_SNMP_AUTH_PASS");
+        std::env::remove_var("SWEEPR_SNMP_PRIV_PASS");
+        let v3 = res.unwrap().unwrap().v3.unwrap();
+        assert_eq!(v3.auth_password.as_deref(), Some("env-auth-pass"));
+        assert_eq!(v3.priv_password.as_deref(), Some("env-priv-pass"));
+        let Some(Command::Snmp(args)) = snmp.unwrap().command else {
+            panic!("expected snmp")
+        };
+        assert_eq!(args.snmp.snmp_auth_pass.as_deref(), Some("env-auth-pass"));
+        // The secret values never show up in --help.
+        let help = Cli::command()
+            .find_subcommand_mut("scan")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("SWEEPR_SNMP_AUTH_PASS") && !help.contains("env-auth-pass"));
+    }
+
+    #[test]
+    fn port_scan_slots_are_bounded_and_cancellable() {
+        let scans = PortScans::default();
+        let slots: Vec<_> = (0..MAX_PORT_SCAN_JOBS)
+            .map(|_| scans.try_enter().unwrap())
+            .collect();
+        assert!(scans.try_enter().is_none());
+        drop(slots);
+        assert!(scans.try_enter().is_some());
+        let t = scans.token();
+        scans.cancel_all();
+        assert!(t.is_cancelled());
+        assert!(
+            !scans.token().is_cancelled(),
+            "later scans get a fresh token"
+        );
     }
 
     #[test]
@@ -1350,7 +1733,7 @@ mod tests {
             panic!("expected scan")
         };
         assert_eq!(
-            args.to_config().vlans,
+            args.to_config().unwrap().vlans,
             VlanSelection::UntaggedAndList(vec![10, 20])
         );
     }

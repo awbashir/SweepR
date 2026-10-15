@@ -6,9 +6,11 @@
 //!
 //! The crate's [`snmp2::AsyncSession`] drives UDP over tokio. Every request is wrapped in a
 //! timeout and retried, and every table walk is bounded by an overall per-device deadline, a
-//! row cap and strict end-of-MIB / subtree / loop detection, so a hostile or buggy agent can
-//! neither hang the poller nor exhaust its memory. All strings coming off the wire pass
-//! through [`sanitize_text`].
+//! row cap, a byte budget, an index-length cap and strict end-of-MIB / subtree / loop
+//! detection, so a hostile or buggy agent can neither hang the poller nor exhaust its memory.
+//! A walk that fails part-way keeps the rows it already has and the result is flagged
+//! `partial`. All strings coming off the wire pass through [`sanitize_text`]. Each poll runs
+//! in its own task, so a panic inside the SNMP library becomes an error, never a crash.
 //!
 //! OID / index parsing and role classification are pure functions (unit tested below), and a
 //! hand-encoded in-process SNMPv2c responder exercises the walk end to end.
@@ -16,17 +18,25 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::Result;
 use snmp2::{AsyncSession, Oid, Value};
 use tokio::sync::{mpsc::Sender, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{
-    now_ms, sanitize_text, DeviceRole, DiscoverySource, PortMacCount, ScanEvent, SnmpConfig,
-    SnmpDeviceInfo, SnmpVersion, SwitchPortMapping, VlanInfo, VlanSource, MAX_VLAN_ID,
+use crate::{
+    limits::SocketBudget,
+    models::{
+        now_ms, sanitize_text, DeviceRole, DiscoverySource, PortMacCount, ScanEvent, SnmpConfig,
+        SnmpDeviceInfo, SnmpVersion, SwitchPortMapping, VlanInfo, VlanSource, MAX_VLAN_ID,
+    },
+    progress::ProgressScope,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -60,6 +70,18 @@ const IF_DESCR: &[u64] = &[1, 3, 6, 1, 2, 1, 2, 2, 1, 2];
 
 /// Hard cap on rows returned by any one table walk (hostile-agent memory bound).
 const MAX_WALK_ROWS: usize = 50_000;
+/// Hard cap on MAC-to-port mappings kept per device, across every VLAN / community context.
+pub const MAX_DEVICE_MAPPINGS: usize = 50_000;
+/// Longest table index accepted (sub-identifiers after the column OID). The tables walked here
+/// use at most 7 (Q-BRIDGE FDB: VLAN + MAC); anything far longer is malformed.
+const MAX_INDEX_SUBIDS: usize = 32;
+/// Octet-string values are truncated to this many bytes when copied out of the session (every
+/// value we keep is a short name; text is further capped by [`sanitize_text`]).
+const MAX_VALUE_BYTES: usize = 1024;
+/// OID-valued varbinds keep at most this many sub-identifiers.
+const MAX_OID_VALUE_SUBIDS: usize = 128;
+/// Approximate memory budget of one walk (index sub-ids + value bytes).
+const MAX_WALK_BYTES: usize = 8 * 1024 * 1024;
 /// GETBULK max-repetitions (v2c/v3). Kept modest so a reply fits one datagram comfortably.
 const BULK_REPETITIONS: u32 = 20;
 /// Overall wall-clock budget for one device poll, independent of per-request timeouts.
@@ -69,13 +91,72 @@ const DEVICE_BUDGET: Duration = Duration::from_secs(25);
 const MAX_AUTH_UPDATES: u8 = 4;
 /// Per-VLAN community-string CAM polling (Cisco Catalyst) is bounded to this many VLANs.
 const MAX_COMMUNITY_VLANS: usize = 128;
-/// Max concurrent device polls in [`probe_candidates`].
-const MAX_CONCURRENT_POLLS: usize = 16;
+/// Max concurrent device polls in [`probe_candidates`] (each also holds a socket permit from
+/// the global [`SocketBudget`]).
+const MAX_CONCURRENT_POLLS: usize = 64;
+/// Timeout of the cheap reachability probe sent before any heavy walk.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Attempts of the reachability probe.
+const PROBE_ATTEMPTS: u8 = 2;
+/// Warnings kept per poll result.
+const MAX_POLL_WARNINGS: usize = 16;
+/// Per-device failure lines streamed to the scan log (the rest only go to `tracing`).
+const MAX_FAILURE_LOGS: usize = 20;
 
 /// A `(index-suffix, value)` row returned by a table walk / GET.
 type OidRow = (Vec<u64>, SnmpValue);
 /// Forwarding database: `(vlan, mac)` → `(bridge port, vlan)`.
 type FdbMap = BTreeMap<(Option<u16>, [u8; 6]), (u32, Option<u16>)>;
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------------------------
+
+/// Coarse reason a poll failed, for per-scan statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollFailure {
+    /// No answer (timeout, ICMP unreachable): usually "no SNMP agent" or a wrong v1/v2c
+    /// community (agents silently drop those).
+    NoResponse,
+    /// The agent answered but rejected or could not decrypt our credentials (v3 USM errors).
+    Auth,
+    /// Anything else (malformed replies, invalid configuration, library failure).
+    Other,
+}
+
+/// A failed SNMP poll / request with its [`PollFailure`] class.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct SnmpPollError {
+    pub kind: PollFailure,
+    pub message: String,
+}
+
+impl SnmpPollError {
+    fn new(kind: PollFailure, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+/// Classify an `anyhow` error from [`SnmpClient::poll_device`].
+pub fn failure_kind(err: &anyhow::Error) -> PollFailure {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<SnmpPollError>().map(|e| e.kind))
+        .unwrap_or(PollFailure::Other)
+}
+
+fn classify_snmp_error(e: &snmp2::Error) -> PollFailure {
+    match e {
+        snmp2::Error::AuthFailure(_)
+        | snmp2::Error::CommunityMismatch
+        | snmp2::Error::Crypto(_) => PollFailure::Auth,
+        snmp2::Error::Send | snmp2::Error::Receive => PollFailure::NoResponse,
+        _ => PollFailure::Other,
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Owned SNMP value (decoupled from the session's borrowed receive buffer)
@@ -103,10 +184,12 @@ impl SnmpValue {
     fn from_value(v: &Value<'_>) -> Self {
         match v {
             Value::Integer(i) => SnmpValue::Int(*i),
-            Value::OctetString(b) => SnmpValue::Bytes(b.to_vec()),
-            Value::ObjectIdentifier(o) => {
-                SnmpValue::Oid(o.iter().map(|it| it.collect()).unwrap_or_default())
-            }
+            Value::OctetString(b) => SnmpValue::Bytes(b[..b.len().min(MAX_VALUE_BYTES)].to_vec()),
+            Value::ObjectIdentifier(o) => SnmpValue::Oid(
+                o.iter()
+                    .map(|it| it.take(MAX_OID_VALUE_SUBIDS).collect())
+                    .unwrap_or_default(),
+            ),
             Value::Counter32(n) => SnmpValue::Counter32(*n),
             Value::Counter64(n) => SnmpValue::Counter64(*n),
             Value::Unsigned32(n) => SnmpValue::Unsigned32(*n),
@@ -136,6 +219,15 @@ impl SnmpValue {
             }
             SnmpValue::Counter64(n) => u32::try_from(*n).ok(),
             _ => None,
+        }
+    }
+
+    /// Approximate bytes this value occupies once stored.
+    fn approx_size(&self) -> usize {
+        match self {
+            SnmpValue::Bytes(b) => b.len(),
+            SnmpValue::Oid(o) => o.len() * 8,
+            _ => 8,
         }
     }
 
@@ -221,18 +313,57 @@ pub fn enterprise_number(sys_object_id: &str) -> Option<u64> {
 // Role classification (pure)
 // ---------------------------------------------------------------------------------------------
 
-/// Classify a device from its sysObjectID enterprise number, sysDescr text and sysServices
-/// bit field. Keyword evidence wins; the enterprise number and services bits are tie-breakers.
+/// `true` when `sys_object_id` lies in the subtree `prefix` (dotted, no trailing dot).
+fn oid_in(sys_object_id: Option<&str>, prefix: &str) -> bool {
+    sys_object_id.is_some_and(|o| {
+        let o = o.trim();
+        o == prefix || o.strip_prefix(prefix).is_some_and(|r| r.starts_with('.'))
+    })
+}
+
+/// Enterprises whose agents are (practically) only network infrastructure: with no better
+/// evidence they default to `Switch`.
+const NETWORK_ONLY_ENTERPRISES: &[u64] = &[
+    9,     // Cisco
+    2636,  // Juniper
+    14988, // MikroTik
+    25506, // H3C
+    30065, // Arista
+    1916,  // Extreme Networks
+];
+
+/// Classify a device from its sysObjectID, sysDescr text, sysServices bit field and whether
+/// it answered the BRIDGE-MIB port table (`bridge_ports`). Keyword evidence wins; the
+/// services bits, bridge evidence and enterprise number are tie-breakers.
+///
+/// Vendors that also make non-network products (HP / HPE: printers and servers, Aruba: APs
+/// and controllers, Ubiquiti: cameras and APs, Fortinet: phones and APs) are never assumed to
+/// be switches from the enterprise number alone: that needs bridge evidence (a BRIDGE-MIB port
+/// table or the datalink sysServices bit) or a known switch sysObjectID subtree.
 pub fn classify_role(
     sys_object_id: Option<&str>,
     sys_descr: &str,
     sys_services: Option<i64>,
+    bridge_ports: bool,
 ) -> DeviceRole {
     let text = sys_descr.to_ascii_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
     let ent = sys_object_id.and_then(enterprise_number);
 
-    // Firewalls first: the strongest signal, and several overlap switch/router keywords.
+    // Printers first: JetDirect & co. advertise HP's enterprise number and often bridging bits.
+    if oid_in(sys_object_id, "1.3.6.1.4.1.11.2.3.9")
+        || any(&[
+            "jetdirect",
+            "laserjet",
+            "officejet",
+            "designjet",
+            "printer",
+            "print server",
+        ])
+    {
+        return DeviceRole::Host;
+    }
+    // Firewalls: the strongest signal, and several overlap switch/router keywords.
     if any(&[
         "fortigate",
         "fortios",
@@ -271,6 +402,7 @@ pub fn classify_role(
         "aruba ap",
         "instant ap",
         "arubaos (ap",
+        "fortiap",
         "ruckus",
         "mikrotik cap",
         "wifi access",
@@ -294,7 +426,12 @@ pub fn classify_role(
         "ex4300",
         "qfx",
         "meraki ms",
-    ]) {
+        "usw-",
+        "unifi switch",
+        "edgeswitch",
+    ]) || oid_in(sys_object_id, "1.3.6.1.4.1.11.2.3.7.11")
+    // HP ProCurve / Aruba switch products
+    {
         return DeviceRole::Switch;
     }
     if any(&[
@@ -314,9 +451,10 @@ pub fn classify_role(
         return DeviceRole::Router;
     }
 
-    // No keyword hit: lean on sysServices (bit L set => offers OSI layer L) and the vendor.
-    if let Some(bits) = sys_services {
-        let offers = |layer: u32| bits & (1 << (layer - 1)) != 0;
+    // No keyword hit: lean on sysServices (bit L set => offers OSI layer L), bridge evidence
+    // and the vendor.
+    let offers = |layer: u32| sys_services.is_some_and(|bits| bits & (1 << (layer - 1)) != 0);
+    if sys_services.is_some() {
         if offers(2) && !offers(4) && !offers(7) {
             return DeviceRole::Switch; // datalink only
         }
@@ -324,12 +462,11 @@ pub fn classify_role(
             return DeviceRole::Router; // internet layer, not an application host
         }
     }
-    match ent {
-        // Pure network-equipment vendors default to infrastructure (Switch) over Host.
-        Some(9) | Some(2636) | Some(11) | Some(47196) | Some(14823) | Some(41112) | Some(14988)
-        | Some(25506) => DeviceRole::Switch,
-        _ => DeviceRole::Host,
+    let network_only = ent.is_some_and(|e| NETWORK_ONLY_ENTERPRISES.contains(&e));
+    if network_only || bridge_ports {
+        return DeviceRole::Switch;
     }
+    DeviceRole::Host
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -367,6 +504,83 @@ pub struct SnmpClient {
     cfg: SnmpConfig,
 }
 
+/// Rows of one table walk plus, when it ended early, why.
+#[derive(Debug, Default)]
+struct Walk {
+    rows: Vec<OidRow>,
+    /// `Some(reason)` when the walk failed or was cut short; `rows` holds what was collected.
+    issue: Option<String>,
+}
+
+impl Walk {
+    fn cut(rows: Vec<OidRow>, issue: impl Into<String>) -> Self {
+        Self {
+            rows,
+            issue: Some(issue.into()),
+        }
+    }
+}
+
+/// Bounded list of per-poll warnings.
+#[derive(Debug, Default)]
+struct Warnings {
+    lines: Vec<String>,
+    omitted: usize,
+}
+
+impl Warnings {
+    fn push(&mut self, line: String) {
+        if self.lines.len() < MAX_POLL_WARNINGS {
+            self.lines.push(line);
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    fn note(&mut self, table: &str, walk: &Walk) {
+        if let Some(issue) = &walk.issue {
+            self.push(format!("{table}: {issue}"));
+        }
+    }
+
+    fn into_lines(mut self) -> Vec<String> {
+        if self.omitted > 0 {
+            self.lines
+                .push(format!("... and {} more warning(s)", self.omitted));
+        }
+        self.lines
+    }
+}
+
+/// Run `fut` on its own task so that a panic inside it (e.g. in a dependency) becomes
+/// `Err(message)` instead of unwinding through the caller. The task is aborted when the
+/// returned future is dropped, so cancellation still works.
+pub async fn run_isolated<T, F>(fut: F) -> std::result::Result<T, String>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut task = AbortOnDrop(tokio::spawn(fut));
+    match (&mut task.0).await {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            Err(payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".into()))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 impl SnmpClient {
     pub fn new(cfg: SnmpConfig) -> Self {
         Self { cfg }
@@ -380,28 +594,55 @@ impl SnmpClient {
         Duration::from_millis(self.cfg.timeout_ms.clamp(1, 600_000))
     }
 
+    /// Timeout of the cheap reachability probe (never longer than the configured timeout).
+    fn probe_timeout(&self) -> Duration {
+        self.per_request_timeout().min(PROBE_TIMEOUT)
+    }
+
     fn attempts(&self) -> u8 {
         self.cfg.retries.saturating_add(1)
     }
 
+    fn uses_bulk(&self) -> bool {
+        self.cfg.version != SnmpVersion::V1
+    }
+
+    /// `true` when the configured SNMPv3 auth/priv pair needs a privacy-key extension
+    /// (AES-192/256 with MD5 or SHA-1, AES-256 with SHA-224). Agents implement either the
+    /// Reeder or the Blumenthal method for it.
+    fn needs_key_extension(&self) -> bool {
+        self.cfg.version == SnmpVersion::V3
+            && self.cfg.v3.as_ref().is_some_and(|c| {
+                c.auth_password.is_some()
+                    && c.priv_password.is_some()
+                    && priv_cipher(c.priv_protocol)
+                        .priv_key_needs_extension(&auth_protocol(c.auth_protocol))
+            })
+    }
+
     /// Open a session to `addr` using `community` (community-string polling can override the
-    /// configured community for Cisco per-VLAN `community@vlan` indexing).
-    async fn open(&self, addr: SocketAddr, community: &str) -> Result<AsyncSession> {
+    /// configured community for Cisco per-VLAN `community@vlan` indexing). For SNMPv3 this
+    /// also runs engine discovery, which doubles as the reachability probe.
+    async fn open(
+        &self,
+        addr: SocketAddr,
+        community: &str,
+    ) -> std::result::Result<AsyncSession, SnmpPollError> {
         let start_id = ((now_ms() as i32) ^ (std::process::id() as i32)) & 0x7fff_ffff;
+        let other = |e: String| SnmpPollError::new(PollFailure::Other, e);
         match self.cfg.version {
             SnmpVersion::V1 => AsyncSession::new_v1(addr, community.as_bytes(), start_id)
                 .await
-                .map_err(|e| anyhow!("SNMPv1 session to {addr}: {e}")),
+                .map_err(|e| other(format!("SNMPv1 session to {addr}: {e}"))),
             SnmpVersion::V2c => AsyncSession::new_v2c(addr, community.as_bytes(), start_id)
                 .await
-                .map_err(|e| anyhow!("SNMPv2c session to {addr}: {e}")),
+                .map_err(|e| other(format!("SNMPv2c session to {addr}: {e}"))),
             SnmpVersion::V3 => {
                 let creds = self
                     .cfg
                     .v3
                     .as_ref()
-                    .ok_or_else(|| anyhow!("SNMPv3 requires credentials"))?;
-                let auth = snmp2::v3::Auth::NoAuthNoPriv;
+                    .ok_or_else(|| other("SNMPv3 requires credentials".into()))?;
                 let mut security = snmp2::v3::Security::new(
                     creds.username.as_bytes(),
                     creds.auth_password.as_deref().unwrap_or("").as_bytes(),
@@ -413,67 +654,70 @@ impl SnmpClient {
                         privacy_password: pw.as_bytes().to_vec(),
                     }),
                     (Some(_), None) => security.with_auth(snmp2::v3::Auth::AuthNoPriv),
-                    (None, Some(_)) => bail!(
-                        "SNMPv3 privacy requires an authentication password (authPriv has no \
-                         noAuthPriv mode)"
-                    ),
-                    (None, None) => security.with_auth(auth),
+                    (None, Some(_)) => {
+                        return Err(other(
+                            "SNMPv3 privacy requires an authentication password (there is no \
+                             noAuthPriv security level)"
+                                .into(),
+                        ))
+                    }
+                    (None, None) => security.with_auth(snmp2::v3::Auth::NoAuthNoPriv),
                 };
-                // AES-192/256 with MD5/SHA1 (and AES-256 with SHA224) need a key-extension
-                // method; default to Reeder and let the session fall back if needed.
-                if priv_cipher(creds.priv_protocol)
-                    .priv_key_needs_extension(&auth_protocol(creds.auth_protocol))
-                {
+                // AES-192/256 with MD5/SHA-1 (and AES-256 with SHA-224) need a key-extension
+                // method. Start with Reeder; `poll_device` retries the first encrypted request
+                // with Blumenthal when the agent cannot decrypt it.
+                if self.needs_key_extension() {
                     security = security.with_key_extension_method(snmp2::v3::KeyExtension::Reeder);
                 }
                 let mut session = AsyncSession::new_v3(addr, start_id, security)
                     .await
-                    .map_err(|e| anyhow!("SNMPv3 session to {addr}: {e}"))?;
-                // Engine-ID / boots-time discovery. AuthUpdated just means "state learned,
-                // retry"; a couple of rounds settles it.
-                let timeout = self.per_request_timeout();
-                let mut ok = false;
-                for _ in 0..MAX_AUTH_UPDATES {
-                    match tokio::time::timeout(timeout, session.init()).await {
-                        Ok(Ok(())) => {
-                            ok = true;
-                            break;
-                        }
+                    .map_err(|e| other(format!("SNMPv3 session to {addr}: {e}")))?;
+                // Engine-ID / boots-time discovery (unauthenticated, so it cannot detect a
+                // wrong key-extension method). AuthUpdated just means "state learned, retry".
+                let mut timeouts = 0u8;
+                for _ in 0..MAX_AUTH_UPDATES + PROBE_ATTEMPTS {
+                    match tokio::time::timeout(self.probe_timeout(), session.init()).await {
+                        Ok(Ok(())) => return Ok(session),
                         Ok(Err(snmp2::Error::AuthUpdated)) => continue,
                         Ok(Err(e)) => {
-                            // Try the alternate key-extension method once before giving up.
-                            if let Ok(Some(_)) = session.try_another_key_extension_method().await {
-                                continue;
-                            }
-                            bail!("SNMPv3 initialization failed: {e}");
+                            return Err(SnmpPollError::new(
+                                classify_snmp_error(&e),
+                                format!("SNMPv3 engine discovery with {addr} failed: {e}"),
+                            ))
                         }
-                        Err(_) => bail!("SNMPv3 initialization to {addr} timed out"),
+                        Err(_) => {
+                            timeouts += 1;
+                            if timeouts >= PROBE_ATTEMPTS {
+                                return Err(SnmpPollError::new(
+                                    PollFailure::NoResponse,
+                                    format!("no SNMPv3 response from {addr} (timeout)"),
+                                ));
+                            }
+                        }
                     }
                 }
-                if !ok {
-                    bail!("SNMPv3 engine discovery did not converge for {addr}");
-                }
-                Ok(session)
+                Err(other(format!(
+                    "SNMPv3 engine discovery did not converge for {addr}"
+                )))
             }
         }
     }
 
-    fn uses_bulk(&self) -> bool {
-        self.cfg.version != SnmpVersion::V1
-    }
-
     // ----- one-shot requests (each copies results out before returning) ----------------------
 
-    /// GET several scalar OIDs in one request; returns `(oid, value)` pairs.
-    async fn get_many(
+    /// GET several scalar OIDs in one request; returns `(oid, value)` pairs. Timeouts and
+    /// malformed replies are retried up to `attempts` times; authentication errors and ICMP
+    /// unreachables are not (retrying cannot fix them).
+    async fn get_many_with(
         &self,
         session: &mut AsyncSession,
         oids: &[Oid<'static>],
-    ) -> Result<Vec<OidRow>> {
+        timeout: Duration,
+        attempts: u8,
+    ) -> std::result::Result<Vec<OidRow>, SnmpPollError> {
         let refs: Vec<&Oid> = oids.iter().collect();
-        let timeout = self.per_request_timeout();
-        let mut last_err: Option<String> = None;
-        for _ in 0..self.attempts() {
+        let mut last: Option<SnmpPollError> = None;
+        for _ in 0..attempts.max(1) {
             let mut auth_rounds = 0u8;
             loop {
                 match tokio::time::timeout(timeout, session.get_many(&refs)).await {
@@ -494,20 +738,36 @@ impl SnmpClient {
                         continue;
                     }
                     Ok(Err(e)) => {
-                        last_err = Some(e.to_string());
+                        let err = SnmpPollError::new(
+                            classify_snmp_error(&e),
+                            format!("SNMP GET failed: {e}"),
+                        );
+                        if err.kind != PollFailure::Other {
+                            return Err(err);
+                        }
+                        last = Some(err);
                         break;
                     }
                     Err(_) => {
-                        last_err = Some("request timed out".into());
+                        last = Some(SnmpPollError::new(
+                            PollFailure::NoResponse,
+                            "SNMP GET timed out",
+                        ));
                         break;
                     }
                 }
             }
         }
-        Err(anyhow!(
-            "SNMP GET failed: {}",
-            last_err.unwrap_or_else(|| "no response".into())
-        ))
+        Err(last.unwrap_or_else(|| SnmpPollError::new(PollFailure::NoResponse, "no response")))
+    }
+
+    async fn get_many(
+        &self,
+        session: &mut AsyncSession,
+        oids: &[Oid<'static>],
+    ) -> std::result::Result<Vec<OidRow>, SnmpPollError> {
+        self.get_many_with(session, oids, self.per_request_timeout(), self.attempts())
+            .await
     }
 
     /// One GETBULK (v2c/v3) or GETNEXT (v1) step from `from`. Returns `(oid, value)` pairs in
@@ -516,10 +776,10 @@ impl SnmpClient {
         &self,
         session: &mut AsyncSession,
         from: &Oid<'static>,
-    ) -> Result<(Vec<OidRow>, u32)> {
+    ) -> std::result::Result<(Vec<OidRow>, u32), SnmpPollError> {
         let timeout = self.per_request_timeout();
         let bulk = self.uses_bulk();
-        let mut last_err: Option<String> = None;
+        let mut last: Option<SnmpPollError> = None;
         for _ in 0..self.attempts() {
             let mut auth_rounds = 0u8;
             loop {
@@ -549,38 +809,62 @@ impl SnmpClient {
                         continue;
                     }
                     Ok(Err(e)) => {
-                        last_err = Some(e.to_string());
+                        let err = SnmpPollError::new(
+                            classify_snmp_error(&e),
+                            format!("walk step failed: {e}"),
+                        );
+                        if err.kind != PollFailure::Other {
+                            return Err(err);
+                        }
+                        last = Some(err);
                         break;
                     }
                     Err(_) => {
-                        last_err = Some("request timed out".into());
+                        last = Some(SnmpPollError::new(
+                            PollFailure::NoResponse,
+                            "request timed out",
+                        ));
                         break;
                     }
                 }
             }
         }
-        Err(anyhow!(
-            "SNMP walk step failed: {}",
-            last_err.unwrap_or_else(|| "no response".into())
-        ))
+        Err(last.unwrap_or_else(|| SnmpPollError::new(PollFailure::NoResponse, "no response")))
     }
 
     /// Walk the subtree rooted at `base`, returning `(index-suffix, value)` rows. Stops at the
-    /// end of the subtree, on an SNMP end marker, when the agent fails to advance (loop), at
-    /// the row cap, or when the device deadline passes.
+    /// end of the subtree, on an SNMP end marker or when the agent fails to advance (loop).
+    /// Stops early, keeping the rows collected so far and reporting why, on a request failure,
+    /// at `row_cap` rows, when the byte budget is spent, on an over-long index, or when the
+    /// device deadline passes.
     async fn walk(
         &self,
         session: &mut AsyncSession,
         base: &[u64],
         deadline: Instant,
-    ) -> Result<Vec<OidRow>> {
+        row_cap: usize,
+    ) -> Walk {
+        let row_cap = row_cap.min(MAX_WALK_ROWS);
         let mut rows: Vec<OidRow> = Vec::new();
-        let mut cursor = oid(base);
+        let mut bytes = 0usize;
+        let mut cursor: Vec<u64> = base.to_vec();
+        if row_cap == 0 {
+            return Walk::cut(rows, "mapping cap reached; not walked");
+        }
         loop {
             if Instant::now() >= deadline {
-                break;
+                return Walk::cut(
+                    rows,
+                    format!(
+                        "device time budget ({} s) exhausted",
+                        DEVICE_BUDGET.as_secs()
+                    ),
+                );
             }
-            let (batch, err_status) = self.step(session, &cursor).await?;
+            let (batch, err_status) = match self.step(session, &oid(&cursor)).await {
+                Ok(v) => v,
+                Err(e) => return Walk::cut(rows, e.message),
+            };
             // v1 signals the end of a table with noSuchName (error-status 2).
             if !self.uses_bulk() && err_status != 0 {
                 break;
@@ -602,53 +886,138 @@ impl SnmpClient {
                 }
                 // Loop / non-advance protection: each OID must be strictly greater than the
                 // cursor we asked from.
-                if oid_le(&full, &oid_vec(&cursor)) {
+                if oid_le(&full, &cursor) {
                     done = true;
                     break;
+                }
+                if suffix.len() > MAX_INDEX_SUBIDS {
+                    return Walk::cut(rows, "agent returned an over-long table index");
+                }
+                bytes = bytes.saturating_add(suffix.len() * 8 + value.approx_size() + 32);
+                if bytes > MAX_WALK_BYTES {
+                    return Walk::cut(rows, "walk exceeded its memory budget");
                 }
                 rows.push((suffix.to_vec(), value));
                 last_full = Some(full);
                 advanced = true;
-                if rows.len() >= MAX_WALK_ROWS {
-                    done = true;
-                    break;
+                if rows.len() >= row_cap {
+                    return Walk::cut(rows, format!("row cap ({row_cap}) reached"));
                 }
             }
             if done || !advanced {
                 break;
             }
-            if let Some(full) = last_full {
-                cursor = oid(&full);
-            } else {
-                break;
+            match last_full {
+                Some(full) => cursor = full,
+                None => break,
             }
         }
-        Ok(rows)
+        Walk { rows, issue: None }
     }
 
     /// Poll one device and return its structured SNMP view. Fails (rather than returning an
-    /// empty record) when the system group cannot be read, so callers can treat the device as
-    /// not SNMP-reachable.
+    /// empty record) when the device does not answer or the system group cannot be read, so
+    /// callers can treat the device as not SNMP-reachable. Table walks that fail part-way
+    /// yield a `partial` result with the rows collected so far.
+    ///
+    /// The configuration is validated first, the poll holds one permit of the global
+    /// [`SocketBudget`], and the session work runs on its own task: a panic inside the SNMP
+    /// library becomes an error instead of tearing down the caller.
     pub async fn poll_device(&self, ip: IpAddr) -> Result<SnmpDeviceInfo> {
+        self.cfg
+            .validate()
+            .map_err(|e| SnmpPollError::new(PollFailure::Other, e.to_string()))?;
+        let _permit = SocketBudget::global().acquire().await;
+        let client = self.clone();
+        match run_isolated(async move { client.poll_device_inner(ip).await }).await {
+            Ok(res) => res,
+            Err(panic) => Err(SnmpPollError::new(
+                PollFailure::Other,
+                format!("SNMP poll of {ip} failed inside the SNMP library: {panic}"),
+            )
+            .into()),
+        }
+    }
+
+    async fn poll_device_inner(&self, ip: IpAddr) -> Result<SnmpDeviceInfo> {
         let deadline = Instant::now() + DEVICE_BUDGET;
         let addr = SocketAddr::new(ip, self.cfg.port);
         let community = self.cfg.community.clone();
         let mut session = self.open(addr, &community).await?;
 
-        // --- system group ---
-        let sys = self
-            .get_many(
+        // Cheap reachability probe before anything heavy (v3 engine discovery in `open`
+        // already was one): silent hosts cost one short timeout, not a full retry cycle.
+        if self.cfg.version != SnmpVersion::V3 {
+            self.get_many_with(
                 &mut session,
-                &[
-                    oid(SYS_DESCR),
-                    oid(SYS_OBJECT_ID),
-                    oid(SYS_UPTIME),
-                    oid(SYS_NAME),
-                    oid(SYS_SERVICES),
-                ],
+                &[oid(SYS_OBJECT_ID)],
+                self.probe_timeout(),
+                PROBE_ATTEMPTS.min(self.attempts()),
             )
             .await
-            .context("SNMP system group unreadable")?;
+            .map_err(|e| {
+                let hint = if e.kind == PollFailure::NoResponse {
+                    " (no agent, filtered, or wrong community)"
+                } else {
+                    ""
+                };
+                SnmpPollError::new(
+                    e.kind,
+                    format!("no SNMP response from {ip}: {}{hint}", e.message),
+                )
+            })?;
+        }
+
+        // --- system group (first authenticated / encrypted request for v3) ---
+        let sys_oids = [
+            oid(SYS_DESCR),
+            oid(SYS_OBJECT_ID),
+            oid(SYS_UPTIME),
+            oid(SYS_NAME),
+            oid(SYS_SERVICES),
+        ];
+        let sys = match self.get_many(&mut session, &sys_oids).await {
+            Ok(rows) => rows,
+            Err(first) if self.needs_key_extension() => {
+                // snmp2's engine discovery succeeds whichever key-extension method we picked;
+                // a mismatch only shows on the first encrypted request (a decryption report,
+                // or silence). Retry it once with the other method (Blumenthal).
+                let switched = tokio::time::timeout(
+                    self.per_request_timeout(),
+                    session.try_another_key_extension_method(),
+                )
+                .await;
+                match switched {
+                    Ok(Ok(Some(method))) => {
+                        tracing::debug!("SNMPv3 {ip}: retrying with key extension {method:?}");
+                        self.get_many(&mut session, &sys_oids).await.map_err(|e| {
+                            SnmpPollError::new(
+                                e.kind,
+                                format!(
+                                    "SNMP system group unreadable with either AES key-extension \
+                                     method (Reeder: {}; Blumenthal: {})",
+                                    first.message, e.message
+                                ),
+                            )
+                        })?
+                    }
+                    _ => {
+                        return Err(SnmpPollError::new(
+                            first.kind,
+                            format!("SNMP system group unreadable: {}", first.message),
+                        )
+                        .into())
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(SnmpPollError::new(
+                    e.kind,
+                    format!("SNMP system group unreadable: {}", e.message),
+                )
+                .into())
+            }
+        };
 
         let mut sys_descr = None;
         let mut sys_object_id = None;
@@ -675,60 +1044,61 @@ impl SnmpClient {
         }
         // A device that answers nothing of the system group is not really SNMP-reachable.
         if sys_descr.is_none() && sys_name.is_none() && sys_object_id.is_none() {
-            bail!("{ip} did not return any system MIB values");
+            return Err(SnmpPollError::new(
+                PollFailure::Other,
+                format!("{ip} did not return any system MIB values"),
+            )
+            .into());
         }
-
-        let role = classify_role(
-            sys_object_id.as_deref(),
-            sys_descr.as_deref().unwrap_or(""),
-            sys_services,
-        );
         let switch_name = sys_name.clone().unwrap_or_else(|| ip.to_string());
+        let mut warnings = Warnings::default();
 
         // --- VLANs (Q-BRIDGE static names, then Cisco VTP) ---
         let mut vlans: BTreeMap<u16, VlanInfo> = BTreeMap::new();
-        for (suffix, value) in self
-            .walk(&mut session, DOT1Q_VLAN_STATIC_NAME, deadline)
-            .await
-            .unwrap_or_default()
-        {
-            if let Some(&id) = suffix.last() {
-                if let Ok(id) = u16::try_from(id) {
-                    if (1..=MAX_VLAN_ID).contains(&id) {
-                        let v = vlans
-                            .entry(id)
-                            .or_insert_with(|| new_snmp_vlan(id, &switch_name));
-                        v.name = value.text().or_else(|| v.name.clone());
-                    }
-                }
+        let walk = self
+            .walk(
+                &mut session,
+                DOT1Q_VLAN_STATIC_NAME,
+                deadline,
+                MAX_WALK_ROWS,
+            )
+            .await;
+        warnings.note("Q-BRIDGE VLAN names", &walk);
+        for (suffix, value) in walk.rows {
+            if let Some(id) = vlan_index(&suffix) {
+                let v = vlans
+                    .entry(id)
+                    .or_insert_with(|| new_snmp_vlan(id, &switch_name));
+                v.name = value.text().or_else(|| v.name.clone());
             }
         }
-        for (suffix, value) in self
-            .walk(&mut session, VTP_VLAN_NAME, deadline)
-            .await
-            .unwrap_or_default()
-        {
-            if let Some(&id) = suffix.last() {
-                if let Ok(id) = u16::try_from(id) {
-                    if (1..=MAX_VLAN_ID).contains(&id) {
-                        let v = vlans
-                            .entry(id)
-                            .or_insert_with(|| new_snmp_vlan(id, &switch_name));
-                        if v.name.is_none() {
-                            v.name = value.text();
-                        }
-                    }
+        let walk = self
+            .walk(&mut session, VTP_VLAN_NAME, deadline, MAX_WALK_ROWS)
+            .await;
+        warnings.note("Cisco VTP VLAN names", &walk);
+        for (suffix, value) in walk.rows {
+            if let Some(id) = vlan_index(&suffix) {
+                let v = vlans
+                    .entry(id)
+                    .or_insert_with(|| new_snmp_vlan(id, &switch_name));
+                if v.name.is_none() {
+                    v.name = value.text();
                 }
             }
         }
 
         // --- interface-name maps ---
         let mut base_port_ifindex: HashMap<u32, u32> = HashMap::new();
-        for (suffix, value) in self
-            .walk(&mut session, DOT1D_BASE_PORT_IFINDEX, deadline)
-            .await
-            .unwrap_or_default()
-        {
+        let walk = self
+            .walk(
+                &mut session,
+                DOT1D_BASE_PORT_IFINDEX,
+                deadline,
+                MAX_WALK_ROWS,
+            )
+            .await;
+        warnings.note("BRIDGE-MIB port table", &walk);
+        for (suffix, value) in walk.rows {
             if let (Some(&port), Some(ifindex)) = (suffix.last(), value.as_u32()) {
                 if let Ok(port) = u32::try_from(port) {
                     base_port_ifindex.insert(port, ifindex);
@@ -736,22 +1106,22 @@ impl SnmpClient {
             }
         }
         let mut if_names: HashMap<u32, String> = HashMap::new();
-        for (suffix, value) in self
-            .walk(&mut session, IF_NAME, deadline)
-            .await
-            .unwrap_or_default()
-        {
+        let walk = self
+            .walk(&mut session, IF_NAME, deadline, MAX_WALK_ROWS)
+            .await;
+        warnings.note("ifName", &walk);
+        for (suffix, value) in walk.rows {
             if let (Some(&ifindex), Some(name)) = (suffix.last(), value.text()) {
                 if let Ok(ifindex) = u32::try_from(ifindex) {
                     if_names.insert(ifindex, name);
                 }
             }
         }
-        for (suffix, value) in self
-            .walk(&mut session, IF_DESCR, deadline)
-            .await
-            .unwrap_or_default()
-        {
+        let walk = self
+            .walk(&mut session, IF_DESCR, deadline, MAX_WALK_ROWS)
+            .await;
+        warnings.note("ifDescr", &walk);
+        for (suffix, value) in walk.rows {
             if let (Some(&ifindex), Some(name)) = (suffix.last(), value.text()) {
                 if let Ok(ifindex) = u32::try_from(ifindex) {
                     if_names.entry(ifindex).or_insert(name);
@@ -760,15 +1130,21 @@ impl SnmpClient {
         }
 
         // --- forwarding database → MAC-to-port ---
-        // Keyed by (vlan, mac) so the same MAC on two VLANs is two mappings.
+        // Keyed by (vlan, mac) so the same MAC on two VLANs is two mappings. At most
+        // MAX_DEVICE_MAPPINGS across every table and VLAN context.
         let mut mappings: FdbMap = FdbMap::new();
 
         // Preferred: Q-BRIDGE per-VLAN FDB (also yields the VLAN id).
-        for (suffix, value) in self
-            .walk(&mut session, DOT1Q_TP_FDB_PORT, deadline)
-            .await
-            .unwrap_or_default()
-        {
+        let walk = self
+            .walk(
+                &mut session,
+                DOT1Q_TP_FDB_PORT,
+                deadline,
+                MAX_DEVICE_MAPPINGS,
+            )
+            .await;
+        warnings.note("Q-BRIDGE FDB", &walk);
+        for (suffix, value) in walk.rows {
             if let (Some((vlan, mac)), Some(port)) =
                 (vlan_and_mac_from_suffix(&suffix), value.as_u32())
             {
@@ -779,11 +1155,16 @@ impl SnmpClient {
         }
         // Fallback: classic 802.1D FDB (no VLAN in the index).
         if mappings.is_empty() {
-            for (suffix, value) in self
-                .walk(&mut session, DOT1D_TP_FDB_PORT, deadline)
-                .await
-                .unwrap_or_default()
-            {
+            let walk = self
+                .walk(
+                    &mut session,
+                    DOT1D_TP_FDB_PORT,
+                    deadline,
+                    MAX_DEVICE_MAPPINGS,
+                )
+                .await;
+            warnings.note("BRIDGE-MIB FDB", &walk);
+            for (suffix, value) in walk.rows {
                 if let (Some(mac), Some(port)) = (mac_from_suffix(&suffix), value.as_u32()) {
                     if port != 0 {
                         mappings.insert((None, mac), (port, None));
@@ -791,29 +1172,54 @@ impl SnmpClient {
                 }
             }
         }
+        // The per-VLAN loop opens its own sessions; release this socket first.
+        drop(session);
         // Cisco Catalyst per-VLAN community indexing when the bridge tables came back empty.
         if mappings.is_empty() && self.cfg.version != SnmpVersion::V3 && !vlans.is_empty() {
-            for &vid in vlans.keys().take(MAX_COMMUNITY_VLANS) {
+            for &vid in vlans
+                .keys()
+                .filter(|v| !CISCO_RESERVED_VLANS.contains(v))
+                .take(MAX_COMMUNITY_VLANS)
+            {
                 if Instant::now() >= deadline {
+                    warnings.push(format!(
+                        "per-VLAN FDB: device time budget ({} s) exhausted at VLAN {vid}",
+                        DEVICE_BUDGET.as_secs()
+                    ));
                     break;
                 }
-                let community = format!("{community}@{vid}");
-                let Ok(mut vsession) = self.open(addr, &community).await else {
+                let remaining = MAX_DEVICE_MAPPINGS.saturating_sub(mappings.len());
+                if remaining == 0 {
+                    warnings.push(format!(
+                        "per-VLAN FDB: mapping cap ({MAX_DEVICE_MAPPINGS}) reached at VLAN {vid}"
+                    ));
+                    break;
+                }
+                let vcommunity = format!("{community}@{vid}");
+                let Ok(mut vsession) = self.open(addr, &vcommunity).await else {
                     continue;
                 };
-                for (suffix, value) in self
-                    .walk(&mut vsession, DOT1D_TP_FDB_PORT, deadline)
-                    .await
-                    .unwrap_or_default()
-                {
+                let walk = self
+                    .walk(&mut vsession, DOT1D_TP_FDB_PORT, deadline, remaining)
+                    .await;
+                warnings.note(&format!("BRIDGE-MIB FDB (VLAN {vid})"), &walk);
+                for (suffix, value) in walk.rows {
                     if let (Some(mac), Some(port)) = (mac_from_suffix(&suffix), value.as_u32()) {
-                        if port != 0 {
+                        if port != 0 && mappings.len() < MAX_DEVICE_MAPPINGS {
                             mappings.insert((Some(vid), mac), (port, Some(vid)));
                         }
                     }
                 }
             }
         }
+
+        // Role, now that we know whether the agent has a bridge (BRIDGE-MIB port table).
+        let role = classify_role(
+            sys_object_id.as_deref(),
+            sys_descr.as_deref().unwrap_or(""),
+            sys_services,
+            !base_port_ifindex.is_empty(),
+        );
 
         // Count MACs per resolved port name, then build the mapping list.
         let mut counts: HashMap<(String, Option<u32>), u32> = HashMap::new();
@@ -845,6 +1251,7 @@ impl SnmpClient {
                 .then(a.port_name.cmp(&b.port_name))
         });
 
+        let warnings = warnings.into_lines();
         Ok(SnmpDeviceInfo {
             sys_name,
             sys_descr,
@@ -854,8 +1261,20 @@ impl SnmpClient {
             vlans: vlans.into_values().collect(),
             port_mappings,
             port_mac_counts,
+            partial: !warnings.is_empty(),
+            warnings,
         })
     }
+}
+
+/// Cisco's default FDDI / Token Ring VLANs: never carry Ethernet MACs, and their
+/// `community@vlan` contexts usually do not answer (each would cost a full timeout).
+const CISCO_RESERVED_VLANS: [u16; 4] = [1002, 1003, 1004, 1005];
+
+/// The VLAN id at the end of a VLAN-table index, when it is a valid 802.1Q id.
+fn vlan_index(suffix: &[u64]) -> Option<u16> {
+    let id = u16::try_from(*suffix.last()?).ok()?;
+    (1..=MAX_VLAN_ID).contains(&id).then_some(id)
 }
 
 fn new_snmp_vlan(id: u16, switch_name: &str) -> VlanInfo {
@@ -871,10 +1290,6 @@ fn oid_to_string(parts: &[u64]) -> String {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(".")
-}
-
-fn oid_vec(o: &Oid<'_>) -> Vec<u64> {
-    o.iter().map(|it| it.collect()).unwrap_or_default()
 }
 
 /// `a <= b` by SNMP lexicographic OID order.
@@ -894,18 +1309,75 @@ fn oid_le(a: &[u64], b: &[u64]) -> bool {
 // Concurrent candidate probing
 // ---------------------------------------------------------------------------------------------
 
+/// Outcome counts of one [`probe_candidates`] run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnmpPollStats {
+    pub polled: usize,
+    pub ok: usize,
+    /// Of `ok`: results with failed / truncated table walks.
+    pub partial: usize,
+    pub no_response: usize,
+    pub auth_failures: usize,
+    pub errors: usize,
+}
+
+impl SnmpPollStats {
+    /// The per-scan summary log line.
+    pub fn summary(&self) -> String {
+        format!(
+            "SNMP: polled {} host(s): {} answered ({} partial), {} no response / timeout, {} \
+             authentication failure(s), {} other error(s)",
+            self.polled, self.ok, self.partial, self.no_response, self.auth_failures, self.errors
+        )
+    }
+
+    fn record(&mut self, outcome: PollOutcome) {
+        match outcome {
+            PollOutcome::Skipped => return,
+            PollOutcome::Ok { partial } => {
+                self.ok += 1;
+                if partial {
+                    self.partial += 1;
+                }
+            }
+            PollOutcome::Failed(PollFailure::NoResponse) => self.no_response += 1,
+            PollOutcome::Failed(PollFailure::Auth) => self.auth_failures += 1,
+            PollOutcome::Failed(PollFailure::Other) => self.errors += 1,
+        }
+        self.polled += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PollOutcome {
+    Skipped,
+    Ok { partial: bool },
+    Failed(PollFailure),
+}
+
 /// Poll every candidate in `ips` with bounded concurrency, emitting a [`ScanEvent::Device`]
 /// (role + SNMP evidence), one [`ScanEvent::Vlan`] per discovered VLAN and one
-/// [`ScanEvent::PortMapping`] per learned MAC. Cancellation stops dispatch promptly.
+/// [`ScanEvent::PortMapping`] per learned MAC (at most [`MAX_DEVICE_MAPPINGS`] per device).
+/// Cancellation stops dispatch promptly. One unit of `progress` is counted per candidate.
+///
+/// Partial results and non-timeout failures are logged per device (the first
+/// [`MAX_FAILURE_LOGS`] to the scan log, all of them to `tracing`), and a summary line with
+/// the outcome counts ends the run.
 pub async fn probe_candidates(
     ips: Vec<IpAddr>,
     cfg: &SnmpConfig,
     tx: Sender<ScanEvent>,
     cancel: CancellationToken,
-) {
+    progress: ProgressScope,
+) -> SnmpPollStats {
     let client = SnmpClient::new(cfg.clone());
-    let semaphore = std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS));
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS));
+    let logged = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut stats = SnmpPollStats::default();
+    let record = |stats: &mut SnmpPollStats, res: Result<PollOutcome, tokio::task::JoinError>| {
+        stats.record(res.unwrap_or(PollOutcome::Failed(PollFailure::Other)));
+    };
 
     for ip in ips {
         if cancel.is_cancelled() {
@@ -915,24 +1387,64 @@ pub async fn probe_candidates(
             Ok(p) => p,
             Err(_) => break,
         };
-        let (client, tx, cancel) = (client.clone(), tx.clone(), cancel.clone());
+        let (client, tx, cancel, logged, progress) = (
+            client.clone(),
+            tx.clone(),
+            cancel.clone(),
+            logged.clone(),
+            progress.clone(),
+        );
         tasks.spawn(async move {
             let _permit = permit;
-            if cancel.is_cancelled() {
-                return;
-            }
-            let info = tokio::select! {
-                _ = cancel.cancelled() => return,
-                res = client.poll_device(ip) => match res {
-                    Ok(info) => info,
-                    Err(_) => return, // unreachable / wrong credentials: silently skip
-                },
+            let res = if cancel.is_cancelled() {
+                None
+            } else {
+                tokio::select! {
+                    _ = cancel.cancelled() => None,
+                    res = client.poll_device(ip) => Some(res),
+                }
             };
-            emit_device_info(ip, &info, &tx).await;
+            progress.add(1);
+            let may_log = || logged.fetch_add(1, Ordering::Relaxed) < MAX_FAILURE_LOGS;
+            match res {
+                None => PollOutcome::Skipped,
+                Some(Ok(info)) => {
+                    if info.partial {
+                        tracing::info!("SNMP {ip}: partial result: {}", info.warnings.join("; "));
+                        if may_log() {
+                            let _ = tx
+                                .send(ScanEvent::warn(format!(
+                                    "SNMP {ip}: partial result ({})",
+                                    info.warnings.join("; ")
+                                )))
+                                .await;
+                        }
+                    }
+                    emit_device_info(ip, &info, &tx).await;
+                    PollOutcome::Ok {
+                        partial: info.partial,
+                    }
+                }
+                Some(Err(e)) => {
+                    let kind = failure_kind(&e);
+                    tracing::debug!("SNMP poll of {ip} failed: {e:#}");
+                    // Silent hosts are the common case on a mixed network: count them only.
+                    if kind != PollFailure::NoResponse && may_log() {
+                        let _ = tx.send(ScanEvent::warn(format!("SNMP {ip}: {e:#}"))).await;
+                    }
+                    PollOutcome::Failed(kind)
+                }
+            }
         });
-        while tasks.try_join_next().is_some() {}
+        while let Some(res) = tasks.try_join_next() {
+            record(&mut stats, res);
+        }
     }
-    while tasks.join_next().await.is_some() {}
+    while let Some(res) = tasks.join_next().await {
+        record(&mut stats, res);
+    }
+    let _ = tx.send(ScanEvent::info(stats.summary())).await;
+    stats
 }
 
 /// Turn one [`SnmpDeviceInfo`] into stream events for `ip`.
@@ -951,7 +1463,7 @@ async fn emit_device_info(ip: IpAddr, info: &SnmpDeviceInfo, tx: &Sender<ScanEve
     for v in &info.vlans {
         let _ = tx.send(ScanEvent::Vlan(v.clone())).await;
     }
-    for pm in &info.port_mappings {
+    for pm in info.port_mappings.iter().take(MAX_DEVICE_MAPPINGS) {
         let _ = tx.send(ScanEvent::PortMapping(pm.clone())).await;
     }
 }
@@ -1037,42 +1549,156 @@ mod tests {
             classify_role(
                 Some("1.3.6.1.4.1.9.1.516"),
                 "Cisco IOS Software, Catalyst L3 Switch",
-                None
+                None,
+                true
             ),
             DeviceRole::Switch
         );
         assert_eq!(
-            classify_role(Some("1.3.6.1.4.1.12356.101.1"), "FortiGate-60F", None),
+            classify_role(
+                Some("1.3.6.1.4.1.12356.101.1"),
+                "FortiGate-60F",
+                None,
+                false
+            ),
             DeviceRole::Firewall
         );
         assert_eq!(
             classify_role(
                 Some("1.3.6.1.4.1.25461.2.3"),
                 "Palo Alto Networks PA-220",
-                None
+                None,
+                false
             ),
             DeviceRole::Firewall
         );
         assert_eq!(
-            classify_role(None, "Cisco Aironet 2800 Series AP Software", None),
+            classify_role(None, "Cisco Aironet 2800 Series AP Software", None, false),
             DeviceRole::AccessPoint
         );
         assert_eq!(
-            classify_role(Some("1.3.6.1.4.1.14988.1"), "RouterOS RB750", None),
+            classify_role(Some("1.3.6.1.4.1.14988.1"), "RouterOS RB750", None, false),
             DeviceRole::Router
         );
-        // No keywords: sysServices datalink-only => switch; vendor-only => switch; host.
+        // No keywords: sysServices datalink-only => switch; network-only vendor => switch.
         assert_eq!(
-            classify_role(None, "some device", Some(0b10)),
+            classify_role(None, "some device", Some(0b10), false),
             DeviceRole::Switch
         );
         assert_eq!(
-            classify_role(Some("1.3.6.1.4.1.2636.1.1"), "junos box", None),
+            classify_role(Some("1.3.6.1.4.1.2636.1.1"), "junos box", None, false),
             DeviceRole::Switch
         );
         assert_eq!(
-            classify_role(None, "Linux server 5.15", Some(0b1001110)),
+            classify_role(None, "Linux server 5.15", Some(0b1001110), false),
             DeviceRole::Host
+        );
+    }
+
+    /// M6: vendors that also make printers, servers, APs or cameras are not switches by
+    /// enterprise number alone.
+    #[test]
+    fn role_classification_avoids_vendor_only_false_positives() {
+        // HP JetDirect printer: enterprise 11, sysServices 72 (L4 + L7).
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.11.2.3.9.1"),
+                "HP ETHERNET MULTI-ENVIRONMENT,ROM none,JETDIRECT,JD153,EEPROM JSI24",
+                Some(72),
+                false
+            ),
+            DeviceRole::Host
+        );
+        // ... even when it happens to expose a bridge table.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.11.2.3.9.1"),
+                "HP LaserJet",
+                Some(72),
+                true
+            ),
+            DeviceRole::Host
+        );
+        // An HP/HPE server with an agent: enterprise 11, no bridge evidence.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.11.5.7"),
+                "Linux ilo 5.10",
+                Some(72),
+                false
+            ),
+            DeviceRole::Host
+        );
+        // HP ProCurve switch subtree, or bridge evidence, is a switch.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.11.2.3.7.11.181"),
+                "2930F-24G",
+                Some(72),
+                false
+            ),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.11.2.14.11.5"), "ArubaOS", Some(72), true),
+            DeviceRole::Switch
+        );
+        // Aruba (14823) and Ubiquiti (41112) without evidence: not assumed to be switches.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.14823.1.1.36"),
+                "ArubaOS 8.10",
+                Some(72),
+                false
+            ),
+            DeviceRole::Host
+        );
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.41112.1.4"),
+                "Linux 4.4.153",
+                Some(72),
+                false
+            ),
+            DeviceRole::Host
+        );
+        // UniFi switch: keyword (or bridge evidence) makes it a switch.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.41112.1.6"),
+                "USW-24-PoE, 6.5.59",
+                Some(72),
+                false
+            ),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.41112.1.6"), "Linux 3.6.5", Some(72), true),
+            DeviceRole::Switch
+        );
+        // UniFi AP.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.41112.1.6"),
+                "UAP-AC-Pro 6.5.62",
+                Some(72),
+                true
+            ),
+            DeviceRole::AccessPoint
+        );
+        // FortiSwitch / FortiAP are not firewalls.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.12356.106.1"),
+                "FortiSwitch-148F-FPOE",
+                None,
+                true
+            ),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.12356.120.1"), "FortiAP-231F", None, false),
+            DeviceRole::AccessPoint
         );
     }
 
@@ -1190,6 +1816,16 @@ mod tests {
     /// A tiny fixed SNMPv2c agent: answers the system group GET and the two table walks the
     /// poller performs, returning end-of-MIB markers to terminate.
     async fn fake_agent(sock: UdpSocket, cancel: CancellationToken) {
+        fake_agent_with(sock, cancel, false).await
+    }
+
+    /// `stall_vlan_continuation`: never answer the VLAN-name walk's second request (a walk
+    /// that breaks part-way).
+    async fn fake_agent_with(
+        sock: UdpSocket,
+        cancel: CancellationToken,
+        stall_vlan_continuation: bool,
+    ) {
         let mut buf = [0u8; 65535];
         loop {
             let (n, peer) = tokio::select! {
@@ -1210,6 +1846,15 @@ mod tests {
                     .unwrap_or_default()
             });
 
+            let vlan_base: &[u64] = &[1, 3, 6, 1, 2, 1, 17, 7, 1, 4, 3, 1, 1];
+            if stall_vlan_continuation
+                && is_bulk
+                && first
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with(vlan_base) && f != vlan_base)
+            {
+                continue;
+            }
             let varbinds = build_reply(first.as_deref(), is_bulk, &mut vb);
             let pdu = ber::tlv(
                 0xa2,
@@ -1323,6 +1968,112 @@ mod tests {
 
         cancel.cancel();
         let _ = agent.await;
+    }
+
+    /// M4: a walk that stops answering part-way keeps the rows it already collected, and the
+    /// device result is flagged partial instead of losing everything.
+    #[tokio::test]
+    async fn failing_walk_returns_partial_rows() {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        // The fake answers the VLAN table's first batch but never its continuation.
+        let agent = tokio::spawn(fake_agent_with(sock, cancel.clone(), true));
+        let cfg = SnmpConfig {
+            port: addr.port(),
+            timeout_ms: 300,
+            retries: 1,
+            ..SnmpConfig::v2c("public")
+        };
+        let client = SnmpClient::new(cfg);
+        let info = client
+            .poll_device(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .expect("a partial poll still succeeds");
+        let ids: Vec<u16> = info.vlans.iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec![1, 20], "rows before the failure are kept");
+        assert!(info.partial);
+        assert!(
+            info.warnings
+                .iter()
+                .any(|w| w.contains("Q-BRIDGE VLAN names")),
+            "{:?}",
+            info.warnings
+        );
+        cancel.cancel();
+        let _ = agent.await;
+    }
+
+    /// M3: a panic inside the session work (e.g. snmp2's key localization on an empty
+    /// password) must surface as an error, not kill the caller.
+    #[tokio::test]
+    async fn panics_in_session_work_become_errors() {
+        let res: std::result::Result<(), String> =
+            run_isolated(async { panic!("index out of bounds") }).await;
+        assert_eq!(res.unwrap_err(), "index out of bounds");
+        assert_eq!(run_isolated(async { 7 }).await, Ok(7));
+        // Invalid credentials are rejected before any session is opened.
+        let cfg = SnmpConfig {
+            version: SnmpVersion::V3,
+            v3: Some(crate::models::SnmpV3Credentials {
+                username: "u".into(),
+                auth_password: Some(String::new()),
+                ..Default::default()
+            }),
+            ..SnmpConfig::default()
+        };
+        let err = SnmpClient::new(cfg)
+            .poll_device(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 8"), "{err}");
+    }
+
+    #[test]
+    fn values_and_walk_rows_are_bounded() {
+        let big = vec![b'x'; 10_000];
+        let v = SnmpValue::from_value(&Value::OctetString(&big));
+        assert_eq!(v.octets().unwrap().len(), MAX_VALUE_BYTES);
+        let mut w = Warnings::default();
+        for i in 0..MAX_POLL_WARNINGS + 3 {
+            w.push(format!("w{i}"));
+        }
+        let lines = w.into_lines();
+        assert_eq!(lines.len(), MAX_POLL_WARNINGS + 1);
+        assert!(lines.last().unwrap().contains("3 more"));
+        assert_eq!(vlan_index(&[1, 20]), Some(20));
+        assert_eq!(vlan_index(&[0]), None);
+        assert_eq!(vlan_index(&[4095]), None);
+    }
+
+    #[test]
+    fn poll_stats_summary_counts_outcomes() {
+        let mut s = SnmpPollStats::default();
+        s.record(PollOutcome::Ok { partial: false });
+        s.record(PollOutcome::Ok { partial: true });
+        s.record(PollOutcome::Failed(PollFailure::NoResponse));
+        s.record(PollOutcome::Failed(PollFailure::Auth));
+        s.record(PollOutcome::Failed(PollFailure::Other));
+        s.record(PollOutcome::Skipped);
+        assert_eq!(
+            s,
+            SnmpPollStats {
+                polled: 5,
+                ok: 2,
+                partial: 1,
+                no_response: 1,
+                auth_failures: 1,
+                errors: 1
+            }
+        );
+        let line = s.summary();
+        assert!(
+            line.contains("polled 5") && line.contains("1 authentication"),
+            "{line}"
+        );
+        let e: anyhow::Error = SnmpPollError::new(PollFailure::Auth, "nope").into();
+        assert_eq!(failure_kind(&e.context("outer")), PollFailure::Auth);
+        assert_eq!(failure_kind(&anyhow::anyhow!("x")), PollFailure::Other);
     }
 
     #[tokio::test]

@@ -1079,7 +1079,7 @@ impl fmt::Debug for SnmpV3Credentials {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SnmpConfig {
     pub version: SnmpVersion,
@@ -1089,6 +1089,24 @@ pub struct SnmpConfig {
     pub timeout_ms: u64,
     pub retries: u8,
 }
+
+// The community string is a shared secret: never print it.
+impl fmt::Debug for SnmpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnmpConfig")
+            .field("version", &self.version)
+            .field("community", &"<redacted>")
+            .field("v3", &self.v3)
+            .field("port", &self.port)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("retries", &self.retries)
+            .finish()
+    }
+}
+
+/// RFC 3414 (section 11.2) requires SNMPv3 passwords of at least 8 characters; the key
+/// localization of shorter (and especially empty) passwords is undefined.
+pub const MIN_SNMPV3_PASSWORD_LEN: usize = 8;
 
 impl Default for SnmpConfig {
     fn default() -> Self {
@@ -1111,14 +1129,41 @@ impl SnmpConfig {
         }
     }
 
-    /// Validate the SNMP settings in isolation (SNMPv3 needs a username; timeout and retries
-    /// are bounded). Used by both [`ScanConfig::validate`] and the GUI `query_snmp` command.
+    /// Validate the SNMP settings in isolation. Used by [`ScanConfig::validate`], the CLI and
+    /// the GUI `query_snmp` command.
+    ///
+    /// * The UDP port must not be 0; timeout and retries are bounded.
+    /// * SNMPv3 needs a username; any password given must be at least
+    ///   [`MIN_SNMPV3_PASSWORD_LEN`] characters (RFC 3414), and a privacy password needs an
+    ///   authentication password (there is no noAuthPriv security level).
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.version == SnmpVersion::V3 && self.v3.as_ref().is_none_or(|c| c.username.is_empty())
-        {
-            return Err(ModelError::InvalidConfig(
-                "SNMPv3 requires a username".into(),
-            ));
+        let invalid = |m: &str| Err(ModelError::InvalidConfig(m.into()));
+        if self.port == 0 {
+            return invalid("snmp.port must be between 1 and 65535");
+        }
+        if self.version == SnmpVersion::V3 {
+            let Some(creds) = self.v3.as_ref().filter(|c| !c.username.is_empty()) else {
+                return invalid("SNMPv3 requires a username");
+            };
+            for (name, pw) in [
+                ("authentication", &creds.auth_password),
+                ("privacy", &creds.priv_password),
+            ] {
+                if let Some(pw) = pw {
+                    if pw.chars().count() < MIN_SNMPV3_PASSWORD_LEN {
+                        return Err(ModelError::InvalidConfig(format!(
+                            "the SNMPv3 {name} password must be at least \
+                             {MIN_SNMPV3_PASSWORD_LEN} characters (RFC 3414)"
+                        )));
+                    }
+                }
+            }
+            if creds.auth_password.is_none() && creds.priv_password.is_some() {
+                return invalid(
+                    "SNMPv3 privacy requires an authentication password (there is no \
+                     noAuthPriv security level)",
+                );
+            }
         }
         if !(1..=MAX_TIMEOUT_MS).contains(&self.timeout_ms) {
             return Err(ModelError::InvalidConfig(format!(
@@ -1159,6 +1204,10 @@ pub struct ScanConfig {
     /// Listen for CDP/LLDP advertisements while scanning.
     pub cdp_lldp: bool,
     pub snmp: Option<SnmpConfig>,
+    /// Poll every discovered host over SNMP instead of only likely infrastructure (gateway,
+    /// CDP/LLDP neighbors, hosts with management ports open, network-vendor MACs, devices
+    /// already classified as infrastructure). Slow on large ranges.
+    pub snmp_all: bool,
     /// Discover IPv6 link-local / global addresses via ICMPv6 NDP.
     pub ipv6: bool,
     pub ports: Vec<u16>,
@@ -1185,6 +1234,7 @@ impl Default for ScanConfig {
             discover_vlans: false,
             cdp_lldp: false,
             snmp: None,
+            snmp_all: false,
             ipv6: false,
             ports: DEFAULT_PORTS.to_vec(),
             resolve_names: true,
@@ -1235,15 +1285,7 @@ impl ScanConfig {
             return Err(ModelError::InvalidPort("port 0".into()));
         }
         if let Some(snmp) = &self.snmp {
-            if snmp.version == SnmpVersion::V3
-                && snmp.v3.as_ref().is_none_or(|c| c.username.is_empty())
-            {
-                return Err(ModelError::InvalidConfig(
-                    "SNMPv3 requires a username".into(),
-                ));
-            }
-            bound("snmp.timeout_ms", snmp.timeout_ms, 1, MAX_TIMEOUT_MS)?;
-            bound("snmp.retries", u64::from(snmp.retries), 0, MAX_RETRIES)?;
+            snmp.validate()?;
         }
         Ok(())
     }
@@ -1276,13 +1318,21 @@ pub struct SnmpDeviceInfo {
     pub vlans: Vec<VlanInfo>,
     pub port_mappings: Vec<SwitchPortMapping>,
     pub port_mac_counts: Vec<PortMacCount>,
+    /// `true` when some table walks failed or were cut short (timeout, device budget, row
+    /// cap): the data above is what was collected before that happened.
+    #[serde(default)]
+    pub partial: bool,
+    /// Why the result is partial (one line per failed or truncated walk).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Longest override text kept (hostname / comments the user types in the GUI).
 pub const MAX_OVERRIDE_LEN: usize = 1024;
 
-/// A user-assigned label and free-form note for one device, persisted locally by the GUI and
-/// applied to emitted [`Device`]s by the engine. Keyed by [`Device::key`].
+/// A user-assigned label and free-form note for one device, persisted locally by the GUI.
+/// The GUI applies overrides itself; the CLI scan path copies them into emitted [`Device`]s
+/// (see `engine::ScanOptions`). Keyed by [`Device::key`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DeviceOverride {
@@ -1746,6 +1796,73 @@ mod tests {
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("hunter"));
         assert!(dbg.contains("admin"));
+        // The v1/v2c community is a secret too.
+        let cfg = SnmpConfig::v2c("s3cr3t-community");
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("s3cr3t"), "{dbg}");
+        assert!(dbg.contains("<redacted>"));
+        let scan = ScanConfig {
+            snmp: Some(cfg),
+            ..Default::default()
+        };
+        assert!(!format!("{scan:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn snmp_validation_rejects_unusable_credentials() {
+        let v3 = |auth: Option<&str>, privacy: Option<&str>| SnmpConfig {
+            version: SnmpVersion::V3,
+            v3: Some(SnmpV3Credentials {
+                username: "monitor".into(),
+                auth_password: auth.map(String::from),
+                priv_password: privacy.map(String::from),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Valid security levels: noAuthNoPriv, authNoPriv, authPriv.
+        assert!(v3(None, None).validate().is_ok());
+        assert!(v3(Some("authpass1"), None).validate().is_ok());
+        assert!(v3(Some("authpass1"), Some("privpass1")).validate().is_ok());
+        // Empty / short passwords would make the key localization panic or be insecure.
+        assert!(v3(Some(""), None).validate().is_err());
+        assert!(v3(Some("short"), None).validate().is_err());
+        assert!(v3(Some("authpass1"), Some("")).validate().is_err());
+        assert!(v3(Some("authpass1"), Some("1234567")).validate().is_err());
+        // Privacy without authentication does not exist.
+        assert!(v3(None, Some("privpass1")).validate().is_err());
+        // Missing username.
+        let mut no_user = v3(None, None);
+        no_user.v3.as_mut().unwrap().username.clear();
+        assert!(no_user.validate().is_err());
+        // Port 0.
+        let port0 = SnmpConfig {
+            port: 0,
+            ..SnmpConfig::v2c("public")
+        };
+        assert!(port0.validate().is_err());
+        // ScanConfig validation delegates to the SNMP rules.
+        let scan = ScanConfig {
+            snmp: Some(v3(Some("short"), None)),
+            ..Default::default()
+        };
+        assert!(scan.validate().is_err());
+    }
+
+    #[test]
+    fn snmp_device_info_partial_fields_default_when_absent() {
+        let json = r#"{"sysName":null,"sysDescr":null,"sysUptimeTicks":null,"sysObjectId":null,
+            "role":"switch","vlans":[],"portMappings":[],"portMacCounts":[]}"#;
+        let info: SnmpDeviceInfo = serde_json::from_str(json).unwrap();
+        assert!(!info.partial && info.warnings.is_empty());
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["partial"], false);
+        assert!(v["warnings"].as_array().unwrap().is_empty());
+        // `snmpAll` is optional on the wire and defaults to off.
+        let cfg: ScanConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.snmp_all);
+        let cfg: ScanConfig = serde_json::from_str(r#"{"snmpAll":true}"#).unwrap();
+        assert!(cfg.snmp_all);
     }
 
     #[test]

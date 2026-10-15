@@ -633,6 +633,8 @@ export function createMockBackend(): Backend {
             vlans,
             portMappings: mappings,
             portMacCounts: [...counts].map(([portName, c]) => ({ portName, ...c })),
+            partial: false,
+            warnings: [],
           };
           resolve(info);
         }, 500);
