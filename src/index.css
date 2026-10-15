@@ -1,0 +1,176 @@
+@import "tailwindcss";
+
+/* Design tokens: macOS-like light/dark palette driven by prefers-color-scheme. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --chrome: #ececec;
+  --chrome-2: #e3e3e3;
+  --panel: #f6f6f6;
+  --field: #ffffff;
+  --line: #d4d4d4;
+  --line-soft: #e6e6e6;
+  --fg: #1d1d1f;
+  --muted: #6e6e73;
+  --faint: #a1a1a6;
+  --accent: #0a64d8;
+  --accent-fg: #ffffff;
+  --accent-soft: #dbe8fb;
+  --row-alt: #f5f7fa;
+  --row-hover: #eaf1fb;
+  --row-sel: #0a64d8;
+  --row-sel-fg: #ffffff;
+  --row-sel-blur: #d4dbe6;
+  --danger: #d6342c;
+  --danger-soft: #fde7e6;
+  --warn: #b25f00;
+  --warn-soft: #fff1dc;
+  --ok: #1f8a3b;
+  --ok-soft: #e1f4e5;
+  --shadow: 0 8px 28px rgb(0 0 0 / 0.18), 0 0 0 0.5px rgb(0 0 0 / 0.18);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --chrome: #2b2b2d;
+    --chrome-2: #323235;
+    --panel: #252527;
+    --field: #1b1b1c;
+    --line: #3d3d40;
+    --line-soft: #303033;
+    --fg: #ececf0;
+    --muted: #9c9ca3;
+    --faint: #6b6b72;
+    --accent: #3a8bf5;
+    --accent-fg: #ffffff;
+    --accent-soft: #1d3557;
+    --row-alt: #232325;
+    --row-hover: #2a3341;
+    --row-sel: #2a62c9;
+    --row-sel-fg: #ffffff;
+    --row-sel-blur: #3a3f4a;
+    --danger: #ff6159;
+    --danger-soft: #4a2220;
+    --warn: #ffb340;
+    --warn-soft: #463414;
+    --ok: #4cd964;
+    --ok-soft: #1c3d24;
+    --shadow: 0 10px 32px rgb(0 0 0 / 0.55), 0 0 0 0.5px rgb(255 255 255 / 0.12);
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-chrome: var(--chrome);
+  --color-chrome-2: var(--chrome-2);
+  --color-panel: var(--panel);
+  --color-field: var(--field);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-row-alt: var(--row-alt);
+  --color-row-hover: var(--row-hover);
+  --color-row-sel: var(--row-sel);
+  --color-row-sel-fg: var(--row-sel-fg);
+  --color-row-sel-blur: var(--row-sel-blur);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --shadow-pop: var(--shadow);
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+}
+
+/* Base styles live in the base layer so Tailwind utilities (text-*, font-*) can override them. */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 1.35;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+  }
+
+  input,
+  textarea,
+  select,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+
+  input,
+  textarea,
+  .selectable {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* Visible keyboard focus everywhere; no ring for mouse clicks. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Thin macOS-like scrollbars. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 22%, transparent);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-corner,
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes sweepr-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+.progress-indeterminate {
+  animation: sweepr-indeterminate 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-indeterminate {
+    animation: none;
+  }
+}
