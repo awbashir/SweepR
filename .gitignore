@@ -1,0 +1,13 @@
+# Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Node / Vite
+node_modules/
+dist/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
