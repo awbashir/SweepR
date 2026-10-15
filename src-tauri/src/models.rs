@@ -663,7 +663,31 @@ pub struct Device {
     pub neighbor: Option<CdpLldpNeighbor>,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
+    /// Rolling latency statistics (latency monitor). The engine never fills this during a
+    /// scan; the GUI copies it from `latency-update` events (like overrides) so exports
+    /// carry it.
+    #[serde(default)]
+    pub latency: Option<LatencyStats>,
+    /// HTML `<title>` of the device's web interface (sanitized, entity-decoded).
+    #[serde(default)]
+    pub web_title: Option<String>,
+    /// HTTP `Server` header of the device's web interface.
+    #[serde(default)]
+    pub web_server: Option<String>,
+    /// TLS certificate presented by the device's HTTPS interface.
+    #[serde(default)]
+    pub tls_cert: Option<TlsCertInfo>,
+    /// Appliance / product recognized from the web title, server header or certificate
+    /// (e.g. "Proxmox VE", "Dell iDRAC").
+    #[serde(default)]
+    pub web_identity: Option<String>,
+    /// Problems worth flagging (expired / expiring / self-signed certificates, ...).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
+
+/// Most warnings kept on one device (hostile-input bound).
+pub const MAX_DEVICE_WARNINGS: usize = 32;
 
 impl Device {
     pub fn new(ip: IpAddr) -> Self {
@@ -689,6 +713,20 @@ impl Device {
             neighbor: None,
             first_seen_ms: now,
             last_seen_ms: now,
+            latency: None,
+            web_title: None,
+            web_server: None,
+            tls_cert: None,
+            web_identity: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Add a warning unless it is already present (bounded by [`MAX_DEVICE_WARNINGS`]).
+    pub fn add_warning(&mut self, warning: impl Into<String>) {
+        let warning = warning.into();
+        if self.warnings.len() < MAX_DEVICE_WARNINGS && !self.warnings.contains(&warning) {
+            self.warnings.push(warning);
         }
     }
 
@@ -739,8 +777,21 @@ impl Device {
             comments,
             interface,
             rtt_ms,
-            neighbor
+            neighbor,
+            web_title,
+            web_server,
+            tls_cert,
+            web_identity
         );
+        // Live statistics: the newest snapshot wins.
+        match (&mut self.latency, &other.latency) {
+            (None, Some(o)) => self.latency = Some(o.clone()),
+            (Some(s), Some(o)) if o.updated_ms >= s.updated_ms => *s = o.clone(),
+            _ => {}
+        }
+        for w in &other.warnings {
+            self.add_warning(w.clone());
+        }
         if other.role.priority() > self.role.priority() {
             self.role = other.role;
         }
@@ -1223,6 +1274,9 @@ pub struct ScanConfig {
     pub concurrency: usize,
     /// Duration of the passive CDP/LLDP/VLAN listener in seconds.
     pub listen_secs: u64,
+    /// Fetch the HTTP `<title>`, `Server` header and TLS certificate of devices with a web
+    /// port open (needs the port scan, i.e. a non-empty `ports`).
+    pub web_identity: bool,
 }
 
 impl Default for ScanConfig {
@@ -1243,6 +1297,7 @@ impl Default for ScanConfig {
             rate_pps: 2000,
             concurrency: 512,
             listen_secs: 10,
+            web_identity: true,
         }
     }
 }
@@ -1455,6 +1510,392 @@ impl ScanEvent {
             message: message.into(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Network utilities: latency monitor, traceroute, web identity, iPerf3, Wake-on-LAN
+// ---------------------------------------------------------------------------------------------
+
+/// How a latency sample was measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeMethod {
+    /// ICMP / ICMPv6 echo.
+    #[default]
+    Icmp,
+    /// TCP connect round trip (SYN → SYN-ACK or RST), used when the host ignores ICMP.
+    Tcp,
+}
+
+/// Rolling latency statistics of one host over the monitor window (its last
+/// `latency::HISTORY_LEN` samples). Times are milliseconds; they stay `None` until a reply
+/// arrives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LatencyStats {
+    pub last_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+    pub min_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    /// Mean absolute difference between consecutive replies.
+    pub jitter_ms: Option<f64>,
+    /// Lost probes in the window, 0-100.
+    pub loss_pct: f64,
+    /// Probes in the window and replies among them.
+    pub sent: u32,
+    pub received: u32,
+    pub method: ProbeMethod,
+    /// When the newest sample was taken (Unix ms).
+    pub updated_ms: u64,
+}
+
+/// One host's newest sample plus its rolling statistics (element of a `latency-update`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatencySample {
+    pub ip: IpAddr,
+    /// Round trip of the newest probe; `None` when it was lost.
+    pub rtt_ms: Option<f64>,
+    /// When the newest probe was sent (Unix ms).
+    pub ts: u64,
+    pub method: ProbeMethod,
+    pub loss_pct: f64,
+    pub avg_ms: Option<f64>,
+    pub min_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub sent: u32,
+    pub received: u32,
+    /// The window, oldest first (`null` = lost), for sparklines.
+    pub history: Vec<Option<f64>>,
+}
+
+impl LatencySample {
+    /// The statistics part, as stored on [`Device::latency`].
+    pub fn stats(&self) -> LatencyStats {
+        LatencyStats {
+            last_ms: self.rtt_ms,
+            avg_ms: self.avg_ms,
+            min_ms: self.min_ms,
+            max_ms: self.max_ms,
+            jitter_ms: self.jitter_ms,
+            loss_pct: self.loss_pct,
+            sent: self.sent,
+            received: self.received,
+            method: self.method,
+            updated_ms: self.ts,
+        }
+    }
+}
+
+/// Payload of the `latency-update` Tauri event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatencyUpdate {
+    pub monitor_id: u64,
+    pub samples: Vec<LatencySample>,
+}
+
+/// How a traceroute was run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceMethod {
+    /// Raw ICMP echo probes with increasing TTL (needs root / CAP_NET_RAW).
+    Raw,
+    /// The system `traceroute` / `traceroute6` / `tracepath` binary, run once per round.
+    System,
+}
+
+/// MTR-style statistics of one hop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceHop {
+    pub ttl: u8,
+    /// The address that answered most recently (`None` while the hop never answered).
+    pub ip: Option<IpAddr>,
+    /// Reverse-DNS name of `ip`.
+    pub hostname: Option<String>,
+    /// Other addresses that answered for this TTL (load-balanced paths), at most 4.
+    #[serde(default)]
+    pub other_ips: Vec<IpAddr>,
+    pub sent: u32,
+    pub received: u32,
+    pub loss_pct: f64,
+    pub last_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+    pub best_ms: Option<f64>,
+    pub worst_ms: Option<f64>,
+}
+
+/// Payload of the `trace-update` Tauri event (also the CLI's JSON output).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceUpdate {
+    pub trace_id: u64,
+    pub target: IpAddr,
+    pub method: TraceMethod,
+    /// Rounds completed so far / requested.
+    pub round: u32,
+    pub rounds: u32,
+    /// Hops 1..=N, where N is the destination's TTL once it answered.
+    pub hops: Vec<TraceHop>,
+    /// `true` once the destination itself answered.
+    pub reached: bool,
+    /// `true` on the last update of the trace (finished, stopped or failed).
+    pub done: bool,
+    /// Why the trace failed (only on the final update).
+    pub error: Option<String>,
+}
+
+/// Details of a server's TLS certificate (read without validating it).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TlsCertInfo {
+    /// Port the certificate was read from.
+    pub port: u16,
+    pub subject_cn: Option<String>,
+    /// Full subject DN, e.g. `CN=pve.lan, O=Proxmox`.
+    pub subject: Option<String>,
+    /// Subject alternative names (DNS names and IPs), at most 8.
+    pub sans: Vec<String>,
+    /// Total number of SANs in the certificate.
+    pub san_count: u32,
+    pub issuer_cn: Option<String>,
+    pub issuer: Option<String>,
+    /// Validity bounds, ISO 8601 UTC (`2026-01-31T12:00:00Z`).
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+    /// Validity bounds as Unix milliseconds.
+    pub not_before_ms: Option<i64>,
+    pub not_after_ms: Option<i64>,
+    /// Whole days until `notAfter` (negative once expired).
+    pub days_remaining: Option<i64>,
+    /// Issuer equals subject and the certificate verifies with its own key.
+    pub self_signed: bool,
+    pub expired: bool,
+    /// `"RSA"`, `"EC P-256"`, `"Ed25519"`, ...
+    pub key_type: Option<String>,
+    pub key_bits: Option<u32>,
+    pub signature_algorithm: Option<String>,
+    /// SHA-256 fingerprint of the DER certificate, `AB:CD:...`.
+    pub sha256: Option<String>,
+}
+
+/// Plain HTTP or HTTPS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebScheme {
+    Http,
+    Https,
+}
+
+/// What one web port of a device answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebService {
+    pub port: u16,
+    /// Scheme that answered on `port` (TLS is tried first on HTTPS-style ports).
+    pub scheme: WebScheme,
+    /// URL of the final response (after redirects).
+    pub url: String,
+    pub status: Option<u16>,
+    pub title: Option<String>,
+    pub server: Option<String>,
+    /// Redirects followed (at most 2, same host only).
+    pub redirects: u8,
+    /// Where an unfollowed redirect pointed (other host, or the redirect limit was hit).
+    pub redirect_to: Option<String>,
+    pub tls_cert: Option<TlsCertInfo>,
+    /// Why nothing (or only part) could be read.
+    pub error: Option<String>,
+}
+
+/// Result of `grab_web_identity` / `sweepr web`, and what the scan copies onto a device.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebIdentity {
+    pub ip: IpAddr,
+    /// One entry per probed port that accepted a connection.
+    pub services: Vec<WebService>,
+    /// Best title / server / certificate across the services (HTTPS first).
+    pub title: Option<String>,
+    pub server: Option<String>,
+    pub tls_cert: Option<TlsCertInfo>,
+    /// Recognized appliance, e.g. "Proxmox VE", "Synology DSM", "Fortinet FortiGate".
+    pub identity: Option<String>,
+    /// Role suggested by the identity (only ever applied to devices still classified as a
+    /// plain host).
+    pub role_hint: Option<DeviceRole>,
+    /// Certificate problems (expired, expiring within 30 days, self-signed, not yet valid).
+    pub warnings: Vec<String>,
+}
+
+/// Bounds of [`IperfOptions`].
+pub const IPERF_MAX_DURATION_SECS: u32 = 60;
+pub const IPERF_MAX_STREAMS: u8 = 16;
+
+/// Options of one iPerf3 client run. Missing JSON fields use the defaults (TCP, port 5201,
+/// 10 s, one stream, client → server).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IperfOptions {
+    pub port: u16,
+    pub duration_secs: u32,
+    /// Server sends, client receives (`-R`).
+    pub reverse: bool,
+    /// Parallel streams (`-P`), 1-16.
+    pub streams: u8,
+    pub udp: bool,
+    /// Target bitrate (`-b`), e.g. `"100M"`, `"1G"`, `"500K"`, `"0"` (unlimited). UDP
+    /// defaults to iperf3's 1 Mbit/s when omitted.
+    pub bitrate: Option<String>,
+}
+
+impl Default for IperfOptions {
+    fn default() -> Self {
+        Self {
+            port: 5201,
+            duration_secs: 10,
+            reverse: false,
+            streams: 1,
+            udp: false,
+            bitrate: None,
+        }
+    }
+}
+
+/// `true` for `"0"`, `"100"`, `"100M"`, `"2.5G"`, `"500k"` (no other characters).
+pub fn is_valid_bitrate(s: &str) -> bool {
+    let s = s.trim();
+    let digits = s
+        .strip_suffix(['K', 'M', 'G', 'T', 'k', 'm', 'g', 't'])
+        .unwrap_or(s);
+    if digits.is_empty() || digits.len() > 12 {
+        return false;
+    }
+    let mut dots = 0;
+    for c in digits.chars() {
+        match c {
+            '0'..='9' => {}
+            '.' => dots += 1,
+            _ => return false,
+        }
+    }
+    dots <= 1 && !digits.starts_with('.') && !digits.ends_with('.')
+}
+
+impl IperfOptions {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        let invalid = |m: String| Err(ModelError::InvalidConfig(m));
+        if self.port == 0 {
+            return invalid("iperf port must be between 1 and 65535".into());
+        }
+        if !(1..=IPERF_MAX_DURATION_SECS).contains(&self.duration_secs) {
+            return invalid(format!(
+                "iperf duration must be 1-{IPERF_MAX_DURATION_SECS} seconds"
+            ));
+        }
+        if !(1..=IPERF_MAX_STREAMS).contains(&self.streams) {
+            return invalid(format!(
+                "iperf parallel streams must be 1-{IPERF_MAX_STREAMS}"
+            ));
+        }
+        if let Some(b) = &self.bitrate {
+            if !is_valid_bitrate(b) {
+                return invalid(format!(
+                    "invalid bitrate '{}': use a number with an optional K/M/G/T suffix, e.g. 100M",
+                    sanitize_text(b)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether the `iperf3` binary can be used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IperfAvailability {
+    pub available: bool,
+    pub path: Option<String>,
+    /// e.g. `"3.17.1"`.
+    pub version: Option<String>,
+    /// `true` when the version streams per-interval results live (`--json-stream`, 3.17+);
+    /// older versions report every interval at the end of the run.
+    pub streaming: bool,
+    /// How to install iperf3 when it is missing.
+    pub install_hint: Option<String>,
+}
+
+/// One per-second (summed over streams) iPerf3 measurement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IperfInterval {
+    /// Seconds since the test started.
+    pub start: f64,
+    pub end: f64,
+    pub bytes: u64,
+    pub bits_per_second: f64,
+    /// TCP sender only.
+    pub retransmits: Option<u64>,
+    /// UDP only.
+    pub jitter_ms: Option<f64>,
+    pub lost_packets: Option<u64>,
+    pub packets: Option<u64>,
+    pub lost_percent: Option<f64>,
+    /// Inside the `--omit` warm-up window.
+    pub omitted: bool,
+}
+
+/// End-of-test iPerf3 totals.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IperfSummary {
+    /// `"tcp"` or `"udp"`.
+    pub protocol: String,
+    pub reverse: bool,
+    pub streams: u32,
+    pub duration_secs: f64,
+    pub sent_bytes: Option<u64>,
+    pub sent_bps: Option<f64>,
+    pub received_bytes: Option<u64>,
+    pub received_bps: Option<f64>,
+    pub retransmits: Option<u64>,
+    pub jitter_ms: Option<f64>,
+    pub lost_packets: Option<u64>,
+    pub packets: Option<u64>,
+    pub lost_percent: Option<f64>,
+    pub cpu_local_pct: Option<f64>,
+    pub cpu_remote_pct: Option<f64>,
+    /// `host:port` the client connected to, and the local iperf3 version (sanitized).
+    pub remote_host: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Payload of the `iperf-update` Tauri event: one interval, or the final summary / error
+/// (`done: true`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IperfUpdate {
+    pub run_id: u64,
+    pub interval: Option<IperfInterval>,
+    pub summary: Option<IperfSummary>,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
+/// What a Wake-on-LAN request sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeResult {
+    /// Target MAC, canonical `aa:bb:cc:dd:ee:ff`.
+    pub mac: String,
+    /// Destinations as `addr:port`.
+    pub targets: Vec<String>,
+    pub packets_sent: u32,
+    /// Interface the packets were sent from (when one was chosen).
+    pub interface: Option<String>,
+    pub source_ip: Option<IpAddr>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2001,5 +2442,133 @@ mod tests {
         assert_eq!(v["data"]["level"], "info");
         let role = serde_json::to_value(DeviceRole::AccessPoint).unwrap();
         assert_eq!(role, "access_point");
+    }
+
+    /// Regression: the GUI passes devices back to `export_devices`; a frontend that does not
+    /// know the utility fields yet must still deserialize.
+    #[test]
+    fn devices_without_utility_fields_still_deserialize() {
+        let json = r#"{"ip":"10.0.0.1","extraIps":[],"mac":null,"vlanId":null,"role":"host",
+            "hostname":null,"dnsName":null,"mdnsName":null,"smbName":null,"smbDomain":null,
+            "vendor":null,"switchPort":null,"openPorts":[443],"comments":null,"interface":null,
+            "rttMs":null,"sources":[],"neighbor":null,"firstSeenMs":1,"lastSeenMs":2}"#;
+        let d: Device = serde_json::from_str(json).unwrap();
+        assert!(d.latency.is_none() && d.tls_cert.is_none() && d.warnings.is_empty());
+        let v = serde_json::to_value(&d).unwrap();
+        for key in [
+            "latency",
+            "webTitle",
+            "webServer",
+            "tlsCert",
+            "webIdentity",
+            "warnings",
+        ] {
+            assert!(v.get(key).is_some(), "{key} is always serialized");
+        }
+        // Partial nested objects use their defaults.
+        let mut v = v;
+        v["latency"] = serde_json::json!({ "avgMs": 3.5 });
+        v["tlsCert"] = serde_json::json!({ "subjectCn": "fw.lan", "port": 443 });
+        let d: Device = serde_json::from_value(v).unwrap();
+        assert_eq!(d.latency.unwrap().avg_ms, Some(3.5));
+        assert_eq!(d.tls_cert.unwrap().subject_cn.as_deref(), Some("fw.lan"));
+    }
+
+    #[test]
+    fn device_merge_of_utility_fields() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut a = Device::new(ip);
+        a.web_title = Some("first".into());
+        a.latency = Some(LatencyStats {
+            avg_ms: Some(1.0),
+            updated_ms: 100,
+            ..LatencyStats::default()
+        });
+        a.add_warning("w1");
+        let mut b = Device::new(ip);
+        b.web_title = Some("second".into());
+        b.web_server = Some("nginx".into());
+        b.web_identity = Some("pfSense".into());
+        b.tls_cert = Some(TlsCertInfo {
+            port: 443,
+            ..TlsCertInfo::default()
+        });
+        b.latency = Some(LatencyStats {
+            avg_ms: Some(2.0),
+            updated_ms: 200,
+            ..LatencyStats::default()
+        });
+        b.add_warning("w1");
+        b.add_warning("w2");
+        a.merge(&b);
+        assert_eq!(
+            a.web_title.as_deref(),
+            Some("first"),
+            "gaps are filled, values kept"
+        );
+        assert_eq!(a.web_server.as_deref(), Some("nginx"));
+        assert_eq!(a.web_identity.as_deref(), Some("pfSense"));
+        assert_eq!(a.tls_cert.as_ref().map(|c| c.port), Some(443));
+        assert_eq!(
+            a.latency.as_ref().unwrap().avg_ms,
+            Some(2.0),
+            "newest stats win"
+        );
+        assert_eq!(a.warnings, vec!["w1", "w2"]);
+        // Older latency snapshots never replace newer ones.
+        let mut old = Device::new(ip);
+        old.latency = Some(LatencyStats {
+            avg_ms: Some(9.0),
+            updated_ms: 50,
+            ..LatencyStats::default()
+        });
+        a.merge(&old);
+        assert_eq!(a.latency.as_ref().unwrap().avg_ms, Some(2.0));
+        for i in 0..100 {
+            a.add_warning(format!("x{i}"));
+        }
+        assert_eq!(a.warnings.len(), MAX_DEVICE_WARNINGS);
+    }
+
+    #[test]
+    fn web_identity_defaults_on_and_utility_options_validate() {
+        let cfg: ScanConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.web_identity);
+        let cfg: ScanConfig = serde_json::from_str(r#"{"webIdentity":false}"#).unwrap();
+        assert!(!cfg.web_identity);
+        for ok in ["0", "100", "100M", "2.5G", "500k", " 10M "] {
+            assert!(is_valid_bitrate(ok), "{ok}");
+        }
+        for bad in ["", "M", "1.2.3M", ".5M", "5.M", "10MB", "-b", "1e9", "1M 2"] {
+            assert!(!is_valid_bitrate(bad), "{bad}");
+        }
+        let o: IperfOptions = serde_json::from_str(r#"{"udp":true,"bitrate":"10M"}"#).unwrap();
+        assert_eq!((o.port, o.duration_secs, o.streams), (5201, 10, 1));
+        o.validate().unwrap();
+        let sample = LatencySample {
+            ip: "10.0.0.1".parse().unwrap(),
+            rtt_ms: None,
+            ts: 5,
+            method: ProbeMethod::Tcp,
+            loss_pct: 50.0,
+            avg_ms: Some(1.0),
+            min_ms: Some(1.0),
+            max_ms: Some(1.0),
+            jitter_ms: None,
+            sent: 2,
+            received: 1,
+            history: vec![Some(1.0), None],
+        };
+        let v = serde_json::to_value(LatencyUpdate {
+            monitor_id: 3,
+            samples: vec![sample.clone()],
+        })
+        .unwrap();
+        assert_eq!(v["monitorId"], 3);
+        assert_eq!(v["samples"][0]["rttMs"], serde_json::Value::Null);
+        assert_eq!(v["samples"][0]["method"], "tcp");
+        assert_eq!(v["samples"][0]["history"][1], serde_json::Value::Null);
+        let stats = sample.stats();
+        assert_eq!((stats.updated_ms, stats.sent, stats.last_ms), (5, 2, None));
     }
 }

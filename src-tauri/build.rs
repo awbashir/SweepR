@@ -21,6 +21,15 @@ fn main() {
             "save_override",
             "scan_ports",
             "query_snmp",
+            "wake_device",
+            "start_latency_monitor",
+            "stop_latency_monitor",
+            "start_trace",
+            "stop_trace",
+            "grab_web_identity",
+            "iperf_available",
+            "start_iperf",
+            "stop_iperf",
         ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
