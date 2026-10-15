@@ -1,12 +1,12 @@
 // Simulated backend for a plain browser (no `window.__TAURI_INTERNALS__`). It follows the real
 // contract: job ids, superseding jobs, full device snapshots, progress, logs and `finished`.
 // Large ranges (e.g. `10.0.0.0/16`) stream ~50k devices in big batches for performance testing.
+// The simulated campus topology (CAM tables, CDP/LLDP) lives in `mockTopology.ts`: switch ports
+// and CAM entries are reported only when SNMP is configured, as with the real backend.
 
 import type { Backend } from "./api.ts";
 import type {
-  CdpLldpNeighbor,
   Device,
-  DeviceRole,
   ExportFormat,
   InterfaceInfo,
   Overrides,
@@ -20,6 +20,7 @@ import type {
 } from "./types.ts";
 import { ipv4ToNumber, numberToIpv4 } from "./lib/ip.ts";
 import { parseRange, type Ipv4Span } from "./lib/parse.ts";
+import { MockNet, macFor } from "./mockTopology.ts";
 
 const INTERFACES: InterfaceInfo[] = [
   {
@@ -125,99 +126,6 @@ const HOST_VENDORS = [
   { vendor: "VMware, Inc.", oui: "00:50:56", names: ["vm-web", "vm-db", "esx"] },
 ] as const;
 
-interface InfraSpec {
-  octet: number;
-  role: DeviceRole;
-  name: string;
-  vendor: string;
-  oui: string;
-  platform: string;
-  software: string;
-  caps: CdpLldpNeighbor["capabilities"];
-  protocol: CdpLldpNeighbor["protocol"];
-  ports: number[];
-}
-
-const INFRA: InfraSpec[] = [
-  {
-    octet: 1,
-    role: "firewall",
-    name: "FW-EDGE01",
-    vendor: "Fortinet, Inc.",
-    oui: "00:09:0f",
-    platform: "FortiGate-100F",
-    software: "FortiOS v7.4.4 build2662",
-    caps: ["router", "firewall"],
-    protocol: "lldp",
-    ports: [22, 443, 10443],
-  },
-  {
-    octet: 2,
-    role: "switch",
-    name: "Cisco-SW01",
-    vendor: "Cisco Systems, Inc",
-    oui: "00:1b:54",
-    platform: "cisco C9300-48P",
-    software: "Cisco IOS XE Software, Version 17.09.04a",
-    caps: ["router", "switch"],
-    protocol: "cdp",
-    ports: [22, 80, 161, 443],
-  },
-  {
-    octet: 3,
-    role: "switch",
-    name: "Aruba-SW02",
-    vendor: "Hewlett Packard Enterprise",
-    oui: "94:b4:0f",
-    platform: "Aruba JL659A 6300M",
-    software: "ArubaOS-CX FL.10.13.1000",
-    caps: ["switch"],
-    protocol: "lldp",
-    ports: [22, 443],
-  },
-  {
-    octet: 4,
-    role: "access_point",
-    name: "AP-Floor1",
-    vendor: "Ubiquiti Inc.",
-    oui: "24:5a:4c",
-    platform: "UniFi U6-Pro",
-    software: "UAP firmware 6.6.77",
-    caps: ["wlan_access_point"],
-    protocol: "lldp",
-    ports: [22],
-  },
-  {
-    octet: 5,
-    role: "access_point",
-    name: "AP-Floor2",
-    vendor: "Cisco Systems, Inc",
-    oui: "00:1b:54",
-    platform: "cisco C9120AXI-B",
-    software: "Cisco AP Software, ap3g3-k9w8 17.9",
-    caps: ["switch"],
-    protocol: "cdp",
-    ports: [22, 443],
-  },
-  {
-    octet: 254,
-    role: "router",
-    name: "MikroTik-GW",
-    vendor: "Routerboard.com",
-    oui: "48:8f:5a",
-    platform: "CCR2004-16G-2S+",
-    software: "RouterOS 7.15.3",
-    caps: ["router", "switch"],
-    protocol: "lldp",
-    ports: [22, 80, 8291],
-  },
-];
-
-function macFor(oui: string, n: number): string {
-  const b = [(n >>> 16) & 255, (n >>> 8) & 255, n & 255].map((x) => x.toString(16).padStart(2, "0"));
-  return `${oui}:${b.join(":")}`;
-}
-
 function blankDevice(ip: string, now: number): Device {
   return {
     ip,
@@ -243,36 +151,11 @@ function blankDevice(ip: string, now: number): Device {
   };
 }
 
-function switchFor(ipNum: number): { name: string; ip: string } {
-  const base = (ipNum & 0xffffff00) >>> 0;
-  return (ipNum & 1) === 0
-    ? { name: "Cisco-SW01", ip: numberToIpv4(base + 2) }
-    : { name: "Aruba-SW02", ip: numberToIpv4(base + 3) };
-}
-
-function neighborFor(spec: InfraSpec, ip: string, mac: string, iface: string, vlanId: number | null): CdpLldpNeighbor {
-  return {
-    protocol: spec.protocol,
-    localInterface: iface,
-    sourceMac: mac,
-    deviceId: spec.protocol === "cdp" ? `${spec.name}.corp.example` : mac,
-    systemName: spec.name,
-    systemDescription: spec.software,
-    portId: spec.protocol === "cdp" ? "GigabitEthernet1/0/48" : "ethernet1/1/48",
-    portDescription: "Uplink to core",
-    platform: spec.platform,
-    softwareVersion: spec.software,
-    managementAddrs: [ip],
-    nativeVlan: vlanId ?? 1,
-    voiceVlan: spec.role === "switch" ? 99 : null,
-    capabilities: spec.caps,
-    vtpDomain: spec.protocol === "cdp" ? "CORP" : null,
-    ttlSecs: spec.protocol === "cdp" ? 180 : 120,
-    lastSeenMs: Date.now(),
-  };
-}
-
-function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNames: boolean): Device {
+/**
+ * One simulated device. Infrastructure lives in the scanned base /24 (see `MockNet`); hosts get
+ * their switch port only when SNMP is configured (the real backend reads it from CAM tables).
+ */
+function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNames: boolean, net: MockNet, withSnmp: boolean): Device {
   const now = Date.now();
   const ip = numberToIpv4(ipNum);
   const r = rng(hash(`${ip}@${vlanId ?? ""}`));
@@ -280,16 +163,14 @@ function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNam
   dev.vlanId = vlanId;
   dev.interface = iface;
   dev.rttMs = Math.round((0.3 + r() * 8) * 100) / 100;
-  const octet = ipNum & 255;
-  const infra = INFRA.find((s) => s.octet === octet);
+  const infra = vlanId === null ? net.infraAt(ipNum) : undefined;
   if (infra) {
     dev.role = infra.role;
     dev.vendor = infra.vendor;
-    dev.mac = macFor(infra.oui, ipNum & 0xffffff);
-    dev.dnsName = withNames ? `${infra.name.toLowerCase()}.corp.example` : null;
+    dev.mac = infra.mac;
+    dev.dnsName = `${infra.name.toLowerCase()}.corp.example`;
     dev.openPorts = withNames ? infra.ports : [];
-    dev.neighbor = neighborFor(infra, ip, dev.mac, iface, vlanId);
-    dev.sources = ["arp", infra.protocol];
+    dev.sources = withSnmp ? ["arp", "snmp", "dns"] : ["arp", "dns"];
     return dev;
   }
   const v = pick(r, HOST_VENDORS);
@@ -305,18 +186,40 @@ function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNam
     }
     if (r() < 0.35) dev.openPorts = [pick(r, [22, 80, 443, 445, 3389, 5060, 554, 9100])];
   }
-  const sw = switchFor(ipNum);
-  dev.switchPort = {
-    switchName: sw.name,
-    switchIp: sw.ip,
-    portName: sw.name.startsWith("Cisco") ? `Gi1/0/${(octet % 48) + 1}` : `1/1/${(octet % 48) + 1}`,
-    portIndex: (octet % 48) + 1,
-    vlanId,
-    mac: dev.mac,
-  };
+  if (withSnmp) {
+    const place = net.place(ipNum, vlanId);
+    dev.switchPort = {
+      switchName: place.sw.name,
+      switchIp: place.sw.ip,
+      portName: place.port,
+      portIndex: Number(/(\d+)$/.exec(place.port)?.[1] ?? 0) || null,
+      vlanId: vlanId ?? 1,
+      mac: dev.mac,
+    };
+  }
   if (r() < 0.15) dev.extraIps = [`fe80::${(ipNum & 0xffff).toString(16)}:${Math.floor(r() * 0xffff).toString(16)}`];
   dev.sources = withNames ? ["arp", "dns"] : ["arp"];
   return dev;
+}
+
+/** /24 networks covered by untagged scan targets (the first one hosts the core gear). */
+function blocksOf(spans: Ipv4Span[], limit: number): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const s of spans) {
+    for (let b = (s.start & 0xffffff00) >>> 0; b <= s.end && out.length < limit; b += 256) {
+      if (!seen.has(b)) {
+        seen.add(b);
+        out.push(b);
+      }
+    }
+  }
+  return out;
+}
+
+function ifaceBlock(iface: InterfaceInfo): number {
+  const base = ipv4ToNumber(iface.addrs.find((a) => ipv4ToNumber(a.ip) !== null)?.ip ?? "10.177.134.1") ?? 0;
+  return (base & 0xffffff00) >>> 0;
 }
 
 // --- job runner ---------------------------------------------------------------------------------
@@ -377,12 +280,18 @@ export function createMockBackend(): Backend {
     return j;
   };
 
-  const vlanInfo = (id: number, source: VlanSource, iface: string): VlanInfo => ({
+  /** Network of the latest scan (SNMP queries answer from it). */
+  let lastNet: MockNet | null = null;
+  /** CAM entries the latest scan reported, by switch IP. */
+  let lastCam = new Map<string, SwitchPortMapping[]>();
+  const netFor = (iface: InterfaceInfo): MockNet => lastNet ?? new MockNet([ifaceBlock(iface)], false);
+
+  const vlanInfo = (id: number, source: VlanSource, iface: string, switchName: string): VlanInfo => ({
     id,
     name: { 1: "default", 10: "USERS", 20: "SERVERS", 30: "VOICE", 99: "MGMT", 100: "GUEST" }[id] ?? null,
     sources: [source],
     interface: iface,
-    switchName: "Cisco-SW01",
+    switchName,
     framesSeen: 10 + (id % 17) * 3,
     firstSeenMs: Date.now(),
     lastSeenMs: Date.now(),
@@ -396,8 +305,8 @@ export function createMockBackend(): Backend {
     if (parsed.ok && parsed.value.spans.length > 0) {
       spans = parsed.value.spans;
     } else {
-      const base = ipv4ToNumber(iface.addrs[0]?.ip ?? "10.0.0.1") ?? 0;
-      spans = [{ start: (base & 0xffffff00) + 1, end: (base & 0xffffff00) + 254 }];
+      const base = ifaceBlock(iface);
+      spans = [{ start: base + 1, end: base + 254 }];
     }
     // VLANs: each VLAN ID maps to its own 10.<id>.0.0/24 network.
     const sel = config.vlans;
@@ -418,7 +327,24 @@ export function createMockBackend(): Backend {
     const big = total > 4096;
     const batch = big ? 3000 : 6;
     const tick = big ? 30 : 25;
-    const replyRate = big ? 0.8 : 0.42;
+    const replyRate = big ? 0.8 : 0.6;
+    const withSnmp = config.snmp !== null;
+    // The simulated campus: built from the untagged /24s being scanned (or the interface's).
+    const untaggedSpans = vlanIds.includes(null) ? spans : [];
+    const blocks = blocksOf(untaggedSpans.length > 0 ? untaggedSpans : [{ start: ifaceBlock(iface) + 1, end: ifaceBlock(iface) + 254 }], 1024);
+    const net = new MockNet(blocks, big);
+    lastNet = net;
+    lastCam = new Map();
+    const scannerSw = net.scannerSwitch;
+    const recordCam = (entries: SwitchPortMapping[]): void => {
+      for (const m of entries) {
+        const k = m.switchIp ?? m.switchName;
+        const l = lastCam.get(k);
+        if (l) l.push(m);
+        else lastCam.set(k, [m]);
+        emit(j, { type: "port_mapping", data: m });
+      }
+    };
 
     emit(j, { type: "progress", data: { phase: "preparing", probesSent: 0, probesTotal: total, devicesFound: 0 } });
     emit(j, { type: "log", data: { level: "warn", message: "Browser mock mode: no Tauri backend, showing simulated devices." } });
@@ -431,10 +357,24 @@ export function createMockBackend(): Backend {
       const ids = sel.mode === "list" || sel.mode === "untagged_and_list" ? sel.ids.slice(0, 64) : [1, 10, 20, 30, 99, 100];
       ids.forEach((id, i) =>
         later(j, 200 + i * 150, () => {
-          emit(j, { type: "vlan", data: vlanInfo(id, sel.mode === "auto_detect" ? "tagged8021q" : "user_configured", iface.name) });
+          emit(j, {
+            type: "vlan",
+            data: vlanInfo(id, sel.mode === "auto_detect" ? "tagged8021q" : "user_configured", iface.name, scannerSw.name),
+          });
         }),
       );
       vlanCount = ids.length;
+    }
+
+    // CDP/LLDP: this computer hears the access switch it is plugged into (Gi1/0/12).
+    let neighbors = 0;
+    const scannerAdvert = net.neighborOf(scannerSw, iface.name, scannerSw.accessPort?.(12) ?? "Gi1/0/12", 1);
+    if (config.cdpLldp) {
+      neighbors = 1;
+      later(j, 400, () => emit(j, { type: "neighbor", data: scannerAdvert }));
+    }
+    if (withSnmp) {
+      emit(j, { type: "log", data: { level: "info", message: `SNMP: polling ${net.switches.length} switches for MAC address tables (mock)` } });
     }
 
     // Flatten target addresses lazily.
@@ -442,13 +382,17 @@ export function createMockBackend(): Backend {
     let addr = targets[0]?.span.start ?? 0;
     let sent = 0;
     let found = 0;
-    let neighbors = 0;
     const discovered: Device[] = [];
+    let infraCamSent = false;
 
     const step = (): void => {
       if (j.cancelled) {
         finish(j, found, vlanCount, neighbors);
         return;
+      }
+      if (withSnmp && !infraCamSent) {
+        infraCamSent = true;
+        recordCam(net.infraCam());
       }
       for (let k = 0; k < batch && ti < targets.length && sent < total; k++) {
         const t = targets[ti]!;
@@ -460,19 +404,19 @@ export function createMockBackend(): Backend {
           addr = targets[ti]?.span.start ?? 0;
         }
         const r = rng(hash(`r${ipNum}`))();
-        const octet = ipNum & 255;
-        const isInfra = INFRA.some((s) => s.octet === octet);
+        const isInfra = t.vlan === null && net.infraAt(ipNum) !== undefined;
         if (!isInfra && r > replyRate) continue;
-        const dev = makeDevice(ipNum, t.vlan, iface.name, !big || r < 0.5);
+        const dev = makeDevice(ipNum, t.vlan, iface.name, isInfra || !big || r < 0.5, net, withSnmp);
+        if (isInfra && config.cdpLldp && dev.ip === scannerSw.ip) {
+          dev.neighbor = scannerAdvert;
+          dev.sources = [...dev.sources, scannerAdvert.protocol];
+        }
         found++;
         discovered.push(dev);
         emit(j, { type: "device", data: dev });
-        if (isInfra && config.cdpLldp && dev.neighbor) {
-          neighbors++;
-          emit(j, { type: "neighbor", data: dev.neighbor });
-        }
-        if (!isInfra && dev.switchPort && found % 3 === 0 && !big) {
-          emit(j, { type: "port_mapping", data: dev.switchPort });
+        if (withSnmp && !isInfra && dev.mac && dev.switchPort) {
+          const place = net.place(ipNum, t.vlan);
+          recordCam(net.hostCam(dev.mac, place, t.vlan ?? 1));
         }
       }
       emit(j, { type: "progress", data: { phase: "discovering", probesSent: sent, probesTotal: total, devicesFound: found } });
@@ -485,8 +429,9 @@ export function createMockBackend(): Backend {
       const sample = discovered.filter((_, i) => i % (big ? 50 : 4) === 0);
       later(j, big ? 100 : 600, () => {
         for (const d of sample) {
-          const named = makeDevice(ipv4ToNumber(d.ip) ?? 0, d.vlanId, iface.name, true);
+          const named = makeDevice(ipv4ToNumber(d.ip) ?? 0, d.vlanId, iface.name, true, net, withSnmp);
           if (named.role === "host" && named.openPorts.length === 0) named.openPorts = [443];
+          named.neighbor = d.neighbor;
           emit(j, { type: "device", data: { ...named, sources: [...named.sources, "tcp"], lastSeenMs: Date.now() } });
         }
         if (config.cdpLldp) {
@@ -503,17 +448,18 @@ export function createMockBackend(): Backend {
 
   function runVlanDiscovery(j: Job, ifaceName: string | null, timeoutSecs: number): void {
     const iface = INTERFACES.find((i) => i.name === ifaceName) ?? INTERFACES[0]!;
+    const net = netFor(iface);
+    const sw = net.scannerSwitch;
     const ids = [1, 10, 20, 30, 99, 100, 200, 310];
     const duration = Math.min(timeoutSecs, 8) * 1000;
     emit(j, { type: "progress", data: { phase: "listening", probesSent: 0, probesTotal: 0, devicesFound: 0 } });
     emit(j, { type: "log", data: { level: "info", message: `Listening on ${iface.name} for 802.1Q tags, VTP, DTP, CDP and LLDP (mock, ${duration / 1000}s)` } });
     ids.forEach((id, i) =>
       later(j, ((i + 1) * duration) / (ids.length + 2), () =>
-        emit(j, { type: "vlan", data: vlanInfo(id, i % 3 === 0 ? "vtp" : "tagged8021q", iface.name) }),
+        emit(j, { type: "vlan", data: vlanInfo(id, i % 3 === 0 ? "vtp" : "tagged8021q", iface.name, sw.name) }),
       ),
     );
-    const sw = INFRA[1]!;
-    later(j, duration / 3, () => emit(j, { type: "neighbor", data: neighborFor(sw, "10.177.134.2", macFor(sw.oui, 0x86_02), iface.name, null) }));
+    later(j, duration / 3, () => emit(j, { type: "neighbor", data: net.neighborOf(sw, iface.name, sw.accessPort?.(12) ?? "Gi1/0/12", 1) }));
     later(j, duration, () => finish(j, 0, ids.length, 1));
   }
 
@@ -597,44 +543,33 @@ export function createMockBackend(): Backend {
     querySnmp: (ip, snmp) =>
       new Promise((resolve, reject) => {
         const n = ipv4ToNumber(ip);
-        const spec = n === null ? undefined : INFRA.find((s) => s.octet === (n & 255));
+        const net = netFor(INTERFACES[0]!);
+        const spec = n === null ? undefined : net.infraAt(n);
         window.setTimeout(() => {
-          if (!spec || n === null) {
+          if (!spec) {
             reject(`SNMP request to ${ip} timed out (community '${snmp?.community ?? "public"}')`);
             return;
           }
-          const vlans: VlanInfo[] = [1, 10, 20, 30, 99].map((id) => ({ ...vlanInfo(id, "snmp", "en0"), switchName: spec.name }));
-          const mappings: SwitchPortMapping[] = [];
-          if (spec.role === "switch") {
-            for (let p = 1; p <= 24; p++) {
-              mappings.push({
-                switchName: spec.name,
-                switchIp: ip,
-                portName: spec.name.startsWith("Cisco") ? `Gi1/0/${p}` : `1/1/${p}`,
-                portIndex: p,
-                vlanId: [10, 20, 30][p % 3] ?? null,
-                mac: macFor(pick(rng(p), HOST_VENDORS).oui, (n + p * 7919) & 0xffffff),
-              });
-            }
-          }
+          const vlans: VlanInfo[] = [1, 10, 20, 30, 99].map((id) => vlanInfo(id, "snmp", "en0", spec.name));
+          const isSwitch = spec.role === "switch";
+          const all = isSwitch ? (lastCam.get(spec.ip) ?? net.infraCam().filter((m) => m.switchIp === spec.ip)) : [];
           const counts = new Map<string, { portIndex: number | null; macCount: number }>();
-          for (const m of mappings) {
+          for (const m of all) {
             const c = counts.get(m.portName) ?? { portIndex: m.portIndex, macCount: 0 };
             c.macCount += 1;
             counts.set(m.portName, c);
           }
-          if (spec.role === "switch") counts.set(spec.name.startsWith("Cisco") ? "Gi1/0/48" : "1/1/48", { portIndex: 48, macCount: 37 });
           const info: SnmpDeviceInfo = {
             sysName: spec.name,
             sysDescr: `${spec.platform} — ${spec.software}`,
-            sysUptimeTicks: 123_456_789 + (n & 0xffff),
+            sysUptimeTicks: 123_456_789 + (spec.ipNum & 0xffff),
             sysObjectId: spec.protocol === "cdp" ? "1.3.6.1.4.1.9.1.2694" : "1.3.6.1.4.1.12356.101.1.1",
             role: spec.role,
             vlans,
-            portMappings: mappings,
+            portMappings: all.slice(0, 5000),
             portMacCounts: [...counts].map(([portName, c]) => ({ portName, ...c })),
-            partial: false,
-            warnings: [],
+            partial: all.length > 5000,
+            warnings: all.length > 5000 ? [`MAC table truncated to 5,000 of ${all.length.toLocaleString()} entries`] : [],
           };
           resolve(info);
         }, 500);

@@ -14,6 +14,8 @@ import {
   Radar,
   Search,
   Square,
+  Table2,
+  Network,
   X,
 } from "lucide-react";
 import type { DeviceRole, ExportFormat, InterfaceInfo } from "../types.ts";
@@ -25,6 +27,8 @@ import { Button, RoleIcon, Select, Separator, TextInput, Toggle, cx } from "./ui
 
 export type RoleFilter = "all" | DeviceRole;
 export type View = "devices" | "vlans" | "neighbors";
+/** How the Devices view is drawn. */
+export type DevicesMode = "table" | "topology";
 
 interface ToolbarProps {
   settings: ScanSettings;
@@ -195,6 +199,8 @@ export function Toolbar(p: ToolbarProps) {
 interface FilterBarProps {
   view: View;
   onView: (v: View) => void;
+  devicesMode: DevicesMode;
+  onDevicesMode: (m: DevicesMode) => void;
   counts: { devices: number; vlans: number; neighbors: number };
   roleFilter: RoleFilter;
   onRoleFilter: (r: RoleFilter) => void;
@@ -245,6 +251,33 @@ export const FilterBar = forwardRef<HTMLInputElement, FilterBarProps>(function F
           </button>
         ))}
       </div>
+      {p.view === "devices" && (
+        <div role="radiogroup" aria-label="Devices layout" className="flex rounded-[7px] border border-line bg-chrome-2 p-[2px]">
+          {(
+            [
+              ["table", "Table", Table2],
+              ["topology", "Topology", Network],
+            ] as const
+          ).map(([id, label, Icon]) => (
+            <button
+              key={id}
+              type="button"
+              role="radio"
+              aria-checked={p.devicesMode === id}
+              onClick={() => p.onDevicesMode(id)}
+              title={`${label} (⌘T toggles)`}
+              aria-label={label}
+              className={cx(
+                "flex h-[20px] items-center gap-1 rounded-[5px] px-2 text-[12px] whitespace-nowrap",
+                p.devicesMode === id ? "bg-field font-medium shadow-[0_0.5px_2px_rgb(0_0_0/0.18)]" : "text-muted hover:text-fg",
+              )}
+            >
+              <Icon size={13} strokeWidth={1.75} aria-hidden />
+              <span className="hidden min-[1600px]:inline">{label}</span>
+            </button>
+          ))}
+        </div>
+      )}
       {p.view === "devices" && (
         <div role="radiogroup" aria-label="Filter by device role" className="flex flex-wrap items-center gap-1">
           {PILLS.map((pill) => {
