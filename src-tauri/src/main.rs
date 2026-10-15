@@ -38,6 +38,7 @@ use sweepr_core::{
         SnmpDeviceInfo, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, VlanInfo, VlanSelection,
         VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
     },
+    report::{self, ReportFormat, ReportOptions},
     snmp_infra::SnmpClient,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -124,6 +125,8 @@ enum Command {
     Snmp(SnmpArgs),
     /// List network interfaces with their kind, VLAN and addresses
     Interfaces,
+    /// Build an audit report (HTML, PDF or JSON) from a saved scan
+    Report(ReportArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -209,6 +212,55 @@ struct ScanArgs {
     /// Maximum concurrent ICMP probes for routed ranges
     #[arg(long, value_name = "N", default_value_t = 512)]
     concurrency: usize,
+
+    /// After the scan, write an audit report (format from the extension: .html, .pdf, .json)
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct ReportArgs {
+    /// Scan data: the JSON written by `sweepr scan -o json`, `sweepr scan --report x.json`
+    /// or `sweepr report --format json`
+    #[arg(short, long, value_name = "PATH")]
+    input: PathBuf,
+
+    /// Report format [default: from the output extension, else html]
+    #[arg(long, value_enum)]
+    format: Option<CliReportFormat>,
+
+    /// Output file
+    #[arg(short, long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Report title
+    #[arg(long, value_name = "TEXT")]
+    title: Option<String>,
+
+    /// Customer / organization name shown on the report
+    #[arg(long, value_name = "NAME")]
+    org: Option<String>,
+
+    /// PNG or JPEG logo shown in the report header (max 1 MiB)
+    #[arg(long, value_name = "PATH")]
+    logo: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliReportFormat {
+    Html,
+    Pdf,
+    Json,
+}
+
+impl From<CliReportFormat> for ReportFormat {
+    fn from(f: CliReportFormat) -> Self {
+        match f {
+            CliReportFormat::Html => ReportFormat::Html,
+            CliReportFormat::Pdf => ReportFormat::Pdf,
+            CliReportFormat::Json => ReportFormat::Json,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -487,6 +539,7 @@ async fn run_cli(command: Command) -> ExitCode {
         Command::Vlans(args) => cmd_vlans(args, cancel.clone()).await,
         Command::Snmp(args) => cmd_snmp(args, cancel.clone()).await,
         Command::Interfaces => cmd_interfaces().await,
+        Command::Report(args) => cmd_report(args),
     };
     match result {
         // The reader went away (`| head`): stop quietly, like other Unix filters.
@@ -769,11 +822,26 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
     }
     let cfg = args.to_config()?;
     cfg.validate()?;
+    let report_format = match &args.report {
+        Some(path) => Some(ReportFormat::from_path(path).with_context(|| {
+            format!(
+                "--report {}: use a .html, .pdf or .json file name",
+                path.display()
+            )
+        })?),
+        None => None,
+    };
+    let started_ms = sweepr_core::models::now_ms();
+    let report_cfg = report_format.map(|_| cfg.clone());
 
     let (tx, mut rx) = mpsc::channel(1024);
     let scan = tokio::spawn(engine::run_scan(cfg, tx, cancel.clone()));
     let mut ui = LiveRenderer::new(args.output == OutputFormat::Table, cancel.clone());
+    let mut collector = report_format.map(|_| report::ScanCollector::default());
     while let Some(ev) = rx.recv().await {
+        if let Some(c) = &mut collector {
+            c.observe(&ev);
+        }
         ui.handle(ev);
     }
     ui.clear_progress();
@@ -822,6 +890,50 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
         (OutputFormat::Xlsx, None) => bail!("xlsx output requires --file <PATH>"),
     }
     print_summary(&summary);
+    if let (Some(collector), Some(format), Some(path), Some(cfg)) =
+        (collector, report_format, &args.report, report_cfg)
+    {
+        let meta = report::meta_from_config(
+            &cfg,
+            None,
+            started_ms,
+            sweepr_core::models::now_ms(),
+            summary.cancelled,
+        );
+        let input = collector.finish(Some(devices), meta)?;
+        let bytes = report::render(&input, &ReportOptions::default(), format)?;
+        std::fs::write(path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        diag!("wrote {format} audit report to {}", path.display());
+    }
+    Ok(())
+}
+
+/// `sweepr report`: render an audit report from saved scan data.
+fn cmd_report(args: ReportArgs) -> Result<()> {
+    let format = match args.format {
+        Some(f) => f.into(),
+        None => ReportFormat::from_path(&args.output).unwrap_or(ReportFormat::Html),
+    };
+    let input = report::load_input(&args.input)?;
+    let mut opts = ReportOptions::new(args.title.as_deref(), args.org.as_deref());
+    if let Some(logo) = &args.logo {
+        opts.logo = Some(report::Logo::load(logo)?);
+    }
+    let bytes = report::render(&input, &opts, format)?;
+    std::fs::write(&args.output, bytes)
+        .with_context(|| format!("cannot write {}", args.output.display()))?;
+    if input.skipped_records > 0 {
+        diag!(
+            "warning: {} malformed record(s) in {} were skipped",
+            input.skipped_records,
+            args.input.display()
+        );
+    }
+    diag!(
+        "wrote {format} audit report for {} device(s) to {}",
+        input.devices.len(),
+        args.output.display()
+    );
     Ok(())
 }
 
@@ -1279,6 +1391,96 @@ async fn export_devices(
     Ok(Some(written.display().to_string()))
 }
 
+/// The most recent report written by `generate_report` (the only path `reveal_report` opens).
+#[derive(Default)]
+struct LastReport(Mutex<Option<PathBuf>>);
+
+/// Build an audit report from the GUI's current data and save it to a file the user picks
+/// in a native save dialog opened by the backend (the webview never supplies a path).
+/// Records are parsed leniently, so newer device fields are picked up and malformed ones
+/// skipped. Returns the written path, or `null` when the dialog was cancelled.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn generate_report(
+    app: AppHandle,
+    last: State<'_, LastReport>,
+    devices: Vec<serde_json::Value>,
+    vlans: Option<Vec<serde_json::Value>>,
+    neighbors: Option<Vec<serde_json::Value>>,
+    port_mappings: Option<Vec<serde_json::Value>>,
+    snmp_infos: Option<Vec<serde_json::Value>>,
+    meta: Option<serde_json::Value>,
+    format: String,
+    title: Option<String>,
+    org: Option<String>,
+) -> Result<Option<String>, String> {
+    let format: ReportFormat = format.parse().map_err(|e: anyhow::Error| e.to_string())?;
+    let envelope = serde_json::json!({
+        "devices": devices,
+        "vlans": vlans.unwrap_or_default(),
+        "neighbors": neighbors.unwrap_or_default(),
+        "portMappings": port_mappings.unwrap_or_default(),
+        "snmpInfos": snmp_infos.unwrap_or_default(),
+        "meta": meta.unwrap_or_default(),
+    });
+    let opts = ReportOptions::new(title.as_deref(), org.as_deref());
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let input = sweepr_core::audit::AuditInput::from_json_value(envelope)?;
+        report::render(&input, &opts, format)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+
+    let (label, ext) = match format {
+        ReportFormat::Html => ("HTML report", "html"),
+        ReportFormat::Pdf => ("PDF report", "pdf"),
+        ReportFormat::Json => ("JSON audit", "json"),
+    };
+    let (done, chosen) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Save audit report")
+        .add_filter(label, &[ext])
+        .set_file_name(format!("sweepr-audit-report.{ext}"))
+        .save_file(move |path| {
+            let _ = done.send(path);
+        });
+    let Some(chosen) = chosen.await.map_err(|_| "save dialog closed".to_string())? else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    let path = report::resolve_chosen_path(path, format)?;
+    let written = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        report::write_to_chosen_path(&bytes, format, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    *last.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(written.clone());
+    Ok(Some(written.display().to_string()))
+}
+
+/// Reveal the report most recently written by `generate_report` in Finder / the file
+/// manager. Takes no path, so the webview cannot reveal arbitrary files.
+#[tauri::command]
+fn reveal_report(app: AppHandle, last: State<'_, LastReport>) -> Result<bool, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let Some(path) = last
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+    else {
+        return Ok(false);
+    };
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Largest port count a single `scan_ports` command accepts (GUI drawer input bound).
 const SCAN_PORTS_CAP: usize = 4096;
 /// Drawer port scans allowed to run at once.
@@ -1432,6 +1634,7 @@ fn run_gui() -> ExitCode {
         .plugin(tauri_plugin_dialog::init())
         .manage(ScanManager::default())
         .manage(PortScans::default())
+        .manage(LastReport::default())
         .invoke_handler(tauri::generate_handler![
             list_interfaces,
             start_scan,
@@ -1441,7 +1644,9 @@ fn run_gui() -> ExitCode {
             load_overrides,
             save_override,
             scan_ports,
-            query_snmp
+            query_snmp,
+            generate_report,
+            reveal_report
         ])
         .run(tauri::generate_context!());
     match result {
@@ -1461,6 +1666,38 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn report_subcommand_and_scan_report_flag_parse() {
+        let cli = Cli::try_parse_from([
+            "sweepr",
+            "report",
+            "--input",
+            "scan.json",
+            "--format",
+            "pdf",
+            "-o",
+            "out.pdf",
+            "--title",
+            "Q3",
+            "--org",
+            "Acme",
+            "--logo",
+            "logo.png",
+        ])
+        .unwrap();
+        let Some(Command::Report(a)) = cli.command else {
+            panic!("expected report");
+        };
+        assert_eq!(a.format, Some(CliReportFormat::Pdf));
+        assert_eq!(a.org.as_deref(), Some("Acme"));
+        assert!(Cli::try_parse_from(["sweepr", "report", "-o", "x.html"]).is_err());
+        let cli = Cli::try_parse_from(["sweepr", "scan", "--report", "audit.html"]).unwrap();
+        let Some(Command::Scan(s)) = cli.command else {
+            panic!("expected scan");
+        };
+        assert_eq!(s.report, Some(PathBuf::from("audit.html")));
     }
 
     #[test]

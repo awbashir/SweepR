@@ -21,6 +21,8 @@ fn main() {
             "save_override",
             "scan_ports",
             "query_snmp",
+            "generate_report",
+            "reveal_report",
         ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
