@@ -68,6 +68,41 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
   learned more than 48 MACs, or that lead to another switch, router or firewall), prefers
   the device's VLAN and then the port with the fewest MACs.
 
+- **Network utilities**:
+  - **Wake-on-LAN** (`sweepr wake`, GUI `wake_device`): sends the magic packet (6 x `0xFF`
+    + the MAC 16 times, optional 6-byte SecureOn password) over UDP (port 9 by default) to
+    the interface's subnet broadcast and `255.255.255.255`, from a socket bound to that
+    interface with `SO_BROADCAST`. `--broadcast` sends to one address instead (e.g. the
+    directed broadcast of a remote subnet).
+  - **Latency monitor** (`sweepr ping`, GUI `start_latency_monitor`): pings hosts every
+    0.5-10 s with unprivileged ICMP / ICMPv6 and keeps the last 120 samples per host (last /
+    avg / min / max / jitter / loss, plus a sparkline history). Hosts that never answer ICMP
+    fall back to TCP connect round trips (SYN → SYN-ACK or RST) on a known open port or on
+    443 / 80 / 22 / 445. At most 2,000 hosts are monitored at once.
+  - **MTR / traceroute** (`sweepr trace`, GUI `start_trace`): per-hop loss and last / avg /
+    best / worst latency over several rounds, with reverse-DNS hop names. As root (or with
+    `CAP_NET_RAW`) it sends raw ICMP echo probes with increasing TTL; otherwise it runs the
+    system tool once per round (`traceroute -n -q 1 -w 1 -m <max>`; macOS ships a setuid
+    `/usr/sbin/traceroute` / `traceroute6`, Linux needs `traceroute` or `tracepath`). Only IP
+    literals are accepted and arguments are never passed through a shell.
+  - **Web identity** (`sweepr web`, GUI `grab_web_identity`, and automatically during scans
+    for devices with 80 / 443 / 8443 / 8080 / 8000 / 10443 open; `--no-web` disables it):
+    the HTML `<title>`, `Server` header and TLS certificate (subject / SANs / issuer /
+    validity / key / SHA-256) of each web port. Requests are a plain `GET /` with short
+    timeouts, a 64 KiB body cap and at most two same-host redirects; no credentials are ever
+    sent, and certificates are read without being trusted. Known appliances (Proxmox VE,
+    Synology DSM, QNAP, TrueNAS, iDRAC, iLO, ESXi / vCenter, UniFi, pfSense / OPNsense,
+    FortiGate, MikroTik, Pi-hole, Home Assistant, ...) are named in `webIdentity`; firewall /
+    router appliances also suggest a role, which is only applied to devices still classified
+    as plain hosts. Expired, soon-to-expire (< 30 days), not-yet-valid and self-signed
+    certificates are listed in `warnings`.
+  - **iPerf3** (`sweepr iperf`, GUI `start_iperf`): runs the installed `iperf3` client
+    (looked up on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`) with validated arguments
+    (IP literal, port, 1-60 s, 1-16 streams, TCP or UDP with a numeric bitrate) and reports
+    per-second intervals and the summary (throughput, retransmits, UDP jitter / loss, CPU).
+    iperf3 3.17+ streams intervals live (`--json-stream`); older versions report them at
+    the end. Without iperf3 it says how to install it (`brew install iperf3`).
+
 ## CLI usage
 
 ```sh
@@ -100,7 +135,31 @@ sweepr scan -r 10.0.0.0/24 -o json > devices.json
 
 # List interfaces (kind, VLAN ID/parent, addresses)
 sweepr interfaces
+
+# Wake-on-LAN (any MAC notation); --broadcast for a remote subnet, --port 7 for echo
+sweepr wake aa:bb:cc:dd:ee:ff -i en0
+sweepr wake aabb.ccdd.eeff --broadcast 10.20.0.255 --port 9 --port 7 --repeat 5
+
+# Continuous ping with loss / jitter statistics (Ctrl-C to stop) or a fixed count
+sweepr ping 10.0.0.1 10.0.0.2
+sweepr ping 10.0.0.1 --count 10 --interval-ms 500 -o json
+
+# MTR-style traceroute (no sudo needed: uses the system traceroute when unprivileged)
+sweepr trace 8.8.8.8 --max-hops 30 --rounds 10
+sweepr trace 2001:4860:4860::8888 -o json
+
+# Web page titles, Server headers and TLS certificates
+sweepr web 10.0.0.10
+sweepr web 10.0.0.10 -p 443,8006 -o json
+
+# Throughput against an iperf3 server (iperf3 must be installed)
+sweepr iperf 10.0.0.20 -t 10 -P 4
+sweepr iperf 10.0.0.20 -R --udp -b 100M
 ```
+
+`ping` exits with status 1 when a host never answered (and 130 after Ctrl-C, like the other
+commands). The SecureOn password for `wake --password` can also come from
+`SWEEPR_WOL_PASSWORD`.
 
 Main `scan` flags:
 
@@ -125,6 +184,7 @@ encrypted request fails or times out, repeats it once with Blumenthal.
 | `-6, --ipv6` | IPv6 neighbor discovery. |
 | `-p, --ports` | TCP ports to connect-scan, e.g. `22,80,443` or `1-1024`. |
 | `--no-resolve` | Disable DNS / mDNS / NetBIOS name resolution. |
+| `--no-web` | Do not read web titles / TLS certificates of devices with web ports open. |
 | `-o, --output` | `table` (default, live), `json`, `csv` or `xlsx`. |
 | `-f, --file` | Output file. Required for `xlsx`. |
 | `--timeout-ms`, `--rate-pps`, `--retries`, `--listen-secs`, `--concurrency` | Timing and pacing (validated: timeout <= 600000 ms, rate 1-1000000 pps, retries <= 10, listen <= 86400 s, concurrency 1-65535). |
@@ -203,6 +263,12 @@ src-tauri/
   src/snmp_infra.rs  async SNMP (v1/v2c/v3): system MIB, VLAN tables, bridge/CAM mapping
   src/enricher.rs  OUI vendor DB, DNS/mDNS/NetBIOS, port scan, fingerprint, local overrides
   src/export.rs    CSV / JSON / XLSX export and terminal tables
+  src/wol.rs       Wake-on-LAN magic packets
+  src/latency.rs   latency monitor (ICMP / TCP fallback, rolling stats, sparklines)
+  src/trace.rs     MTR-style traceroute (raw ICMP as root, system traceroute otherwise)
+  src/webid.rs     HTTP title / Server header / TLS certificate grabber, appliance identification
+  src/iperf.rs     iperf3 client runner and JSON parsers
+  src/jobs.rs      registry of running utility jobs (monitors, traces, iperf3 runs)
   data/oui.tsv     embedded IEEE OUI database (generated by scripts/build_oui_db.py)
 ```
 
@@ -222,6 +288,15 @@ The webview may call only the commands listed in `src-tauri/build.rs` and grante
 | `save_override` | `{ key: string, hostname: string \| null, comments: string \| null }` | `null`. Rejects on a write error or a corrupt store (which is moved aside first). |
 | `scan_ports` | `{ ip: string, ports: number[] }` | `number[]` of open ports (sorted). Rejects on a bad IP, > 4096 distinct ports, when 4 port scans are already running, when stopped by `stop_scan`, or when some ports could not be checked (out of file descriptors). |
 | `query_snmp` | `{ ip: string, snmp: SnmpConfig \| null }` | `SnmpDeviceInfo`. Rejects on a bad IP, invalid config or unreachable device. |
+| `wake_device` | `{ mac: string, interface?: string \| null, broadcast?: string \| null, port?: number \| null, repeat?: number \| null, password?: string \| null }` | `WakeResult`. Rejects a malformed / broadcast / multicast MAC, a non-IPv4 or multicast `broadcast`, port 0, a malformed SecureOn password, or when nothing could be sent. |
+| `start_latency_monitor` | `{ ips: string[], intervalMs?: number \| null, tcpPorts?: Record<string, number[]> \| null }` | `monitorId` (number). Rejects bad IPs, an empty list, `intervalMs` outside 500-10000 (default 1000), more than 2,000 monitored hosts in total, or when 16 monitors are running. |
+| `stop_latency_monitor` | `{ monitorId: number }` | `true` if it was running (one final batch may follow). |
+| `start_trace` | `{ ip: string, maxHops?: number \| null, rounds?: number \| null }` | `traceId` (number). `maxHops` 1-64 (default 30), `rounds` 1-100 (default 5). Rejects host names, unspecified / multicast / broadcast addresses, or when 8 traces are running. |
+| `stop_trace` | `{ traceId: number }` | `true` if it was running (its final `done` update follows). |
+| `grab_web_identity` | `{ ip: string, ports?: number[] \| null }` | `WebIdentity`. `ports` defaults to `[80, 443, 8443, 8080, 8000, 10443]` (at most 16). Rejects a bad IP or when 4 lookups are running. |
+| `iperf_available` | none | `IperfAvailability` |
+| `start_iperf` | `{ ip: string, options?: IperfOptions \| null }` | `runId` (number). Rejects right away when iperf3 is missing (message includes the install hint), on invalid options, or when 2 runs are active. |
+| `stop_iperf` | `{ runId: number }` | `true` if it was running (the iperf3 process is killed; a final `done` update with an error follows). |
 
 Tauri maps Rust snake_case command arguments to camelCase in JS automatically (so
 `scan_id` is `scanId`, `timeout_secs` is `timeoutSecs`).
@@ -344,5 +419,229 @@ interface SnmpConfig {
   port: number;
   timeoutMs: number;
   retries: number;
+}
+```
+
+### Network utility commands and events
+
+Utility jobs run independently of scans (a scan never stops them and they never emit
+`scan-event`s). Each kind numbers its jobs from 1. Every running monitor, trace and iperf3
+run is cancelled when the app exits (child processes are killed).
+
+- `latency-update` (`LatencyUpdate`): at most one batch per 250 ms per monitor (≤ 4 events
+  per second), carrying only the hosts that got a new sample since the previous batch. The
+  statistics cover the host's window (its last 120 samples); `history` is that window,
+  oldest first, `null` for lost probes. A monitor stops when `stop_latency_monitor` is called
+  (one final batch may follow) or when the app exits. The engine never fills
+  `device.latency`; the GUI may copy a sample into it (`lastMs = rttMs`, `updatedMs = ts`,
+  the other fields by name) so that exports show the Latency / Loss % columns.
+- `trace-update` (`TraceUpdate`): a full snapshot at most every 250 ms while probes arrive,
+  one at the end of each round, and always a final one with `done: true` (also when the trace
+  is stopped or fails; on failure `error` says why, e.g. no traceroute tool installed). `hops` is
+  TTL 1..N, where N is the destination's TTL once it answered (`reached: true`) or the
+  highest TTL probed so far. Hop names arrive asynchronously (a later snapshot fills
+  `hostname`). `method` is `"system"` for unprivileged runs, `"raw"` as root.
+- `iperf-update` (`IperfUpdate`): one event per interval (`interval` set), then a final
+  `done: true` event with `summary` or `error`. With iperf3 older than 3.17 all intervals
+  arrive just before the final event (`IperfAvailability.streaming` is `false`).
+- `grab_web_identity` returns a `WebIdentity` directly. During scans the same data is
+  merged into `device` events (`webTitle`, `webServer`, `tlsCert`, `webIdentity`,
+  `warnings`, and possibly `role`) for devices with 80 / 443 / 8443 / 8080 / 8000 / 10443
+  open, unless `ScanConfig.webIdentity` is `false` (it is ignored when `ports` is empty).
+
+Tabular exports (CSV / XLSX / CLI table) gained the columns `Latency (ms)` (average),
+`Loss %`, `Web Title`, `Cert CN` and `Cert Expires` (date, `(expired)` when past), placed
+before `Comments`; the CLI table hides them when empty for every device.
+
+```ts
+// New Device fields (always serialized; optional when sending devices back to
+// export_devices: missing fields default to null / []).
+interface Device {
+  // ...existing fields...
+  latency: LatencyStats | null;
+  webTitle: string | null;
+  webServer: string | null;
+  tlsCert: TlsCertInfo | null;
+  webIdentity: string | null;  // e.g. "Proxmox VE", "Dell iDRAC", "Fortinet FortiGate"
+  warnings: string[];          // e.g. "TLS certificate on port 443 expires in 12 day(s) (2026-11-01)"
+}
+
+// ScanConfig.webIdentity (boolean, default true): read web titles / TLS certificates of
+// devices with web ports open during enrichment (needs a non-empty `ports`).
+
+type ProbeMethod = "icmp" | "tcp";
+
+interface LatencyStats {
+  lastMs: number | null;
+  avgMs: number | null;
+  minMs: number | null;
+  maxMs: number | null;
+  jitterMs: number | null;   // mean |difference| between consecutive replies
+  lossPct: number;           // 0-100 over the window
+  sent: number;              // probes in the window
+  received: number;
+  method: ProbeMethod;
+  updatedMs: number;         // Unix ms of the newest sample
+}
+
+interface LatencySample {
+  ip: string;
+  rttMs: number | null;      // newest probe, null = lost
+  ts: number;                // Unix ms when the newest probe was sent
+  method: ProbeMethod;       // "tcp" once the host fell back to TCP connect round trips
+  lossPct: number;
+  avgMs: number | null;
+  minMs: number | null;
+  maxMs: number | null;
+  jitterMs: number | null;
+  sent: number;
+  received: number;
+  history: (number | null)[]; // up to 120 samples, oldest first
+}
+
+interface LatencyUpdate {      // event "latency-update"
+  monitorId: number;
+  samples: LatencySample[];    // sorted by IP
+}
+
+type TraceMethod = "raw" | "system";
+
+interface TraceHop {
+  ttl: number;
+  ip: string | null;         // newest responder; null while the hop never answered
+  hostname: string | null;   // reverse DNS
+  otherIps: string[];        // other responders for this TTL (load balancing), at most 4
+  sent: number;
+  received: number;
+  lossPct: number;
+  lastMs: number | null;
+  avgMs: number | null;
+  bestMs: number | null;
+  worstMs: number | null;
+}
+
+interface TraceUpdate {        // event "trace-update"
+  traceId: number;
+  target: string;
+  method: TraceMethod;
+  round: number;               // rounds completed
+  rounds: number;              // rounds requested
+  hops: TraceHop[];
+  reached: boolean;
+  done: boolean;
+  error: string | null;        // only on the final update
+}
+
+interface TlsCertInfo {
+  port: number;
+  subjectCn: string | null;
+  subject: string | null;      // "CN=pve.lan, O=PVE Cluster Node"
+  sans: string[];              // first 8 DNS names / IPs
+  sanCount: number;
+  issuerCn: string | null;
+  issuer: string | null;
+  notBefore: string | null;    // ISO 8601 UTC, "2026-01-31T12:00:00Z"
+  notAfter: string | null;
+  notBeforeMs: number | null;  // Unix ms
+  notAfterMs: number | null;
+  daysRemaining: number | null; // negative once expired
+  selfSigned: boolean;
+  expired: boolean;
+  keyType: string | null;      // "RSA", "EC P-256", "Ed25519", ...
+  keyBits: number | null;
+  signatureAlgorithm: string | null; // "sha256WithRSAEncryption", "ecdsa-with-SHA256", ...
+  sha256: string | null;       // "AB:CD:..."
+}
+
+type WebScheme = "http" | "https";
+
+interface WebService {
+  port: number;
+  scheme: WebScheme;           // TLS is tried first on 443, 8443, 10443, 8006, 5001, ...
+  url: string;                 // final URL after redirects
+  status: number | null;
+  title: string | null;
+  server: string | null;
+  redirects: number;           // followed (at most 2, same host only)
+  redirectTo: string | null;   // redirect that was not followed (other host / limit)
+  tlsCert: TlsCertInfo | null;
+  error: string | null;
+}
+
+interface WebIdentity {
+  ip: string;
+  services: WebService[];      // ports that accepted a connection, HTTPS first
+  title: string | null;
+  server: string | null;
+  tlsCert: TlsCertInfo | null;
+  identity: string | null;
+  roleHint: DeviceRole | null; // "firewall" for pfSense / FortiGate / ..., "router" for MikroTik
+  warnings: string[];
+}
+
+interface IperfOptions {       // every field optional; defaults shown
+  port: number;                // 5201
+  durationSecs: number;        // 10 (1-60)
+  reverse: boolean;            // false (-R: server sends)
+  streams: number;             // 1 (1-16, -P)
+  udp: boolean;                // false
+  bitrate: string | null;      // null; "100M", "1G", "500K", "0" (-b)
+}
+
+interface IperfAvailability {
+  available: boolean;
+  path: string | null;
+  version: string | null;      // "3.17.1"
+  streaming: boolean;          // live intervals (3.17+)
+  installHint: string | null;  // e.g. "iperf3 was not found; install it with `brew install iperf3`"
+}
+
+interface IperfInterval {
+  start: number;               // seconds since the test started
+  end: number;
+  bytes: number;
+  bitsPerSecond: number;
+  retransmits: number | null;  // TCP sender
+  jitterMs: number | null;     // UDP
+  lostPackets: number | null;
+  packets: number | null;
+  lostPercent: number | null;
+  omitted: boolean;
+}
+
+interface IperfSummary {
+  protocol: "tcp" | "udp";
+  reverse: boolean;
+  streams: number;
+  durationSecs: number;
+  sentBytes: number | null;
+  sentBps: number | null;
+  receivedBytes: number | null;
+  receivedBps: number | null;
+  retransmits: number | null;
+  jitterMs: number | null;
+  lostPackets: number | null;
+  packets: number | null;
+  lostPercent: number | null;
+  cpuLocalPct: number | null;
+  cpuRemotePct: number | null;
+  remoteHost: string | null;   // "10.0.0.20:5201"
+  version: string | null;      // local iperf3, "iperf 3.17.1"
+}
+
+interface IperfUpdate {        // event "iperf-update"
+  runId: number;
+  interval: IperfInterval | null;
+  summary: IperfSummary | null; // final event only, on success
+  done: boolean;
+  error: string | null;         // final event only, on failure / stop
+}
+
+interface WakeResult {
+  mac: string;                 // "aa:bb:cc:dd:ee:ff"
+  targets: string[];           // "192.168.1.255:9", "255.255.255.255:9"
+  packetsSent: number;
+  interface: string | null;
+  sourceIp: string | null;
 }
 ```

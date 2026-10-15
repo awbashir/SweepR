@@ -33,7 +33,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 
 # --- Async runtime & CLI ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs", "process"] }
 tokio-util = "0.7"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "wrap_help", "env"] }
@@ -52,6 +52,15 @@ libc = "0.2"
 snmp2 = { version = "0.5", features = ["heap_buffers"] }
 hickory-resolver = "0.26"
 mdns-sd = "0.21"
+
+# --- Network utilities (web identity / TLS certificate grabber) ---
+# rustls with the `ring` provider only (no aws-lc / cmake toolchain needed). The grabber uses a
+# verifier that accepts any certificate *only* to read it; see `webid.rs`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+x509-parser = { version = "0.18", features = ["verify"] }
+ring = "0.17"
+httparse = "1"
 
 # --- Export ---
 csv = "1"

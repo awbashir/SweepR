@@ -22,6 +22,15 @@
     "allow-load-overrides",
     "allow-save-override",
     "allow-scan-ports",
-    "allow-query-snmp"
+    "allow-query-snmp",
+    "allow-wake-device",
+    "allow-start-latency-monitor",
+    "allow-stop-latency-monitor",
+    "allow-start-trace",
+    "allow-stop-trace",
+    "allow-grab-web-identity",
+    "allow-iperf-available",
+    "allow-start-iperf",
+    "allow-stop-iperf"
   ]
 }
