@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     arp_vlan::{self, L2Error, PassiveResults},
     dhcp_fp, enricher,
+    limits::SocketBudget,
     models::{
         normalize_mac, Capability, CdpLldpNeighbor, Device, DeviceOverride, DeviceRole,
         DiscoverySource, InterfaceInfo, InterfaceKind, Ipv4Range, NeighborProtocol, ScanConfig,
@@ -26,7 +27,7 @@ use crate::{
         MAX_LISTEN_SECS,
     },
     progress::{ProgressCounter, ProgressScope},
-    services, snmp_infra, sweep,
+    services, snmp_infra, sweep, webid,
 };
 
 /// Shared, read-only map of user device overrides applied to every emitted [`Device`].
@@ -1239,13 +1240,16 @@ pub fn snmp_candidates(
 
 /// Run the enrichment phase on the discovery result and return the enriched state.
 ///
-/// Enrichment runs when name resolution, port scanning or SNMP is requested, in two steps,
+/// Enrichment runs when name resolution, port scanning or SNMP is requested, in steps,
 /// each through an aggregator seeded with the state so far so every update (sparse device
 /// snapshots, SNMP VLANs / port mappings / role) upserts onto the existing rows and streams
 /// the merged result to `tx`:
 ///
 /// 1. names, vendors and TCP ports ([`enricher::enrich_devices`]);
-/// 2. SNMP polling of the candidates chosen by [`snmp_candidates`] from the enriched state
+/// 2. with `webIdentity`, the HTTP title / `Server` header / TLS certificate of devices
+///    with a web port open ([`webid::enrich_web`]; its role hints only apply to devices
+///    still classified as plain hosts);
+/// 3. SNMP polling of the candidates chosen by [`snmp_candidates`] from the enriched state
 ///    (open ports and vendors are known by then).
 ///
 /// Returns `state` unchanged when there is nothing to do or the scan was cancelled before
@@ -1261,6 +1265,8 @@ async fn run_enrichment(
 ) -> Result<Aggregate> {
     let wants_snmp = cfg.snmp.is_some();
     let wants_enrich = cfg.resolve_names || !cfg.ports.is_empty();
+    // Web identity needs the port scan (it only probes web ports found open).
+    let wants_web = cfg.web_identity && !cfg.ports.is_empty();
     let wants_services = cfg.discover_services;
     let devices = state.sorted_devices();
     if cancel.is_cancelled()
@@ -1288,6 +1294,7 @@ async fn run_enrichment(
     } else {
         0
     });
+    let web_scope = counter.scope(if wants_web { devices.len() as u64 } else { 0 });
     let services_scope = counter.scope(if wants_services {
         devices.len() as u64
     } else {
@@ -1342,7 +1349,46 @@ async fn run_enrichment(
     }
     enrich_scope.finish();
 
-    // Step 1b: service discovery (SSDP/UPnP, WS-Discovery/ONVIF, SIP OPTIONS). Runs on the
+    // Step 2: HTTP title / Server header / TLS certificate of devices with web ports open.
+    if wants_web && !cancel.is_cancelled() {
+        let enriched = state.sorted_devices();
+        let web_devices = enriched
+            .iter()
+            .filter(|d| {
+                d.open_ports
+                    .iter()
+                    .any(|p| webid::DEFAULT_WEB_PORTS.contains(p))
+            })
+            .count();
+        let (wtx, wrx) = mpsc::channel(EVENT_BUFFER);
+        let aggregator = tokio::spawn(aggregate(state, overrides.clone(), false, wrx, tx.clone()));
+        if web_devices > 0 {
+            let _ = wtx
+                .send(ScanEvent::info(format!(
+                    "web identity: reading titles and TLS certificates of {web_devices} \
+                     device(s) with web ports open"
+                )))
+                .await;
+        }
+        let timeout = Duration::from_millis(cfg.timeout_ms.clamp(1_000, 5_000));
+        webid::enrich_web(
+            enriched,
+            webid::DEFAULT_WEB_PORTS,
+            timeout,
+            wtx.clone(),
+            cancel.clone(),
+            web_scope.clone(),
+            SocketBudget::global(),
+        )
+        .await;
+        drop(wtx);
+        state = aggregator
+            .await
+            .context("web identity aggregator crashed")?;
+    }
+    web_scope.finish();
+
+    // Step 3: service discovery (SSDP/UPnP, WS-Discovery/ONVIF, SIP OPTIONS). Runs on the
     // enriched devices so open ports (5060) and vendors pick the SIP candidates.
     if wants_services && !cancel.is_cancelled() {
         let enriched = state.sorted_devices();
@@ -1365,7 +1411,7 @@ async fn run_enrichment(
     }
     services_scope.finish();
 
-    // Step 2: SNMP infrastructure polling.
+    // Step 4: SNMP infrastructure polling.
     if let (Some(snmp), false) = (&cfg.snmp, cancel.is_cancelled()) {
         let gateway = if cfg.snmp_all {
             None

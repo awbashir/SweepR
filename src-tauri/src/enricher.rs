@@ -365,6 +365,30 @@ async fn dns_ptr(
     None
 }
 
+/// A reusable reverse-DNS resolver built from the system configuration (traceroute hop
+/// names, single-device lookups). Same policy as the scan: no public fallback resolver.
+#[derive(Clone)]
+pub struct PtrResolver {
+    inner: Arc<hickory_resolver::TokioResolver>,
+    budget: SocketBudget,
+}
+
+impl PtrResolver {
+    /// The system resolver with a per-query `timeout` (two attempts), drawing sockets from
+    /// the global budget. `None` when the system DNS configuration cannot be used.
+    pub fn system(timeout: Duration) -> Option<Self> {
+        build_resolver(timeout, 2).map(|r| Self {
+            inner: Arc::new(r),
+            budget: SocketBudget::global().clone(),
+        })
+    }
+
+    /// Reverse-resolve `ip` to one sanitized PTR name.
+    pub async fn lookup(&self, ip: IpAddr) -> Option<String> {
+        dns_ptr(&self.inner, ip, &self.budget).await
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // mDNS discovery
 // ---------------------------------------------------------------------------------------------
