@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::{sanitize_text, Device};
 
 /// Number of columns in every tabular export.
-pub const NUM_COLUMNS: usize = 14;
+pub const NUM_COLUMNS: usize = 19;
 
 /// Column headers shared by every tabular export.
 pub const COLUMNS: [&str; NUM_COLUMNS] = [
@@ -33,18 +33,63 @@ pub const COLUMNS: [&str; NUM_COLUMNS] = [
     "SMB Name",
     "SMB Domain",
     "TCP Ports",
+    "Latency (ms)",
+    "Loss %",
+    "Web Title",
+    "Cert CN",
+    "Cert Expires",
     "Comments",
 ];
 
 const COL_VLAN: usize = 3;
+/// Numeric columns written as numbers in XLSX.
+const COL_LATENCY: usize = 13;
+const COL_LOSS: usize = 14;
 
 /// Columns always shown by [`render_table`], even when empty (IP, MAC, VLAN, Role).
 const ALWAYS_SHOWN: [usize; 4] = [0, 2, COL_VLAN, 4];
 
 /// Excel column widths (characters), aligned with [`COLUMNS`].
 const XLSX_WIDTHS: [f64; NUM_COLUMNS] = [
-    16.0, 30.0, 19.0, 7.0, 13.0, 22.0, 24.0, 28.0, 30.0, 26.0, 18.0, 16.0, 20.0, 36.0,
+    16.0, 30.0, 19.0, 7.0, 13.0, 22.0, 24.0, 28.0, 30.0, 26.0, 18.0, 16.0, 20.0, 12.0, 8.0, 32.0,
+    26.0, 13.0, 36.0,
 ];
+
+/// Average latency, `"12.3"` (one decimal), when known.
+fn latency_cell(d: &Device) -> String {
+    d.latency
+        .as_ref()
+        .and_then(|l| l.avg_ms)
+        .filter(|v| v.is_finite())
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_default()
+}
+
+/// Loss percentage, `"0.0"`, when the device has latency statistics.
+fn loss_cell(d: &Device) -> String {
+    d.latency
+        .as_ref()
+        .filter(|l| l.sent > 0)
+        .map(|l| format!("{:.1}", l.loss_pct))
+        .unwrap_or_default()
+}
+
+/// Certificate expiry date (`YYYY-MM-DD`), marked when expired.
+fn cert_expiry_cell(d: &Device) -> String {
+    let Some(c) = &d.tls_cert else {
+        return String::new();
+    };
+    let date = c
+        .not_after
+        .as_deref()
+        .map(|s| sanitize_text(s.get(..10).unwrap_or(s)))
+        .unwrap_or_default();
+    if c.expired && !date.is_empty() {
+        format!("{date} (expired)")
+    } else {
+        date
+    }
+}
 
 /// File formats supported by [`export_to_path`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +167,15 @@ pub fn device_row(d: &Device) -> [String; NUM_COLUMNS] {
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(", "),
+        latency_cell(d),
+        loss_cell(d),
+        opt(&d.web_title),
+        d.tls_cert
+            .as_ref()
+            .and_then(|c| c.subject_cn.as_deref())
+            .map(sanitize_text)
+            .unwrap_or_default(),
+        cert_expiry_cell(d),
         opt(&d.comments),
     ]
 }
@@ -177,11 +231,17 @@ fn build_xlsx(devices: &[Device]) -> Result<Workbook> {
         let row = u32::try_from(i + 1).context("too many rows for a worksheet")?;
         for (col, value) in device_row(d).iter().enumerate() {
             let is_vlan = col == COL_VLAN;
+            let numeric = (col == COL_LATENCY || col == COL_LOSS)
+                .then(|| value.parse::<f64>().ok())
+                .flatten();
             let col = u16::try_from(col)?;
             match (is_vlan, d.vlan_id) {
                 (true, Some(v)) => ws.write_number(row, col, f64::from(v))?,
                 _ if value.is_empty() => continue,
-                _ => ws.write_string(row, col, value)?,
+                _ => match numeric {
+                    Some(n) => ws.write_number(row, col, n)?,
+                    None => ws.write_string(row, col, value)?,
+                },
             };
         }
     }
@@ -293,13 +353,27 @@ pub fn render_table(devices: &[Device]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DeviceRole, DiscoverySource};
+    use crate::models::{DeviceRole, DiscoverySource, LatencyStats, TlsCertInfo};
 
     fn devices() -> Vec<Device> {
         let mut a = Device::new("10.0.0.20".parse().unwrap());
         a.mac = Some("00:11:22:33:44:55".into());
         a.extra_ips = vec!["fe80::1".parse().unwrap(), "2001:db8::20".parse().unwrap()];
         a.add_source(DiscoverySource::Arp);
+        a.latency = Some(LatencyStats {
+            avg_ms: Some(12.345),
+            loss_pct: 25.0,
+            sent: 4,
+            received: 3,
+            ..LatencyStats::default()
+        });
+        a.web_title = Some("Proxmox VE".into());
+        a.tls_cert = Some(TlsCertInfo {
+            subject_cn: Some("pve.lan".into()),
+            not_after: Some("2027-03-01T00:00:00Z".into()),
+            expired: true,
+            ..TlsCertInfo::default()
+        });
         let mut b = Device::new("10.0.0.3".parse().unwrap());
         b.role = DeviceRole::Switch;
         b.open_ports = vec![22, 443];
@@ -317,15 +391,15 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "IP,Other IPs,MAC,VLAN,Role,Hostname,Vendor,Switch/Port,DNS,mDNS,SMB Name,SMB Domain,TCP Ports,Comments"
+            "IP,Other IPs,MAC,VLAN,Role,Hostname,Vendor,Switch/Port,DNS,mDNS,SMB Name,SMB Domain,TCP Ports,Latency (ms),Loss %,Web Title,Cert CN,Cert Expires,Comments"
         );
         assert_eq!(
             lines[1],
-            "10.0.0.3,,,,Switch,,,,,,,,\"22, 443\",\"core, \"\"stack\"\"\""
+            "10.0.0.3,,,,Switch,,,,,,,,\"22, 443\",,,,,,\"core, \"\"stack\"\"\""
         );
         assert_eq!(
             lines[2],
-            "10.0.0.20,\"fe80::1, 2001:db8::20\",00:11:22:33:44:55,,Host,,,,,,,,,"
+            "10.0.0.20,\"fe80::1, 2001:db8::20\",00:11:22:33:44:55,,Host,,,,,,,,,12.3,25.0,Proxmox VE,pve.lan,2027-03-01 (expired),"
         );
         assert!(lines[3].starts_with("10.10.0.1,,,10,Host"));
         assert_eq!(lines.len(), 4);
@@ -350,7 +424,7 @@ mod tests {
             let row = r.records().next().unwrap().unwrap();
             let hostname = &row[5];
             assert!(hostname.starts_with('\''), "{evil:?} -> {hostname:?}");
-            assert!(row[13].starts_with('\''));
+            assert!(row[NUM_COLUMNS - 1].starts_with('\''));
         }
         assert_eq!(csv_safe("plain"), "plain");
         assert_eq!(csv_safe(""), "");
@@ -430,9 +504,23 @@ mod tests {
         assert!(!t.contains("mDNS") && !t.contains("Vendor"));
         assert!(t.contains("10.10.0.1"));
         assert!(t.contains("Other IPs") && t.contains("2001:db8::20"));
+        assert!(t.contains("Latency (ms)") && t.contains("Cert Expires"));
         let mut plain = devices();
         plain[0].extra_ips.clear();
-        assert!(!render_table(&plain).contains("Other IPs"));
+        plain[0].latency = None;
+        plain[0].web_title = None;
+        plain[0].tls_cert = None;
+        let t = render_table(&plain);
+        assert!(!t.contains("Other IPs"));
+        for hidden in [
+            "Latency (ms)",
+            "Loss %",
+            "Web Title",
+            "Cert CN",
+            "Cert Expires",
+        ] {
+            assert!(!t.contains(hidden), "{hidden} must be hidden when empty");
+        }
     }
 
     #[test]

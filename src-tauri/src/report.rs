@@ -1179,6 +1179,29 @@ mod tests {
     }
 
     #[test]
+    fn real_device_tls_cert_reaches_the_audit() {
+        // `Device::tls_cert` (web identity grabber) serializes as `tlsCert` and is read
+        // through the lenient `extra` channel.
+        let mut d = Device::new("10.0.0.9".parse().unwrap());
+        d.mac = Some("00:11:22:33:44:99".into());
+        d.open_ports = vec![443];
+        d.tls_cert = Some(
+            serde_json::from_value(json!({
+                "port": 443, "subjectCn": "old.lan", "selfSigned": true,
+                "notAfterMs": (NOW as i64) - 86_400_000, "keyType": "RSA", "keyBits": 1024
+            }))
+            .unwrap(),
+        );
+        let mut c = ScanCollector::default();
+        c.observe(&ScanEvent::device(d));
+        let input = c.finish(None, ReportMeta::default()).unwrap();
+        let r = run_audit(&input, &AuditThresholds::default(), NOW);
+        for id in ["SWR-TLS-001", "SWR-TLS-003", "SWR-TLS-004"] {
+            assert!(r.findings.iter().any(|f| f.id == id), "{id}");
+        }
+    }
+
+    #[test]
     fn report_format_and_logo_validation() {
         assert_eq!("HTML".parse::<ReportFormat>().unwrap(), ReportFormat::Html);
         assert_eq!(
