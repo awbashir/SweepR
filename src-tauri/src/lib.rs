@@ -5,6 +5,9 @@ pub mod audit;
 pub mod engine;
 pub mod enricher;
 pub mod export;
+pub mod iperf;
+pub mod jobs;
+pub mod latency;
 pub mod limits;
 pub mod models;
 pub mod progress;
@@ -13,6 +16,9 @@ pub mod report_html;
 pub mod report_pdf;
 pub mod snmp_infra;
 pub mod sweep;
+pub mod trace;
+pub mod webid;
+pub mod wol;
 
 /// Install a `tracing` subscriber writing to stderr. The filter comes from `RUST_LOG`
 /// (default `warn`). Safe to call more than once.

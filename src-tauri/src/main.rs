@@ -12,7 +12,7 @@ use std::{
     fmt::Display,
     future::Future,
     io::{self, IsTerminal, Write},
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -31,15 +31,22 @@ use sweepr_core::{
     engine::{self, ScanOptions},
     enricher,
     export::{self, ExportFormat},
+    iperf,
+    jobs::JobRegistry,
+    latency::{self, MonitorConfig},
     limits::{self, SocketBudget},
     models::{
         parse_ports, sanitize_text, CdpLldpNeighbor, Device, DeviceOverride, InterfaceInfo,
-        LogLevel, ScanConfig, ScanEvent, ScanPhase, ScanSummary, SnmpAuthProtocol, SnmpConfig,
-        SnmpDeviceInfo, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, VlanInfo, VlanSelection,
-        VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
+        IperfAvailability, IperfInterval, IperfOptions, IperfSummary, IperfUpdate, LatencySample,
+        LatencyUpdate, LogLevel, ProbeMethod, ScanConfig, ScanEvent, ScanPhase, ScanSummary,
+        SnmpAuthProtocol, SnmpConfig, SnmpDeviceInfo, SnmpPrivProtocol, SnmpV3Credentials,
+        SnmpVersion, TraceMethod, TraceUpdate, VlanInfo, VlanSelection, VlanSource, WakeResult,
+        WebIdentity, WebScheme, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
     },
     report::{self, ReportFormat, ReportOptions},
     snmp_infra::SnmpClient,
+    trace::{self, TraceOptions},
+    webid, wol,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -49,6 +56,10 @@ use tokio_util::sync::CancellationToken;
 /// Tauri event name carrying every [`ScanEvent`] to the frontend, wrapped in a
 /// [`GuiScanEvent`] (`{ scanId, event }`).
 const SCAN_EVENT: &str = "scan-event";
+/// Utility events: [`LatencyUpdate`], [`TraceUpdate`] and [`IperfUpdate`] payloads.
+const LATENCY_EVENT: &str = "latency-update";
+const TRACE_EVENT: &str = "trace-update";
+const IPERF_EVENT: &str = "iperf-update";
 
 const ROOT_HINT: &str = "hint: active layer-2 scanning (ARP, 802.1Q, NDP) and CDP/LLDP capture \
      need root: run `sudo sweepr ...`. On macOS, BPF device access (e.g. Wireshark's ChmodBPF) \
@@ -127,6 +138,159 @@ enum Command {
     Interfaces,
     /// Build an audit report (HTML, PDF or JSON) from a saved scan
     Report(ReportArgs),
+    /// Wake a device with a Wake-on-LAN magic packet
+    Wake(WakeArgs),
+    /// Ping hosts continuously with rolling latency, loss and jitter statistics
+    Ping(PingArgs),
+    /// MTR-style traceroute: per-hop loss and latency over several rounds
+    Trace(TraceArgs),
+    /// Read a host's web page titles, Server headers and TLS certificates
+    Web(WebArgs),
+    /// Measure throughput to an iperf3 server (needs the iperf3 binary)
+    Iperf(IperfArgs),
+}
+
+/// Output of the utility subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ToolOutput {
+    Table,
+    Json,
+}
+
+#[derive(Args, Debug)]
+struct WakeArgs {
+    /// Target MAC address: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff or aabb.ccdd.eeff
+    #[arg(value_name = "MAC")]
+    mac: String,
+
+    /// Interface to send from [default: the default-route interface]
+    #[arg(short, long, value_name = "IFACE")]
+    interface: Option<String>,
+
+    /// Send to this address instead of the interface's subnet broadcast and 255.255.255.255
+    /// (e.g. the directed broadcast of a remote subnet)
+    #[arg(long, value_name = "ADDR")]
+    broadcast: Option<Ipv4Addr>,
+
+    /// UDP destination port; repeat to send to several (e.g. --port 9 --port 7)
+    #[arg(long = "port", value_name = "PORT", default_values_t = [wol::WOL_PORT],
+          value_parser = clap::value_parser!(u16).range(1..))]
+    ports: Vec<u16>,
+
+    /// How many times to send the packet to each destination
+    #[arg(long, value_name = "N", default_value_t = wol::DEFAULT_REPEAT,
+          value_parser = clap::value_parser!(u8).range(1..=i64::from(wol::MAX_REPEAT)))]
+    repeat: u8,
+
+    /// SecureOn password (6 bytes written like a MAC address). Prefer the environment
+    /// variable: command-line arguments are visible to other local users
+    #[arg(
+        long,
+        value_name = "PASS",
+        env = "SWEEPR_WOL_PASSWORD",
+        hide_env_values = true
+    )]
+    password: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct PingArgs {
+    /// Hosts to ping (IP addresses)
+    #[arg(value_name = "IP", required = true, num_args = 1..)]
+    ips: Vec<String>,
+
+    /// Stop after N probes per host [default: run until Ctrl-C]
+    #[arg(short = 'c', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
+    count: Option<u32>,
+
+    /// Probe interval in milliseconds (500-10000)
+    #[arg(long, value_name = "MS", default_value_t = latency::DEFAULT_INTERVAL_MS)]
+    interval_ms: u64,
+
+    /// TCP port for the fallback when a host ignores ICMP (repeatable) [default: 443, 80, 22, 445]
+    #[arg(long = "tcp-port", value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    tcp_ports: Vec<u16>,
+
+    /// Output format (json prints the final statistics)
+    #[arg(short, long, value_enum, default_value_t = ToolOutput::Table)]
+    output: ToolOutput,
+}
+
+#[derive(Args, Debug)]
+struct TraceArgs {
+    /// Destination IP address
+    #[arg(value_name = "IP")]
+    ip: String,
+
+    /// Maximum hops (1-64)
+    #[arg(long, value_name = "N", default_value_t = trace::DEFAULT_MAX_HOPS)]
+    max_hops: u8,
+
+    /// Probe rounds (1-100); statistics accumulate over all rounds
+    #[arg(long, value_name = "N", default_value_t = trace::DEFAULT_ROUNDS)]
+    rounds: u32,
+
+    /// Do not reverse-resolve hop addresses
+    #[arg(long)]
+    no_resolve: bool,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = ToolOutput::Table)]
+    output: ToolOutput,
+}
+
+#[derive(Args, Debug)]
+struct WebArgs {
+    /// Host IP address
+    #[arg(value_name = "IP")]
+    ip: String,
+
+    /// Ports to probe [default: 80,443,8443,8080,8000,10443]
+    #[arg(short, long, value_name = "PORTS", value_parser = parse_ports_arg)]
+    ports: Option<PortList>,
+
+    /// Per-request timeout in milliseconds (100-30000)
+    #[arg(long, value_name = "MS", default_value_t = 3000)]
+    timeout_ms: u64,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = ToolOutput::Table)]
+    output: ToolOutput,
+}
+
+#[derive(Args, Debug)]
+struct IperfArgs {
+    /// iperf3 server IP address
+    #[arg(value_name = "IP")]
+    ip: String,
+
+    /// Server port
+    #[arg(short, long, value_name = "PORT", default_value_t = 5201)]
+    port: u16,
+
+    /// Test duration in seconds (1-60)
+    #[arg(short = 't', long = "time", value_name = "SECS", default_value_t = 10)]
+    duration: u32,
+
+    /// Reverse: the server sends, this host receives
+    #[arg(short = 'R', long)]
+    reverse: bool,
+
+    /// Parallel streams (1-16)
+    #[arg(short = 'P', long = "parallel", value_name = "N", default_value_t = 1)]
+    streams: u8,
+
+    /// UDP instead of TCP
+    #[arg(short = 'u', long)]
+    udp: bool,
+
+    /// Target bitrate, e.g. 100M or 1G (UDP defaults to 1M)
+    #[arg(short = 'b', long, value_name = "RATE")]
+    bitrate: Option<String>,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = ToolOutput::Table)]
+    output: ToolOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -184,6 +348,10 @@ struct ScanArgs {
     /// Do not resolve DNS / mDNS / NetBIOS names
     #[arg(long)]
     no_resolve: bool,
+
+    /// Do not read web page titles / TLS certificates of devices with web ports open
+    #[arg(long)]
+    no_web: bool,
 
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
@@ -477,6 +645,7 @@ impl ScanArgs {
             rate_pps: self.rate_pps,
             concurrency: self.concurrency,
             listen_secs: self.listen_secs,
+            web_identity: !self.no_web,
         })
     }
 }
@@ -540,6 +709,11 @@ async fn run_cli(command: Command) -> ExitCode {
         Command::Snmp(args) => cmd_snmp(args, cancel.clone()).await,
         Command::Interfaces => cmd_interfaces().await,
         Command::Report(args) => cmd_report(args),
+        Command::Wake(args) => cmd_wake(args).await,
+        Command::Ping(args) => cmd_ping(args, cancel.clone()).await,
+        Command::Trace(args) => cmd_trace(args, cancel.clone()).await,
+        Command::Web(args) => cmd_web(args, cancel.clone()).await,
+        Command::Iperf(args) => cmd_iperf(args, cancel.clone()).await,
     };
     match result {
         // The reader went away (`| head`): stop quietly, like other Unix filters.
@@ -1157,6 +1331,535 @@ async fn cmd_interfaces() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Utility commands: wake, ping, trace, web, iperf
+// ---------------------------------------------------------------------------------------------
+
+/// Milliseconds with two decimals, `-` when unknown.
+fn fmt_ms(v: Option<f64>) -> String {
+    v.filter(|x| x.is_finite())
+        .map(|x| format!("{x:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+/// `60.12 Gbit/s` (decimal units, like iperf3).
+fn fmt_bps(bps: f64) -> String {
+    let units = ["bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"];
+    let mut v = if bps.is_finite() { bps.max(0.0) } else { 0.0 };
+    let mut i = 0;
+    while v >= 1000.0 && i < units.len() - 1 {
+        v /= 1000.0;
+        i += 1;
+    }
+    format!("{v:.2} {}", units[i])
+}
+
+/// `7.00 GiB` (binary units).
+fn fmt_bytes(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < units.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.2} {}", units[i])
+    }
+}
+
+fn parse_ip_arg(s: &str) -> Result<IpAddr> {
+    s.trim()
+        .parse()
+        .with_context(|| format!("'{}' is not an IP address", sanitize_text(s)))
+}
+
+async fn cmd_wake(args: WakeArgs) -> Result<()> {
+    let mac = wol::parse_wol_mac(&args.mac)?;
+    let password = args
+        .password
+        .as_deref()
+        .map(wol::parse_secureon)
+        .transpose()?;
+    let opts = wol::WakeOptions {
+        interface: args.interface.clone(),
+        broadcast: args.broadcast,
+        ports: args.ports.clone(),
+        repeat: args.repeat,
+        password,
+    };
+    let res: WakeResult = wol::wake(mac, &opts).await?;
+    write_stdout(format!(
+        "sent {} magic packet(s) for {} to {}{}",
+        res.packets_sent,
+        res.mac,
+        res.targets.join(", "),
+        res.interface
+            .as_deref()
+            .map(|i| format!(" via {}", sanitize_text(i)))
+            .unwrap_or_default()
+    ))?;
+    Ok(())
+}
+
+fn method_label(m: ProbeMethod) -> &'static str {
+    match m {
+        ProbeMethod::Icmp => "icmp",
+        ProbeMethod::Tcp => "tcp",
+    }
+}
+
+fn ping_line(s: &LatencySample) -> String {
+    format!(
+        "{:<15} {:<4} {:>10}  loss {:>5.1}%  avg {}  min {}  max {}  jitter {}  ({}/{})",
+        s.ip,
+        method_label(s.method),
+        s.rtt_ms
+            .map(|r| format!("{r:.2} ms"))
+            .unwrap_or_else(|| "timeout".into()),
+        s.loss_pct,
+        fmt_ms(s.avg_ms),
+        fmt_ms(s.min_ms),
+        fmt_ms(s.max_ms),
+        fmt_ms(s.jitter_ms),
+        s.received,
+        s.sent
+    )
+}
+
+fn ping_table(samples: &[LatencySample]) -> String {
+    let mut t = new_table([
+        "Host", "Method", "Sent", "Recv", "Loss %", "Last", "Avg", "Min", "Max", "Jitter",
+        "History",
+    ]);
+    for s in samples {
+        t.add_row([
+            s.ip.to_string(),
+            method_label(s.method).to_string(),
+            s.sent.to_string(),
+            s.received.to_string(),
+            format!("{:.1}", s.loss_pct),
+            fmt_ms(s.rtt_ms),
+            fmt_ms(s.avg_ms),
+            fmt_ms(s.min_ms),
+            fmt_ms(s.max_ms),
+            fmt_ms(s.jitter_ms),
+            latency::sparkline(&s.history, 30),
+        ]);
+    }
+    t.to_string()
+}
+
+async fn cmd_ping(args: PingArgs, cancel: CancellationToken) -> Result<()> {
+    let ips = args
+        .ips
+        .iter()
+        .map(|s| parse_ip_arg(s))
+        .collect::<Result<Vec<_>>>()?;
+    let mut cfg = MonitorConfig::new(ips, Some(args.interval_ms))?;
+    cfg.count = args.count;
+    if !args.tcp_ports.is_empty() {
+        for ip in cfg.ips.clone() {
+            cfg.tcp_ports.insert(ip, args.tcp_ports.clone());
+        }
+    }
+    let (tx, mut rx) = mpsc::channel(16);
+    let job = tokio::spawn(latency::run_monitor(cfg, tx, cancel.clone()));
+    let live = args.output == ToolOutput::Table;
+    while let Some(batch) = rx.recv().await {
+        if live {
+            for s in &batch {
+                if let Err(e) = write_stdout(ping_line(s)) {
+                    cancel.cancel();
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+    let fin = job.await.context("ping task crashed")??;
+    match args.output {
+        ToolOutput::Table => write_stdout(format!("\n{}", ping_table(&fin)))?,
+        ToolOutput::Json => {
+            let mut out = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut out, &fin)?;
+            writeln!(out)?;
+            out.flush()?;
+        }
+    }
+    let silent: Vec<String> = fin
+        .iter()
+        .filter(|s| s.received == 0)
+        .map(|s| s.ip.to_string())
+        .collect();
+    if !silent.is_empty() && !cancel.is_cancelled() {
+        bail!("no reply from {}", silent.join(", "));
+    }
+    Ok(())
+}
+
+fn trace_method_label(m: TraceMethod) -> &'static str {
+    match m {
+        TraceMethod::Raw => "raw ICMP probes",
+        TraceMethod::System => {
+            "the system traceroute (unprivileged; run as root for raw ICMP probes)"
+        }
+    }
+}
+
+fn trace_table(u: &TraceUpdate) -> String {
+    let mut t = new_table([
+        "Hop", "Address", "Host", "Loss %", "Sent", "Recv", "Last", "Avg", "Best", "Worst",
+    ]);
+    for h in &u.hops {
+        let mut addr = h.ip.map(|i| i.to_string()).unwrap_or_else(|| "???".into());
+        for other in &h.other_ips {
+            addr.push_str(&format!("\n{other}"));
+        }
+        t.add_row([
+            h.ttl.to_string(),
+            addr,
+            h.hostname.as_deref().map(sanitize_text).unwrap_or_default(),
+            format!("{:.1}", h.loss_pct),
+            h.sent.to_string(),
+            h.received.to_string(),
+            fmt_ms(h.last_ms),
+            fmt_ms(h.avg_ms),
+            fmt_ms(h.best_ms),
+            fmt_ms(h.worst_ms),
+        ]);
+    }
+    t.to_string()
+}
+
+async fn cmd_trace(args: TraceArgs, cancel: CancellationToken) -> Result<()> {
+    let ip = trace::parse_target(&args.ip)?;
+    let mut opts = TraceOptions::new(Some(args.max_hops), Some(args.rounds))?;
+    opts.resolve = !args.no_resolve;
+    let (tx, mut rx) = mpsc::channel(64);
+    let job = tokio::spawn(trace::run_trace(ip, opts, 0, tx, cancel.clone()));
+    let tty = io::stderr().is_terminal();
+    let mut announced = false;
+    while let Some(u) = rx.recv().await {
+        if !announced && u.error.is_none() {
+            announced = true;
+            diag!(
+                "tracing {ip} with {} ({} hops max, {} round(s))",
+                trace_method_label(u.method),
+                opts.max_hops,
+                opts.rounds
+            );
+        }
+        if tty && !u.done {
+            let mut err = io::stderr().lock();
+            let _ = write!(
+                err,
+                "\r\x1b[2Kround {}/{}: {} hop(s){}",
+                u.round,
+                u.rounds,
+                u.hops.len(),
+                if u.reached {
+                    ", destination reached"
+                } else {
+                    ""
+                }
+            );
+            let _ = err.flush();
+        }
+    }
+    if tty {
+        let mut err = io::stderr().lock();
+        let _ = write!(err, "\r\x1b[2K");
+        let _ = err.flush();
+    }
+    let fin = job.await.context("trace task crashed")?;
+    match args.output {
+        ToolOutput::Table => {
+            if !fin.hops.is_empty() {
+                write_stdout(trace_table(&fin))?;
+            }
+        }
+        ToolOutput::Json => {
+            let mut out = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut out, &fin)?;
+            writeln!(out)?;
+            out.flush()?;
+        }
+    }
+    if let Some(e) = &fin.error {
+        bail!("{}", sanitize_log(e));
+    }
+    if !fin.reached && !cancel.is_cancelled() {
+        diag!("note: {ip} did not answer within {} hops", opts.max_hops);
+    }
+    Ok(())
+}
+
+fn web_table(id: &WebIdentity) -> String {
+    let mut t = new_table(["Port", "Scheme", "Status", "Title", "Server", "Note"]);
+    for s in &id.services {
+        let mut notes = Vec::new();
+        if s.redirects > 0 {
+            notes.push(format!(
+                "followed {} redirect(s) to {}",
+                s.redirects,
+                sanitize_text(&s.url)
+            ));
+        }
+        if let Some(r) = &s.redirect_to {
+            notes.push(format!("redirects to {}", sanitize_text(r)));
+        }
+        if let Some(e) = &s.error {
+            notes.push(sanitize_text(e));
+        }
+        t.add_row([
+            s.port.to_string(),
+            match s.scheme {
+                WebScheme::Http => "http".to_string(),
+                WebScheme::Https => "https".to_string(),
+            },
+            s.status.map(|c| c.to_string()).unwrap_or_default(),
+            s.title.as_deref().map(sanitize_text).unwrap_or_default(),
+            s.server.as_deref().map(sanitize_text).unwrap_or_default(),
+            notes.join("\n"),
+        ]);
+    }
+    let mut text = format!("Web services on {}\n{t}", id.ip);
+    let mut seen: Vec<String> = Vec::new();
+    for c in id.services.iter().filter_map(|s| s.tls_cert.as_ref()) {
+        let key = c.sha256.clone().unwrap_or_default();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let opt = |s: &Option<String>| s.as_deref().map(sanitize_text).unwrap_or_default();
+        let mut ct = new_table(["Field", "Value"]);
+        let mut sans = c
+            .sans
+            .iter()
+            .map(|s| sanitize_text(s))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if c.san_count as usize > c.sans.len() {
+            sans.push_str(&format!(" (+{} more)", c.san_count as usize - c.sans.len()));
+        }
+        let validity = match (c.days_remaining, c.expired) {
+            (Some(d), true) => format!(
+                "{} (expired {} day(s) ago)",
+                opt(&c.not_after),
+                d.unsigned_abs()
+            ),
+            (Some(d), false) => format!("{} ({d} day(s) left)", opt(&c.not_after)),
+            _ => opt(&c.not_after),
+        };
+        let key = match (&c.key_type, c.key_bits) {
+            (Some(k), Some(b)) => format!("{} ({b} bits)", sanitize_text(k)),
+            (Some(k), None) => sanitize_text(k),
+            _ => String::new(),
+        };
+        for (field, value) in [
+            ("Port", c.port.to_string()),
+            ("Subject CN", opt(&c.subject_cn)),
+            ("Subject", opt(&c.subject)),
+            ("SANs", sans),
+            ("Issuer", opt(&c.issuer)),
+            ("Valid from", opt(&c.not_before)),
+            ("Valid until", validity),
+            (
+                "Self-signed",
+                if c.self_signed { "yes" } else { "no" }.to_string(),
+            ),
+            ("Key", key),
+            ("Signature", opt(&c.signature_algorithm)),
+            ("SHA-256", opt(&c.sha256)),
+        ] {
+            ct.add_row([field.to_string(), value]);
+        }
+        text.push_str(&format!("\n\nTLS certificate (port {})\n{ct}", c.port));
+    }
+    if let Some(identity) = &id.identity {
+        text.push_str(&format!(
+            "\n\nIdentified as: {}{}",
+            sanitize_text(identity),
+            id.role_hint
+                .map(|r| format!(" ({})", r.label()))
+                .unwrap_or_default()
+        ));
+    }
+    text
+}
+
+async fn cmd_web(args: WebArgs, cancel: CancellationToken) -> Result<()> {
+    let ip = parse_ip_arg(&args.ip)?;
+    if ip.is_unspecified() || ip.is_multicast() {
+        bail!("{ip} cannot be probed");
+    }
+    if !(100..=30_000).contains(&args.timeout_ms) {
+        bail!("--timeout-ms must be between 100 and 30000");
+    }
+    let ports = webid::plan_ports(args.ports.as_ref().map(|p| p.0.as_slice()))
+        .map_err(anyhow::Error::msg)?;
+    let id = webid::grab_web_identity(
+        ip,
+        &ports,
+        Duration::from_millis(args.timeout_ms),
+        &cancel,
+        SocketBudget::global(),
+    )
+    .await;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    if args.output == ToolOutput::Json {
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &id)?;
+        writeln!(out)?;
+        out.flush()?;
+        return Ok(());
+    }
+    if id.services.is_empty() {
+        bail!(
+            "no web server answered on {ip} (ports {})",
+            ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    write_stdout(web_table(&id))?;
+    for w in &id.warnings {
+        diag!("warning: {}", sanitize_log(w));
+    }
+    Ok(())
+}
+
+fn iperf_interval_line(i: &IperfInterval) -> String {
+    let mut line = format!(
+        "[{:>5.1}-{:>5.1} s] {:>12} {:>15}",
+        i.start,
+        i.end,
+        fmt_bytes(i.bytes),
+        fmt_bps(i.bits_per_second)
+    );
+    if let Some(r) = i.retransmits {
+        line.push_str(&format!("  retr {r}"));
+    }
+    if let Some(j) = i.jitter_ms {
+        line.push_str(&format!("  jitter {j:.3} ms"));
+    }
+    if let (Some(lost), Some(total)) = (i.lost_packets, i.packets) {
+        line.push_str(&format!("  lost {lost}/{total}"));
+    }
+    if i.omitted {
+        line.push_str("  (omitted)");
+    }
+    line
+}
+
+fn iperf_summary_table(s: &IperfSummary) -> String {
+    let mut t = new_table(["Field", "Value"]);
+    let opt_bps = |v: Option<f64>| v.map(fmt_bps).unwrap_or_default();
+    let opt_bytes = |v: Option<u64>| v.map(fmt_bytes).unwrap_or_default();
+    let pct = |v: Option<f64>| v.map(|p| format!("{p:.1} %")).unwrap_or_default();
+    let mut rows = vec![
+        ("Protocol", s.protocol.to_ascii_uppercase()),
+        (
+            "Direction",
+            if s.reverse {
+                "server → this host (reverse)".to_string()
+            } else {
+                "this host → server".to_string()
+            },
+        ),
+        ("Streams", s.streams.to_string()),
+        ("Duration", format!("{:.1} s", s.duration_secs)),
+        (
+            "Sent",
+            format!("{} ({})", opt_bps(s.sent_bps), opt_bytes(s.sent_bytes)),
+        ),
+        (
+            "Received",
+            format!(
+                "{} ({})",
+                opt_bps(s.received_bps),
+                opt_bytes(s.received_bytes)
+            ),
+        ),
+    ];
+    if let Some(r) = s.retransmits {
+        rows.push(("Retransmits", r.to_string()));
+    }
+    if let Some(j) = s.jitter_ms {
+        rows.push(("Jitter", format!("{j:.3} ms")));
+    }
+    if let (Some(lost), Some(total)) = (s.lost_packets, s.packets) {
+        rows.push(("Lost", format!("{lost}/{total} ({})", pct(s.lost_percent))));
+    }
+    rows.push((
+        "CPU local / remote",
+        format!("{} / {}", pct(s.cpu_local_pct), pct(s.cpu_remote_pct)),
+    ));
+    if let Some(h) = &s.remote_host {
+        rows.push(("Server", sanitize_text(h)));
+    }
+    if let Some(v) = &s.version {
+        rows.push(("Client", sanitize_text(v)));
+    }
+    for (k, v) in rows {
+        t.add_row([k.to_string(), v]);
+    }
+    t.to_string()
+}
+
+async fn cmd_iperf(args: IperfArgs, cancel: CancellationToken) -> Result<()> {
+    let ip = iperf::parse_server(&args.ip)?;
+    let opts = IperfOptions {
+        port: args.port,
+        duration_secs: args.duration,
+        reverse: args.reverse,
+        streams: args.streams,
+        udp: args.udp,
+        bitrate: args.bitrate.clone(),
+    };
+    opts.validate()?;
+    let (tx, mut rx) = mpsc::channel(64);
+    let job = {
+        let (opts, cancel) = (opts.clone(), cancel.clone());
+        tokio::spawn(async move { iperf::run_iperf(ip, &opts, tx, cancel).await })
+    };
+    let live = args.output == ToolOutput::Table;
+    let mut intervals = Vec::new();
+    while let Some(i) = rx.recv().await {
+        if live {
+            if let Err(e) = write_stdout(iperf_interval_line(&i)) {
+                cancel.cancel();
+                return Err(e.into());
+            }
+        }
+        intervals.push(i);
+    }
+    let summary = match job.await.context("iperf3 task crashed")? {
+        Ok(s) => s,
+        Err(_) if cancel.is_cancelled() => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    match args.output {
+        ToolOutput::Table => write_stdout(format!("\n{}", iperf_summary_table(&summary)))?,
+        ToolOutput::Json => {
+            let mut out = io::stdout().lock();
+            serde_json::to_writer_pretty(
+                &mut out,
+                &serde_json::json!({ "intervals": intervals, "summary": summary }),
+            )?;
+            writeln!(out)?;
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // GUI
 // ---------------------------------------------------------------------------------------------
 
@@ -1627,14 +2330,307 @@ async fn query_snmp(ip: String, snmp: Option<SnmpConfig>) -> Result<SnmpDeviceIn
         .map_err(|e| format!("{e:#}"))
 }
 
+// ---------------------------------------------------------------------------------------------
+// GUI utilities: Wake-on-LAN, latency monitor, traceroute, web identity, iPerf3
+// ---------------------------------------------------------------------------------------------
+
+/// Concurrent utility jobs per kind.
+const MAX_LATENCY_MONITORS: usize = 16;
+const MAX_TRACES: usize = 8;
+const MAX_IPERF_RUNS: usize = 2;
+const MAX_WEB_LOOKUPS: usize = 4;
+/// TCP fallback ports accepted per monitored host.
+const MAX_TCP_PORTS_PER_HOST: usize = 16;
+
+/// Running utility jobs; all are cancelled when the app exits.
+struct UtilityJobs {
+    latency: JobRegistry,
+    traces: JobRegistry,
+    iperf: JobRegistry,
+    web: JobRegistry,
+}
+
+impl Default for UtilityJobs {
+    fn default() -> Self {
+        Self {
+            latency: JobRegistry::new("latency monitor", MAX_LATENCY_MONITORS),
+            traces: JobRegistry::new("trace", MAX_TRACES),
+            iperf: JobRegistry::new("iPerf3 test", MAX_IPERF_RUNS),
+            web: JobRegistry::new("web identity lookup", MAX_WEB_LOOKUPS),
+        }
+    }
+}
+
+impl UtilityJobs {
+    fn registries(&self) -> [&JobRegistry; 4] {
+        [&self.latency, &self.traces, &self.iperf, &self.web]
+    }
+
+    /// Cancel everything, then give the jobs up to `grace` to wind down (child processes
+    /// such as traceroute / iperf3 are killed as their tasks finish).
+    fn shutdown(&self, grace: Duration) {
+        for r in self.registries() {
+            r.stop_all();
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && self.registries().iter().any(|r| !r.is_empty()) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+fn gui_ip(s: &str) -> Result<IpAddr, String> {
+    s.trim()
+        .parse()
+        .map_err(|_| format!("'{}' is not an IP address", sanitize_text(s)))
+}
+
+/// Send a Wake-on-LAN magic packet. `broadcast` replaces the interface's subnet broadcast
+/// and 255.255.255.255; `port` defaults to 9, `repeat` to 3; `password` is an optional
+/// SecureOn password written like a MAC address.
+#[tauri::command]
+async fn wake_device(
+    mac: String,
+    interface: Option<String>,
+    broadcast: Option<String>,
+    port: Option<u16>,
+    repeat: Option<u8>,
+    password: Option<String>,
+) -> Result<WakeResult, String> {
+    let mac = wol::parse_wol_mac(&mac).map_err(|e| e.to_string())?;
+    let broadcast = broadcast
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            b.parse::<Ipv4Addr>()
+                .map_err(|_| format!("'{}' is not an IPv4 address", sanitize_text(b)))
+        })
+        .transpose()?;
+    let password = password
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(wol::parse_secureon)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let opts = wol::WakeOptions {
+        interface: interface.filter(|i| !i.trim().is_empty()),
+        broadcast,
+        ports: port.map(|p| vec![p]).unwrap_or_default(),
+        repeat: repeat
+            .unwrap_or(wol::DEFAULT_REPEAT)
+            .clamp(1, wol::MAX_REPEAT),
+        password,
+    };
+    wol::wake(mac, &opts).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Start pinging `ips` every `intervalMs` (500-10000, default 1000). Returns the
+/// `monitorId`; batches arrive as `latency-update` events (≤ 4 per second) until
+/// `stop_latency_monitor`. `tcpPorts` maps an IP to its known open ports for the TCP
+/// fallback.
+#[tauri::command]
+async fn start_latency_monitor(
+    app: AppHandle,
+    jobs: State<'_, UtilityJobs>,
+    ips: Vec<String>,
+    interval_ms: Option<u64>,
+    tcp_ports: Option<HashMap<String, Vec<u16>>>,
+) -> Result<u64, String> {
+    let ips = ips
+        .iter()
+        .map(|s| gui_ip(s))
+        .collect::<Result<Vec<IpAddr>, String>>()?;
+    let mut cfg = MonitorConfig::new(ips, interval_ms).map_err(|e| e.to_string())?;
+    for (ip, ports) in tcp_ports.unwrap_or_default() {
+        let ip = gui_ip(&ip)?;
+        if !cfg.ips.contains(&ip) {
+            continue;
+        }
+        let ports: Vec<u16> = enricher::dedupe_ports(&ports)
+            .into_iter()
+            .take(MAX_TCP_PORTS_PER_HOST)
+            .collect();
+        cfg.tcp_ports.insert(ip, ports);
+    }
+    let reservation = latency::reserve_hosts(cfg.ips.len()).map_err(|e| e.to_string())?;
+    let (id, cancel) = jobs.latency.begin()?;
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = mpsc::channel::<Vec<LatencySample>>(16);
+        let emitter = app.clone();
+        let forwarder = tauri::async_runtime::spawn(async move {
+            while let Some(samples) = rx.recv().await {
+                let _ = emitter.emit(
+                    LATENCY_EVENT,
+                    LatencyUpdate {
+                        monitor_id: id,
+                        samples,
+                    },
+                );
+            }
+        });
+        if let Err(e) =
+            latency::run_monitor_reserved(cfg, reservation, tx, cancel, SocketBudget::global())
+                .await
+        {
+            tracing::warn!("latency monitor {id} failed: {e:#}");
+        }
+        let _ = forwarder.await;
+        app.state::<UtilityJobs>().latency.end(id);
+    });
+    Ok(id)
+}
+
+/// Stop a latency monitor. Returns `true` when it was running (one final batch may follow).
+#[tauri::command]
+fn stop_latency_monitor(jobs: State<'_, UtilityJobs>, monitor_id: u64) -> bool {
+    jobs.latency.stop(monitor_id)
+}
+
+/// Start an MTR-style trace to `ip` (`maxHops` 1-64, default 30; `rounds` 1-100, default
+/// 5). Returns the `traceId`; snapshots arrive as `trace-update` events, the last with
+/// `done: true`.
+#[tauri::command]
+async fn start_trace(
+    app: AppHandle,
+    jobs: State<'_, UtilityJobs>,
+    ip: String,
+    max_hops: Option<u8>,
+    rounds: Option<u32>,
+) -> Result<u64, String> {
+    let target = trace::parse_target(&ip).map_err(|e| e.to_string())?;
+    let opts = TraceOptions::new(max_hops, rounds).map_err(|e| e.to_string())?;
+    let (id, cancel) = jobs.traces.begin()?;
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = mpsc::channel::<TraceUpdate>(64);
+        let emitter = app.clone();
+        let forwarder = tauri::async_runtime::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                let _ = emitter.emit(TRACE_EVENT, &update);
+            }
+        });
+        trace::run_trace(target, opts, id, tx, cancel).await;
+        let _ = forwarder.await;
+        app.state::<UtilityJobs>().traces.end(id);
+    });
+    Ok(id)
+}
+
+/// Stop a trace. Returns `true` when it was running (its final `done` update follows).
+#[tauri::command]
+fn stop_trace(jobs: State<'_, UtilityJobs>, trace_id: u64) -> bool {
+    jobs.traces.stop(trace_id)
+}
+
+/// One-shot web identity of `ip`: HTTP titles, Server headers and TLS certificates of
+/// `ports` (default 80, 443, 8443, 8080, 8000, 10443; at most 16).
+#[tauri::command]
+async fn grab_web_identity(
+    jobs: State<'_, UtilityJobs>,
+    ip: String,
+    ports: Option<Vec<u16>>,
+) -> Result<WebIdentity, String> {
+    let ip = gui_ip(&ip)?;
+    if ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("{ip} cannot be probed"));
+    }
+    let ports = webid::plan_ports(ports.as_deref())?;
+    let (id, cancel) = jobs.web.begin()?;
+    let res = webid::grab_web_identity(
+        ip,
+        &ports,
+        webid::DEFAULT_TIMEOUT,
+        &cancel,
+        SocketBudget::global(),
+    )
+    .await;
+    let stopped = cancel.is_cancelled();
+    jobs.web.end(id);
+    if stopped {
+        return Err("web identity lookup stopped".into());
+    }
+    Ok(res)
+}
+
+/// Whether the iperf3 binary is installed (path, version, live streaming support).
+#[tauri::command]
+async fn iperf_available() -> IperfAvailability {
+    iperf::availability().await
+}
+
+/// Start an iPerf3 client test against `ip`. Rejects immediately (with an install hint)
+/// when iperf3 is missing. Returns the `runId`; results arrive as `iperf-update` events,
+/// the last with `done: true` and the summary or an error.
+#[tauri::command]
+async fn start_iperf(
+    app: AppHandle,
+    jobs: State<'_, UtilityJobs>,
+    ip: String,
+    options: Option<IperfOptions>,
+) -> Result<u64, String> {
+    let ip = iperf::parse_server(&ip).map_err(|e| e.to_string())?;
+    let opts = options.unwrap_or_default();
+    opts.validate().map_err(|e| e.to_string())?;
+    let avail = iperf::availability().await;
+    if !avail.available {
+        return Err(avail
+            .install_hint
+            .unwrap_or_else(|| format!("iperf3 is not available; {}", iperf::install_hint())));
+    }
+    let (id, cancel) = jobs.iperf.begin()?;
+    tauri::async_runtime::spawn(async move {
+        let (tx, mut rx) = mpsc::channel::<IperfInterval>(64);
+        let emitter = app.clone();
+        let forwarder = tauri::async_runtime::spawn(async move {
+            while let Some(interval) = rx.recv().await {
+                let _ = emitter.emit(
+                    IPERF_EVENT,
+                    IperfUpdate {
+                        run_id: id,
+                        interval: Some(interval),
+                        summary: None,
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+        });
+        let res = iperf::run_iperf(ip, &opts, tx, cancel).await;
+        let _ = forwarder.await;
+        let (summary, error) = match res {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(sanitize_log(&format!("{e:#}")))),
+        };
+        let _ = app.emit(
+            IPERF_EVENT,
+            IperfUpdate {
+                run_id: id,
+                interval: None,
+                summary,
+                done: true,
+                error,
+            },
+        );
+        app.state::<UtilityJobs>().iperf.end(id);
+    });
+    Ok(id)
+}
+
+/// Stop an iPerf3 test (kills the iperf3 process). Returns `true` when it was running.
+#[tauri::command]
+fn stop_iperf(jobs: State<'_, UtilityJobs>, run_id: u64) -> bool {
+    jobs.iperf.stop(run_id)
+}
+
 fn run_gui() -> ExitCode {
     sweepr_core::init_tracing();
-    let result = tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ScanManager::default())
         .manage(PortScans::default())
         .manage(LastReport::default())
+        .manage(UtilityJobs::default())
         .invoke_handler(tauri::generate_handler![
             list_interfaces,
             start_scan,
@@ -1646,11 +2642,34 @@ fn run_gui() -> ExitCode {
             scan_ports,
             query_snmp,
             generate_report,
-            reveal_report
+            reveal_report,
+            wake_device,
+            start_latency_monitor,
+            stop_latency_monitor,
+            start_trace,
+            stop_trace,
+            grab_web_identity,
+            iperf_available,
+            start_iperf,
+            stop_iperf
         ])
-        .run(tauri::generate_context!());
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+        .build(tauri::generate_context!());
+    match app {
+        Ok(app) => {
+            app.run(|handle, event| {
+                if let tauri::RunEvent::Exit = event {
+                    // Stop monitors, traces and iperf3 runs (killing their child processes)
+                    // before the process exits.
+                    if let Some(s) = handle.try_state::<ScanManager>() {
+                        s.stop(None);
+                    }
+                    if let Some(jobs) = handle.try_state::<UtilityJobs>() {
+                        jobs.shutdown(Duration::from_millis(750));
+                    }
+                }
+            });
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             diag!("error: failed to start the SweepR GUI: {e}");
             ExitCode::FAILURE
@@ -1995,5 +3014,127 @@ mod tests {
     #[test]
     fn log_sanitizing() {
         assert_eq!(sanitize_log("a\x1b]0;x\x07b\nc"), "a]0;xb c");
+    }
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(["sweepr"].iter().chain(args)).map(|c| c.command.unwrap())
+    }
+
+    #[test]
+    fn utility_subcommands_parse() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let Command::Wake(w) = parse(&[
+            "wake",
+            "aa:bb:cc:dd:ee:ff",
+            "-i",
+            "en0",
+            "--broadcast",
+            "10.0.0.255",
+            "--port",
+            "9",
+            "--port",
+            "7",
+            "--repeat",
+            "5",
+        ])
+        .unwrap() else {
+            panic!("wake")
+        };
+        assert_eq!(w.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(w.broadcast, Some(Ipv4Addr::new(10, 0, 0, 255)));
+        assert_eq!((w.ports.as_slice(), w.repeat), ([9, 7].as_slice(), 5));
+        let Command::Wake(w) = parse(&["wake", "aabb.ccdd.eeff"]).unwrap() else {
+            panic!("wake")
+        };
+        assert_eq!((w.ports.as_slice(), w.repeat), ([9].as_slice(), 3));
+        assert!(parse(&["wake", "aa:bb:cc:dd:ee:ff", "--broadcast", "host.lan"]).is_err());
+        assert!(parse(&["wake", "aa:bb:cc:dd:ee:ff", "--port", "0"]).is_err());
+        assert!(parse(&["wake", "aa:bb:cc:dd:ee:ff", "--repeat", "0"]).is_err());
+        assert!(parse(&["wake", "aa:bb:cc:dd:ee:ff", "--repeat", "21"]).is_err());
+
+        let Command::Ping(p) = parse(&[
+            "ping",
+            "127.0.0.1",
+            "::1",
+            "--count",
+            "3",
+            "--interval-ms",
+            "500",
+        ])
+        .unwrap() else {
+            panic!("ping")
+        };
+        assert_eq!(p.ips, ["127.0.0.1", "::1"]);
+        assert_eq!((p.count, p.interval_ms), (Some(3), 500));
+        assert!(parse(&["ping"]).is_err());
+        assert!(parse(&["ping", "10.0.0.1", "--count", "0"]).is_err());
+
+        let Command::Trace(t) = parse(&[
+            "trace",
+            "8.8.8.8",
+            "--max-hops",
+            "20",
+            "--rounds",
+            "3",
+            "-o",
+            "json",
+        ])
+        .unwrap() else {
+            panic!("trace")
+        };
+        assert_eq!((t.max_hops, t.rounds, t.output), (20, 3, ToolOutput::Json));
+        let Command::Trace(t) = parse(&["trace", "8.8.8.8"]).unwrap() else {
+            panic!("trace")
+        };
+        assert_eq!((t.max_hops, t.rounds, t.no_resolve), (30, 5, false));
+
+        let Command::Web(w) = parse(&["web", "10.0.0.1", "-p", "443,8006"]).unwrap() else {
+            panic!("web")
+        };
+        assert_eq!(w.ports.unwrap().0, vec![443, 8006]);
+
+        let Command::Iperf(i) = parse(&[
+            "iperf", "10.0.0.2", "-p", "5202", "-t", "5", "-R", "-P", "4", "--udp", "-b", "100M",
+        ])
+        .unwrap() else {
+            panic!("iperf")
+        };
+        assert_eq!((i.port, i.duration, i.streams), (5202, 5, 4));
+        assert!(i.reverse && i.udp);
+        assert_eq!(i.bitrate.as_deref(), Some("100M"));
+
+        let Command::Scan(sa) = parse(&["scan", "--no-web"]).unwrap() else {
+            panic!("scan")
+        };
+        assert!(!sa.to_config().unwrap().web_identity);
+        let Command::Scan(sa) = parse(&["scan"]).unwrap() else {
+            panic!("scan")
+        };
+        assert!(sa.to_config().unwrap().web_identity);
+    }
+
+    #[test]
+    fn utility_formatting() {
+        assert_eq!(fmt_bps(60_122_147_560.4), "60.12 Gbit/s");
+        assert_eq!(fmt_bps(999.0), "999.00 bit/s");
+        assert_eq!(fmt_bps(f64::NAN), "0.00 bit/s");
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(7_516_192_768), "7.00 GiB");
+        assert_eq!(fmt_ms(None), "-");
+        assert_eq!(fmt_ms(Some(1.234_56)), "1.23");
+    }
+
+    #[test]
+    fn utility_jobs_shut_down() {
+        let jobs = UtilityJobs::default();
+        let (_a, ta) = jobs.latency.begin().unwrap();
+        let (b, tb) = jobs.iperf.begin().unwrap();
+        jobs.iperf.end(b);
+        jobs.shutdown(Duration::from_millis(50));
+        assert!(ta.is_cancelled() && tb.is_cancelled());
+        for _ in 0..MAX_TRACES {
+            jobs.traces.begin().unwrap();
+        }
+        assert!(jobs.traces.begin().is_err());
     }
 }
