@@ -22,6 +22,8 @@
     "allow-load-overrides",
     "allow-save-override",
     "allow-scan-ports",
-    "allow-query-snmp"
+    "allow-query-snmp",
+    "allow-generate-report",
+    "allow-reveal-report"
   ]
 }

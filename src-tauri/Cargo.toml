@@ -57,6 +57,13 @@ mdns-sd = "0.21"
 csv = "1"
 rust_xlsxwriter = "0.99"
 
+# --- Audit report (HTML / PDF) ---
+pdf-writer = "0.15"
+png = "0.17"
+miniz_oxide = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+
 # --- Serialization, errors, logging, persistence ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -68,6 +68,10 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
   learned more than 48 MACs, or that lead to another switch, router or firewall), prefers
   the device's VLAN and then the port with the fewest MACs.
 
+- **Audit report**: `sweepr report` (or `sweepr scan --report`) turns scan data into a
+  branded audit: a single-file interactive HTML page, a PDF executive summary, or JSON.
+  See [Audit report](#audit-report).
+
 ## CLI usage
 
 ```sh
@@ -100,6 +104,13 @@ sweepr scan -r 10.0.0.0/24 -o json > devices.json
 
 # List interfaces (kind, VLAN ID/parent, addresses)
 sweepr interfaces
+
+# Scan and write an audit report right away (.html, .pdf or .json by extension)
+sudo sweepr scan -i en0 --vlan untagged,10,20 --cdp-lldp --snmp-community public --report audit.html
+
+# Build reports from saved scan data
+sweepr report --input audit.json -o audit.pdf --title "Q3 network audit" --org "Acme Corp" --logo acme.png
+sweepr report --input devices.json --format html -o audit.html
 ```
 
 Main `scan` flags:
@@ -134,6 +145,53 @@ Piping into a reader that exits early (`sweepr scan | head -1`) stops the scan q
 exit status 0. If the OS transmit queue fills up (ENOBUFS), SweepR backs off and slows down
 instead of failing, and reports how many probe frames were dropped.
 Set `RUST_LOG=debug` for diagnostic logging.
+
+## Audit report
+
+`sweepr report --input <scan.json> [--format html|pdf|json] -o <path> [--title ...] [--org ...]
+[--logo logo.png]` builds a report from saved data; `sweepr scan ... --report <path>` builds one
+from the scan that just ran (format from the extension). The input may be the device array
+written by `sweepr scan -o json` (devices only), or the full envelope written by
+`sweepr scan --report x.json` / `sweepr report --format json`, which also carries VLANs,
+CDP/LLDP neighbors, MAC-to-port mappings, SNMP poll results and scan metadata. Unknown fields
+are kept, so data added by newer scanner features (TLS certificates, latency, voice VLAN,
+PoE, ...) is picked up when present; malformed records are skipped and counted.
+
+- **HTML**: one self-contained file (no network requests, no external fonts or scripts, a
+  strict Content-Security-Policy pinning the embedded CSS/JS by hash). Executive summary with
+  risk grade, hosts per VLAN, device roles, findings by severity and category, switch port
+  utilization per switch (active vs. total ports, busiest ports, uplinks / trunks, with a
+  "not available (no SNMP)" state), top vendors, open services, a sortable / filterable
+  findings table with expandable evidence and remediation, a searchable device inventory with
+  column toggles, CDP/LLDP neighbors and device attachment, rule coverage and a methodology
+  appendix. Light/dark follows the system (with a toggle); browser Print -> PDF uses a print
+  stylesheet. All scan-derived text is HTML-escaped; the JSON copy embedded for "Download
+  JSON" is escaped so it cannot close its `<script type="application/json">` element.
+- **PDF**: executive summary (cover with grade and summary cards, VLAN / role / severity /
+  vendor / service charts, top 15 findings with remediation, switch port utilization,
+  rule coverage and appendix). Written in pure Rust with `pdf-writer` using the standard
+  Helvetica fonts (no font file embedded; characters outside Windows-1252 print as `?`).
+- **JSON**: score, findings, rule coverage, statistics and the normalized input (it can be
+  fed back into `sweepr report`). SNMP communities are never written: only whether the
+  default `public` / `private` or a custom community was used.
+
+Rules (stable IDs, CWE / CIS Controls reference text, thresholds in the appendix): Telnet,
+FTP, TFTP, r-services, SMB / NetBIOS on infrastructure and broad SMB exposure, RDP, VNC,
+HTTP-only management on infrastructure, SSH + Telnet, default SNMP community, SNMPv1/v2c,
+incomplete SNMP walks, expired / expiring (< 30 days) / self-signed certificates and weak keys
+or signatures, unidentified devices, locally administered MACs, duplicate IPs, one MAC on
+several IPs, multiple DHCP servers, multiple IPv6 routers (rogue RA), CDP/LLDP on user-facing
+ports, native VLAN 1, native VLAN mismatch, phones outside a voice VLAN, many hosts in VLAN 1,
+unused VLANs, and several MACs on an access port. Rules whose data was not collected are
+listed as "not evaluated" instead of passing.
+
+Risk score: each finding contributes `weight x min(1 + log2(affected), 4)` points (critical
+15, high 8, medium 4, low 1.5, info 0); `score = round(100 * e^(-points/80))`; grade A >= 90,
+B >= 80, C >= 65, D >= 50, else F; any critical finding caps the grade at D and any high
+finding at B.
+
+`cargo run --example sample_audit_input > sample.json` writes a synthetic 300-device network
+for trying the report.
 
 ## Privileges
 
@@ -203,6 +261,10 @@ src-tauri/
   src/snmp_infra.rs  async SNMP (v1/v2c/v3): system MIB, VLAN tables, bridge/CAM mapping
   src/enricher.rs  OUI vendor DB, DNS/mDNS/NetBIOS, port scan, fingerprint, local overrides
   src/export.rs    CSV / JSON / XLSX export and terminal tables
+  src/audit.rs     lenient report input model, audit rules, risk score
+  src/report.rs    report statistics, JSON output, scan collection, file writing
+  src/report_html.rs  self-contained interactive HTML report (templates/report.css, .js)
+  src/report_pdf.rs   PDF executive summary (pdf-writer, Helvetica metrics)
   data/oui.tsv     embedded IEEE OUI database (generated by scripts/build_oui_db.py)
 ```
 
@@ -222,6 +284,8 @@ The webview may call only the commands listed in `src-tauri/build.rs` and grante
 | `save_override` | `{ key: string, hostname: string \| null, comments: string \| null }` | `null`. Rejects on a write error or a corrupt store (which is moved aside first). |
 | `scan_ports` | `{ ip: string, ports: number[] }` | `number[]` of open ports (sorted). Rejects on a bad IP, > 4096 distinct ports, when 4 port scans are already running, when stopped by `stop_scan`, or when some ports could not be checked (out of file descriptors). |
 | `query_snmp` | `{ ip: string, snmp: SnmpConfig \| null }` | `SnmpDeviceInfo`. Rejects on a bad IP, invalid config or unreachable device. |
+| `generate_report` | `GenerateReportArgs` (below) | The written path, or `null` if the user cancelled the save dialog. Rejects on an unknown format, a wrong extension, or a symlink / non-regular target. |
+| `reveal_report` | none | `true` after revealing the report last written by `generate_report` in Finder / the file manager; `false` if none was written yet. |
 
 Tauri maps Rust snake_case command arguments to camelCase in JS automatically (so
 `scan_id` is `scanId`, `timeout_secs` is `timeoutSecs`).
@@ -229,6 +293,53 @@ Tauri maps Rust snake_case command arguments to camelCase in JS automatically (s
 `export_devices` opens the native save dialog from the backend. The webview never passes a
 file path. The chosen file must have the format's extension (it is added when missing), and
 symbolic links and non-regular files are refused.
+
+`generate_report` builds the audit in the backend and opens the native save dialog there,
+like `export_devices`: the webview never passes a path, the extension must match the format
+(it is added when missing, refusing to replace an existing file the dialog did not confirm),
+and symbolic links and non-regular files are refused. `reveal_report` takes no arguments, so
+it can only reveal the file the user just saved (the webview still has no opener permission
+for files).
+
+```ts
+interface GenerateReportArgs {
+  devices: Device[];                 // as shown in the table (with overrides applied); extra
+                                     // fields (tlsCert, latency, voiceVlan, poeWatts, ...) are used when present
+  vlans?: VlanInfo[];
+  neighbors?: CdpLldpNeighbor[];
+  portMappings?: SwitchPortMapping[]; // the raw port_mapping events
+  snmpInfos?: (SnmpDeviceInfo & { ip: string })[]; // query_snmp results, keyed by agent IP
+  meta?: ReportMeta;
+  format: "html" | "pdf" | "json";
+  title?: string;                    // default "SweepR Network Audit Report"
+  org?: string;                      // customer / organization shown on the cover
+}
+
+interface ReportMeta {               // every field optional
+  toolVersion?: string;
+  interface?: string;
+  ranges?: string[];
+  vlans?: string;                    // e.g. "untagged,10,20"
+  portSpec?: string;                 // scanned TCP ports, e.g. "22,23,80,443,1000-2000"
+  startedMs?: number;
+  finishedMs?: number;
+  cancelled?: boolean;
+  ipv6?: boolean;
+  cdpLldp?: boolean;
+  discoverVlans?: boolean;
+  resolveNames?: boolean;
+  snmpAll?: boolean;
+  // `community` is only classified ("public" | "private" | "custom") and never written out.
+  snmp?: { version?: "v1" | "v2c" | "v3"; community?: string };
+  gateway?: string;
+  dhcpServers?: string[];            // DHCP servers observed (rogue DHCP rule)
+  ipv6Routers?: string[];            // IPv6 RA sources observed (rogue RA rule)
+  scannerHost?: string;
+}
+```
+
+Without `portSpec` the service rules still run on the open ports present but cannot tell
+"closed" from "not scanned"; without `snmp` the SNMP rules are reported as not evaluated.
 
 `save_override` persists one record to a JSON file under the OS application-data directory.
 Saves are serialized by a process-wide lock and written durably (uniquely named temp file,

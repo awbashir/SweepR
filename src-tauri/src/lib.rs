@@ -1,12 +1,16 @@
 //! `sweepr-core`: the SweepR scan engine shared by the `sweepr` CLI and the Tauri GUI.
 
 pub mod arp_vlan;
+pub mod audit;
 pub mod engine;
 pub mod enricher;
 pub mod export;
 pub mod limits;
 pub mod models;
 pub mod progress;
+pub mod report;
+pub mod report_html;
+pub mod report_pdf;
 pub mod snmp_infra;
 pub mod sweep;
 
