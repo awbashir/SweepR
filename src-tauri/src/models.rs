@@ -192,6 +192,10 @@ pub enum DiscoverySource {
     Dns,
     Mdns,
     Netbios,
+    Ssdp,
+    Wsd,
+    Sip,
+    Dhcp,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -445,7 +449,7 @@ impl Capability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdpLldpNeighbor {
     pub protocol: NeighborProtocol,
@@ -470,6 +474,14 @@ pub struct CdpLldpNeighbor {
     pub capabilities: Vec<Capability>,
     /// CDP VTP management domain.
     pub vtp_domain: Option<String>,
+    /// PoE power the neighbor reported it draws / supplies, in watts (CDP Power Consumption /
+    /// Power Available, LLDP 802.3 MDI power / LLDP-MED Extended Power-via-MDI).
+    #[serde(default)]
+    pub poe_watts: Option<f32>,
+    /// Full PoE detail parsed from the power TLVs (class, source, priority, status). Boxed to
+    /// keep `ScanEvent::Neighbor` small; serializes exactly like an inline `PoeInfo`.
+    #[serde(default)]
+    pub poe_info: Option<Box<PoeInfo>>,
     pub ttl_secs: u16,
     pub last_seen_ms: u64,
 }
@@ -615,7 +627,7 @@ impl CdpLldpNeighbor {
 // ---------------------------------------------------------------------------------------------
 
 /// A MAC address learned on a physical switch port (from SNMP bridge MIB or CDP/LLDP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchPortMapping {
     pub switch_name: String,
@@ -625,6 +637,12 @@ pub struct SwitchPortMapping {
     pub port_index: Option<u32>,
     pub vlan_id: Option<u16>,
     pub mac: String,
+    /// PoE delivered on this port, when the switch reported POWER-ETHERNET-MIB data for it.
+    #[serde(default)]
+    pub poe: Option<PoeInfo>,
+    /// Voice VLAN configured on this port (Cisco `vmVoiceVlanId`), when reported.
+    #[serde(default)]
+    pub voice_vlan: Option<u16>,
 }
 
 impl SwitchPortMapping {
@@ -632,6 +650,168 @@ impl SwitchPortMapping {
     pub fn label(&self) -> String {
         format!("{} [{}]", self.switch_name, self.port_name)
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deeper discovery: service / identity info (SSDP/UPnP, WSD/ONVIF, SIP, PoE, DHCP)
+// ---------------------------------------------------------------------------------------------
+
+/// Longest service-type / header list kept from a single device.
+pub const MAX_SERVICE_LIST: usize = 64;
+
+/// What an SSDP/UPnP device advertised and what its description XML reported. Only filled
+/// when the description was fetched from the responder's own IP (no SSRF through LOCATION).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SsdpInfo {
+    /// The `LOCATION` URL of the device description (as advertised).
+    pub location: Option<String>,
+    /// SSDP `SERVER` header (OS / product / UPnP version).
+    pub server: Option<String>,
+    /// Search target / notification type (`ST` / `NT`).
+    pub search_target: Option<String>,
+    /// Unique service name (`USN`).
+    pub usn: Option<String>,
+    pub friendly_name: Option<String>,
+    pub manufacturer: Option<String>,
+    pub model_name: Option<String>,
+    pub model_number: Option<String>,
+    pub model_description: Option<String>,
+    pub serial_number: Option<String>,
+    /// UPnP `deviceType` URN, e.g. `urn:schemas-upnp-org:device:MediaServer:1`.
+    pub device_type: Option<String>,
+    /// Unique device name (`UDN`, usually `uuid:...`).
+    pub udn: Option<String>,
+    pub presentation_url: Option<String>,
+    /// Advertised UPnP service types (capped at [`MAX_SERVICE_LIST`]).
+    pub services: Vec<String>,
+}
+
+/// WS-Discovery / ONVIF data learned over UDP 3702 and (for cameras) the device's own HTTP
+/// `GetDeviceInformation` service. No credentials are ever sent; RTSP URLs are only reported
+/// when the device itself returned one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OnvifInfo {
+    /// Transport addresses (`XAddrs`) the device published (capped).
+    pub xaddrs: Vec<String>,
+    /// WS-Discovery `Types` (e.g. `dn:NetworkVideoTransmitter`, `wsdp:Computer`).
+    pub types: Option<String>,
+    /// WS-Discovery `Scopes` (onvif://www.onvif.org/name/…, hardware/…, location/…), capped.
+    pub scopes: Vec<String>,
+    pub name: Option<String>,
+    pub location: Option<String>,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub firmware_version: Option<String>,
+    pub serial_number: Option<String>,
+    pub hardware_id: Option<String>,
+    /// `true` for an ONVIF Network Video Transmitter (IP camera).
+    pub is_camera: bool,
+    /// `true` for a Windows host that answered WSD (`wsdp:Device`/`pub:Computer`).
+    pub is_windows: bool,
+    /// RTSP stream URL the device itself reported (unauthenticated `GetStreamUri`); never a
+    /// guess.
+    pub rtsp_url: Option<String>,
+    /// Common vendor RTSP URL templates, clearly labelled as guesses (never credentials).
+    pub rtsp_hints: Vec<String>,
+}
+
+/// SIP endpoint role hint (stored as a string field, not a [`DeviceRole`] variant).
+pub const DEVICE_KIND_VOIP_PHONE: &str = "voip_phone";
+pub const DEVICE_KIND_PBX: &str = "pbx";
+
+/// What a SIP OPTIONS probe revealed about a VoIP endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SipInfo {
+    /// Status line text, e.g. `200 OK` or `405 Method Not Allowed` (still identifies a device).
+    pub status: Option<String>,
+    pub server: Option<String>,
+    pub user_agent: Option<String>,
+    pub allow: Option<String>,
+    pub supported: Option<String>,
+    /// Transport the response came over (`udp` or `tcp`).
+    pub transport: Option<String>,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    /// `voip_phone` or `pbx` when identified (mirrors [`Device::device_kind`]).
+    pub kind: Option<String>,
+}
+
+/// Power-over-Ethernet delivery to one port / endpoint, from CDP/LLDP power TLVs or SNMP
+/// POWER-ETHERNET-MIB. Watts are real values; `max_watts` is the allocated / classified budget.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PoeInfo {
+    pub watts: Option<f32>,
+    pub max_watts: Option<f32>,
+    /// IEEE PoE class (0-4, or 5-8 for 802.3bt).
+    pub class: Option<u8>,
+    /// `delivering` / `searching` / `disabled` / `fault` / `other`.
+    pub status: Option<String>,
+    /// PSE power source (`primary` / `backup` / `pse` …) from LLDP-MED / CDP.
+    pub source: Option<String>,
+    /// Power priority (`critical` / `high` / `low`) from LLDP-MED / CDP.
+    pub priority: Option<String>,
+    pub switch_name: Option<String>,
+    pub port: Option<String>,
+}
+
+impl PoeInfo {
+    pub fn is_empty(&self) -> bool {
+        self.watts.is_none()
+            && self.max_watts.is_none()
+            && self.class.is_none()
+            && self.status.is_none()
+            && self.source.is_none()
+            && self.priority.is_none()
+    }
+}
+
+/// Switch-wide PoE budget (POWER-ETHERNET-MIB `pethMainPse`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PoeBudget {
+    /// Nominal power of the PSE in watts (summed over groups).
+    pub nominal_watts: Option<f32>,
+    /// Measured power currently consumed in watts (summed over groups).
+    pub consumed_watts: Option<f32>,
+    /// Usage threshold percentage at which the PSE warns.
+    pub usage_threshold_pct: Option<u8>,
+    /// Ports currently delivering power.
+    pub ports_delivering: u32,
+}
+
+/// Result of a single-host service probe (the GUI `discover_services` command): unicast SSDP
+/// `M-SEARCH`, unicast WS-Discovery `Probe` (+ ONVIF / WSD metadata) and SIP OPTIONS.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ServiceDiscovery {
+    pub ip: Option<IpAddr>,
+    pub device_kind: Option<String>,
+    pub ssdp: Option<SsdpInfo>,
+    pub onvif: Option<OnvifInfo>,
+    pub sip: Option<SipInfo>,
+}
+
+/// Passive DHCP fingerprint attributed to a client from its DISCOVER / REQUEST options.
+/// Best-effort heuristic (see the signature table in `data/dhcp_fingerprints.tsv`), never
+/// authoritative.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DhcpFingerprint {
+    /// Guessed OS family / version, when a signature matched.
+    pub os: Option<String>,
+    /// `high` / `medium` / `low`.
+    pub confidence: Option<String>,
+    /// DHCP option 60 vendor class identifier.
+    pub vendor_class: Option<String>,
+    /// DHCP option 12 hostname.
+    pub hostname: Option<String>,
+    /// DHCP option 55 parameter request list (the ordered option codes).
+    pub param_list: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -659,6 +839,28 @@ pub struct Device {
     pub comments: Option<String>,
     pub interface: Option<String>,
     pub rtt_ms: Option<f32>,
+    /// Voice VLAN the port serves (CDP voice VLAN / LLDP-MED network policy / SNMP).
+    #[serde(default)]
+    pub voice_vlan: Option<u16>,
+    /// A finer device category than [`DeviceRole`] (e.g. `voip_phone`, `pbx`, `tv`, `printer`,
+    /// `nas`, `media_server`, `camera`, `igd_router`). Set from service discovery; additive.
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    /// SSDP/UPnP identity (model, serial, services).
+    #[serde(default)]
+    pub ssdp: Option<SsdpInfo>,
+    /// WS-Discovery / ONVIF identity (cameras, Windows hosts).
+    #[serde(default)]
+    pub onvif: Option<OnvifInfo>,
+    /// SIP OPTIONS identity (VoIP phones / PBXes).
+    #[serde(default)]
+    pub sip: Option<SipInfo>,
+    /// Power-over-Ethernet drawn by this endpoint (from its switch port).
+    #[serde(default)]
+    pub poe: Option<PoeInfo>,
+    /// Passive DHCP OS fingerprint.
+    #[serde(default)]
+    pub dhcp_fingerprint: Option<DhcpFingerprint>,
     pub sources: Vec<DiscoverySource>,
     pub neighbor: Option<CdpLldpNeighbor>,
     pub first_seen_ms: u64,
@@ -685,6 +887,13 @@ impl Device {
             comments: None,
             interface: None,
             rtt_ms: None,
+            voice_vlan: None,
+            device_kind: None,
+            ssdp: None,
+            onvif: None,
+            sip: None,
+            poe: None,
+            dhcp_fingerprint: None,
             sources: Vec::new(),
             neighbor: None,
             first_seen_ms: now,
@@ -739,6 +948,13 @@ impl Device {
             comments,
             interface,
             rtt_ms,
+            voice_vlan,
+            device_kind,
+            ssdp,
+            onvif,
+            sip,
+            poe,
+            dhcp_fingerprint,
             neighbor
         );
         if other.role.priority() > self.role.priority() {
@@ -1190,6 +1406,11 @@ pub const MAX_RETRIES: u64 = 10;
 /// Passive listening ceiling (one day).
 pub const MAX_LISTEN_SECS: u64 = 86_400;
 
+/// serde default for boolean fields that default to `true` when absent from GUI JSON.
+fn default_true() -> bool {
+    true
+}
+
 /// Everything a scan needs. Missing fields in JSON (from the GUI) fall back to [`Default`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1213,6 +1434,19 @@ pub struct ScanConfig {
     pub ports: Vec<u16>,
     /// Resolve DNS PTR / mDNS / NetBIOS names for each device.
     pub resolve_names: bool,
+    /// Probe discovered hosts for services during enrichment: SSDP/UPnP (model/serial),
+    /// WS-Discovery + ONVIF (cameras, Windows hosts) and SIP OPTIONS (VoIP phones / PBXes).
+    /// On by default (the CLI `--no-services` disables it).
+    #[serde(default = "default_true")]
+    pub discover_services: bool,
+    /// Also probe every candidate with SIP OPTIONS, not only hosts with 5060 open or a VoIP
+    /// vendor MAC (the CLI `--sip-all`). Only has effect when `discover_services` is on.
+    #[serde(default)]
+    pub sip_all: bool,
+    /// Passively capture and fingerprint DHCP DISCOVER/REQUEST options to guess client OSes.
+    /// Off by default: it needs raw packet capture (root / BPF), like the other sniffers.
+    #[serde(default)]
+    pub dhcp_fingerprint: bool,
     /// How long to wait for late replies after the last probe, in milliseconds.
     pub timeout_ms: u64,
     /// Extra probe passes over unanswered addresses.
@@ -1238,6 +1472,9 @@ impl Default for ScanConfig {
             ipv6: false,
             ports: DEFAULT_PORTS.to_vec(),
             resolve_names: true,
+            discover_services: true,
+            sip_all: false,
+            dhcp_fingerprint: false,
             timeout_ms: 1500,
             retries: 1,
             rate_pps: 2000,
@@ -1318,6 +1555,9 @@ pub struct SnmpDeviceInfo {
     pub vlans: Vec<VlanInfo>,
     pub port_mappings: Vec<SwitchPortMapping>,
     pub port_mac_counts: Vec<PortMacCount>,
+    /// Switch-wide PoE budget (POWER-ETHERNET-MIB `pethMainPse`), when the device answered it.
+    #[serde(default)]
+    pub poe_budget: Option<PoeBudget>,
     /// `true` when some table walks failed or were cut short (timeout, device budget, row
     /// cap): the data above is what was collected before that happened.
     #[serde(default)]
@@ -1863,6 +2103,11 @@ mod tests {
         assert!(!cfg.snmp_all);
         let cfg: ScanConfig = serde_json::from_str(r#"{"snmpAll":true}"#).unwrap();
         assert!(cfg.snmp_all);
+        // Service discovery defaults ON when absent; DHCP fingerprinting defaults OFF.
+        let cfg: ScanConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.discover_services && !cfg.sip_all && !cfg.dhcp_fingerprint);
+        let cfg: ScanConfig = serde_json::from_str(r#"{"discoverServices":false}"#).unwrap();
+        assert!(!cfg.discover_services);
     }
 
     #[test]
@@ -1904,6 +2149,8 @@ mod tests {
             voice_vlan: None,
             capabilities: caps.to_vec(),
             vtp_domain: None,
+            poe_watts: None,
+            poe_info: None,
             ttl_secs: 180,
             last_seen_ms: 0,
         }

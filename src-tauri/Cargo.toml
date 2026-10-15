@@ -52,6 +52,10 @@ libc = "0.2"
 snmp2 = { version = "0.5", features = ["heap_buffers"] }
 hickory-resolver = "0.26"
 mdns-sd = "0.21"
+# Hardened XML pull parser for SSDP/UPnP device descriptions and WS-Discovery / ONVIF SOAP.
+# Default features only: no DTD / external-entity / general-entity expansion, so a hostile
+# device description cannot trigger entity-expansion ("billion laughs") attacks.
+quick-xml = "0.42"
 
 # --- Export ---
 csv = "1"

@@ -1,0 +1,67 @@
+# SweepR DHCP passive-fingerprint signatures (best-effort heuristics, NOT authoritative).
+#
+# Hand-authored from publicly-known DHCP option-55 (parameter request list) and option-60
+# (vendor class) patterns. The Fingerbank API is deliberately NOT used. Each match carries a
+# confidence (high / medium / low); a vendor-class hit outranks a parameter-list hit, which
+# outranks a hostname hint (handled in code).
+#
+# Columns (tab-separated):
+#   kind         "vendorclass" (option 60 substring, case-insensitive) or
+#                "paramlist"   (exact option 55 list, comma-separated decimal codes)
+#   pattern      the substring or the comma-separated option list
+#   os           OS family / version label to report
+#   confidence   high | medium | low
+#
+# --- Vendor class (option 60) signatures -----------------------------------------------------
+vendorclass	MSFT 5.0	Windows	high
+vendorclass	MSFT 98	Windows 98/ME	high
+vendorclass	MSFT	Windows	medium
+vendorclass	android-dhcp	Android	high
+vendorclass	dhcpcd	Linux (dhcpcd)	medium
+vendorclass	udhcp	Linux/embedded (udhcp)	low
+vendorclass	Linux ipconfig	Linux (initramfs)	medium
+vendorclass	FreeBSD	FreeBSD	high
+vendorclass	Hewlett-Packard	HP printer	medium
+vendorclass	HP LaserJet	HP LaserJet printer	high
+vendorclass	Canon	Canon printer	medium
+vendorclass	EPSON	Epson printer	medium
+vendorclass	Cisco Systems, Inc. IP Phone	Cisco IP phone	high
+vendorclass	Cisco AP	Cisco access point	high
+vendorclass	ArubaAP	Aruba access point	high
+vendorclass	Polycom	Polycom/Poly phone	high
+vendorclass	Yealink	Yealink phone	high
+vendorclass	Grandstream	Grandstream phone	high
+vendorclass	snom	Snom phone	high
+vendorclass	Mitel	Mitel phone	high
+vendorclass	Avaya	Avaya phone	high
+vendorclass	AXIS	Axis camera	high
+vendorclass	Hikvision	Hikvision camera	high
+vendorclass	Dahua	Dahua camera	high
+vendorclass	XEROX	Xerox printer	medium
+vendorclass	Brother	Brother printer	medium
+vendorclass	PXEClient	PXE network boot	medium
+vendorclass	Roku	Roku media player	high
+vendorclass	AppleTV	Apple TV	high
+vendorclass	Nintendo	Nintendo console	high
+vendorclass	Sony Computer Entertainment	PlayStation console	high
+vendorclass	XBOX	Xbox console	high
+# --- Parameter request list (option 55) signatures ------------------------------------------
+paramlist	1,3,6,15,31,33,43,44,46,47,119,121,249,252	Windows 10/11	medium
+paramlist	1,15,3,6,44,46,47,31,33,121,249,43	Windows 7/8	medium
+paramlist	1,3,6,15,31,33,43,44,46,47,119,121,249,252,0,0	Windows Server	low
+paramlist	1,121,3,6,15,119,252,95,44,46	macOS	medium
+paramlist	1,121,3,6,15,119,252	macOS/iOS	medium
+paramlist	1,3,6,15,119,252	iOS/iPadOS	medium
+paramlist	1,3,6,15,119,95,252,44,46,47	macOS	low
+paramlist	1,3,6,15,26,28,51,58,59,43	Android	medium
+paramlist	1,3,6,15,26,28,51,58,59,43,114	Android 12+	medium
+paramlist	1,33,3,6,15,26,28,51,58,59	Android (legacy)	low
+paramlist	1,28,2,3,15,6,119,12,44,47,26,121,42	Ubuntu/Debian (dhclient)	medium
+paramlist	1,2,6,12,15,26,28,42,51,54,58,59,119,121	systemd-networkd	medium
+paramlist	1,3,6,12,15,28,42,51,54,58,59	Linux (NetworkManager)	low
+paramlist	1,3,6,12,15,26,28,51,58,59,119,121	Chrome OS	medium
+paramlist	1,3,6,12,15,17,23,28,29,31,33,40,41,42	Linux	low
+paramlist	1,3,6,12,15,28,40,41,42,26	Fedora/RHEL	low
+paramlist	1,3,6,15,66,67	Network boot / thin client	low
+paramlist	1,3,6,15,42,66,150	VoIP phone	low
+paramlist	1,66,6,3,67,12,150,43	Cisco IP phone	medium

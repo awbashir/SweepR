@@ -67,6 +67,48 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
   result is marked partial. A device's switch port ignores uplinks / trunks (ports that
   learned more than 48 MACs, or that lead to another switch, router or firewall), prefers
   the device's VLAN and then the port with the fewest MACs.
+- **Service discovery** (on by default; `--no-services` disables it): after names and ports,
+  SweepR identifies discovered hosts over three protocols at once. Only hosts the scan
+  already found are enriched; responders it did not find are not added.
+  - **SSDP / UPnP** (UDP 1900): `M-SEARCH` (`ssdp:all`, `upnp:rootdevice`) to
+    `239.255.255.250` from the scan interface (and `ff02::c` / `ff05::c` with `-6`). Each
+    device description XML is fetched **only** when the `LOCATION` host is the IP that
+    answered, over plain HTTP, at most 256 KiB, with a timeout and same-origin redirects only,
+    so a hostile reply cannot make SweepR connect anywhere else. The XML is read with a
+    hardened parser (no DTD, no entity expansion, bounded depth / size) for friendly name,
+    manufacturer, model, serial, device type, UDN and services, and the device is classified
+    (`media_server`, `igd_router`, `printer`, `tv`, `nas`, `camera`, ...).
+  - **WS-Discovery / ONVIF** (UDP 3702): a SOAP `Probe` collects `XAddrs` / `Types` /
+    `Scopes`. Windows hosts (WSD `pub:Computer`) get their computer name from a WS-Transfer
+    `Get`; ONVIF cameras are asked for `GetDeviceInformation` (manufacturer, model, firmware,
+    serial, hardware id) and, unauthenticated, `GetCapabilities` → `GetProfiles` →
+    `GetStreamUri`. All of it only at the camera's own address and **never with credentials**.
+    An RTSP URL is reported only when the camera returns one; otherwise common vendor URL
+    templates (Hikvision, Dahua, Axis, ...) are listed as `rtspHints`, labelled as guesses.
+  - **SIP OPTIONS** (UDP 5060, then TCP 5060): an RFC 3261 `OPTIONS` ping to hosts with
+    5060/5061 open, a VoIP-maker MAC (Yealink, Grandstream, Poly, Cisco, Snom, Fanvil, Avaya,
+    Mitel, ...) or a CDP/LLDP Telephone capability (`--sip-all`: every host). The `Server` /
+    `User-Agent` names the PBX (Asterisk, FreePBX/Issabel, 3CX, Cisco CUCM, FreeSWITCH,
+    Kamailio/OpenSIPS, Yeastar, Grandstream UCM) or the desk phone with its model and
+    firmware. No registration or authentication is ever attempted. SIP over TLS (5061) is not
+    probed.
+- **PoE and voice VLANs**: CDP Power Consumption / Power Available, LLDP IEEE 802.3
+  Power-via-MDI (class, 802.3at requested / allocated power) and LLDP-MED Extended
+  Power-via-MDI (value, source, priority) are decoded from neighbor adverts. Over SNMP, the
+  POWER-ETHERNET-MIB port table (status, class) and main PSE table (budget, consumption,
+  threshold), Cisco's per-port power consumption and Cisco `vmVoiceVlanId` are read; the
+  endpoint on an access port gets that port's `poe` and `voiceVlan`, and each switch's PoE
+  budget appears in `query_snmp`. PoE ports are indexed by module/port, not ifIndex, so the
+  PoE-port-to-interface match is a documented heuristic (port number = last number of the
+  interface name, and the PSE group = its first number when the switch has several).
+- **DHCP fingerprinting** (`--dhcp-fingerprint`, opt-in, needs root like the other sniffers):
+  during the listen window (and in `sweepr vlans --dhcp-fingerprint`), inbound DHCP
+  DISCOVER / REQUEST / INFORM packets (BPF `udp and (port 67 or port 68)`, VLAN tags honoured)
+  are parsed and the option-55 parameter list, vendor class (option 60) and hostname are
+  matched against an embedded table (`data/dhcp_fingerprints.tsv`). **These are best-effort
+  heuristics with a confidence level (high / medium / low), not an authoritative OS
+  identification**; the Fingerbank API is not used. A client that has no address yet is
+  attributed to its row by MAC.
 
 ## CLI usage
 
@@ -125,6 +167,9 @@ encrypted request fails or times out, repeats it once with Blumenthal.
 | `-6, --ipv6` | IPv6 neighbor discovery. |
 | `-p, --ports` | TCP ports to connect-scan, e.g. `22,80,443` or `1-1024`. |
 | `--no-resolve` | Disable DNS / mDNS / NetBIOS name resolution. |
+| `--no-services` | Skip service discovery (SSDP/UPnP, WS-Discovery/ONVIF, SIP OPTIONS). |
+| `--sip-all` | SIP OPTIONS to every discovered IPv4 host, not only 5060-open / VoIP-vendor / telephone hosts. |
+| `--dhcp-fingerprint` | Passively fingerprint DHCP clients during the listen window (needs root). Also on `sweepr vlans`. |
 | `-o, --output` | `table` (default, live), `json`, `csv` or `xlsx`. |
 | `-f, --file` | Output file. Required for `xlsx`. |
 | `--timeout-ms`, `--rate-pps`, `--retries`, `--listen-secs`, `--concurrency` | Timing and pacing (validated: timeout <= 600000 ms, rate 1-1000000 pps, retries <= 10, listen <= 86400 s, concurrency 1-65535). |
@@ -202,8 +247,14 @@ src-tauri/
   src/engine.rs    scan planning, orchestration, aggregation and the enrichment phase
   src/snmp_infra.rs  async SNMP (v1/v2c/v3): system MIB, VLAN tables, bridge/CAM mapping
   src/enricher.rs  OUI vendor DB, DNS/mDNS/NetBIOS, port scan, fingerprint, local overrides
+  src/services.rs  service-discovery enrichment (SSDP + WSD + SIP) and the single-host probe
+  src/ssdp.rs      SSDP/UPnP M-SEARCH, SSRF-guarded description fetch, hardened XML walker
+  src/wsd.rs       WS-Discovery probe, ONVIF device info / stream URI, WSD metadata
+  src/sip.rs       SIP OPTIONS ping and PBX / phone identification table
+  src/dhcp_fp.rs   passive DHCP capture, option parser and fingerprint matcher
   src/export.rs    CSV / JSON / XLSX export and terminal tables
   data/oui.tsv     embedded IEEE OUI database (generated by scripts/build_oui_db.py)
+  data/dhcp_fingerprints.tsv  embedded DHCP signature table (best-effort heuristics)
 ```
 
 ## GUI backend contract
@@ -215,13 +266,14 @@ The webview may call only the commands listed in `src-tauri/build.rs` and grante
 | --- | --- | --- |
 | `list_interfaces` | none | `InterfaceInfo[]` |
 | `start_scan` | `{ config: ScanConfig }` | `scanId` (number). Cancels any running job. |
-| `start_vlan_discovery` | `{ interface?: string, timeoutSecs?: number }` | `scanId` (number). Cancels any running job. |
+| `start_vlan_discovery` | `{ interface?: string, timeoutSecs?: number, dhcpFingerprint?: boolean }` | `scanId` (number). Cancels any running job. `dhcpFingerprint` also fingerprints DHCP clients for the same window (needs root). |
 | `stop_scan` | `{ scanId?: number }` | `true` if a job was signalled. With `scanId`, only that job is stopped. Also cancels running `scan_ports` calls. |
 | `export_devices` | `{ devices: Device[], format: "csv" \| "json" \| "xlsx" }` | The written path, or `null` if the user cancelled. |
 | `load_overrides` | none | `Record<string, DeviceOverride>` (may be empty). Rejects when the store is unreadable or corrupt (the file is left untouched). |
 | `save_override` | `{ key: string, hostname: string \| null, comments: string \| null }` | `null`. Rejects on a write error or a corrupt store (which is moved aside first). |
 | `scan_ports` | `{ ip: string, ports: number[] }` | `number[]` of open ports (sorted). Rejects on a bad IP, > 4096 distinct ports, when 4 port scans are already running, when stopped by `stop_scan`, or when some ports could not be checked (out of file descriptors). |
 | `query_snmp` | `{ ip: string, snmp: SnmpConfig \| null }` | `SnmpDeviceInfo`. Rejects on a bad IP, invalid config or unreachable device. |
+| `discover_services` | `{ ip: string, timeoutMs?: number }` | `ServiceDiscovery`. Unicast SSDP + WS-Discovery to the host plus SIP OPTIONS (`timeoutMs` default 2500, clamped 500-5000). Rejects on a bad IP, when 4 probes are already running, or when stopped by `stop_scan`. |
 
 Tauri maps Rust snake_case command arguments to camelCase in JS automatically (so
 `scan_id` is `scanId`, `timeout_secs` is `timeoutSecs`).
@@ -300,6 +352,8 @@ interface SwitchPortMapping {
   portIndex: number | null;
   vlanId: number | null;
   mac: string;
+  poe: PoeInfo | null;        // PoE on this port (POWER-ETHERNET-MIB), see below
+  voiceVlan: number | null;   // voice VLAN of this port (Cisco vmVoiceVlanId)
 }
 
 interface DeviceOverride {
@@ -322,6 +376,7 @@ interface SnmpDeviceInfo {
   vlans: VlanInfo[];
   portMappings: SwitchPortMapping[];
   portMacCounts: PortMacCount[];
+  poeBudget: PoeBudget | null;  // switch-wide PoE budget, when the agent has POWER-ETHERNET-MIB
   partial: boolean;       // some walks failed / were cut short; data is what was collected
   warnings: string[];     // why (one line per failed or truncated walk)
 }
@@ -346,3 +401,155 @@ interface SnmpConfig {
   retries: number;
 }
 ```
+
+### Service discovery, PoE / voice VLAN and DHCP data shapes
+
+All additive: every new field is optional on input (missing = `null` / `false` / `[]`) and
+always present on output. Every string learned from the network is sanitized (control /
+escape / bidi characters stripped, 256 characters max).
+
+```ts
+// New ScanConfig fields.
+interface ScanConfig {
+  // ...existing fields...
+  discoverServices: boolean;  // default true: SSDP/UPnP + WS-Discovery/ONVIF + SIP OPTIONS
+  sipAll: boolean;            // default false: SIP OPTIONS to every discovered IPv4 host
+  dhcpFingerprint: boolean;   // default false: passive DHCP fingerprinting (needs root / BPF)
+}
+
+// New Device fields (all null when unknown).
+interface Device {
+  // ...existing fields...
+  voiceVlan: number | null;          // CDP/LLDP-MED voice VLAN (phones) or the SNMP port's
+  deviceKind: DeviceKind | null;     // finer category than `role` (role is unchanged)
+  ssdp: SsdpInfo | null;
+  onvif: OnvifInfo | null;
+  sip: SipInfo | null;
+  poe: PoeInfo | null;               // PoE this endpoint draws (its switch port / own advert)
+  dhcpFingerprint: DhcpFingerprint | null;
+}
+
+// Additive: new strings may appear; render unknown ones as-is.
+type DeviceKind =
+  | "voip_phone" | "pbx"                      // SIP
+  | "camera"                                  // ONVIF NetworkVideoTransmitter / SSDP
+  | "computer"                                // Windows host answering WS-Discovery
+  | "media_server" | "igd_router" | "printer" | "scanner" | "tv" | "nas"; // SSDP/UPnP
+
+// Device.sources may now also contain "ssdp" | "wsd" | "sip" | "dhcp".
+
+interface SsdpInfo {
+  location: string | null;        // advertised LOCATION URL (only fetched if host == device IP)
+  server: string | null;          // SSDP SERVER header
+  searchTarget: string | null;    // ST / NT
+  usn: string | null;
+  friendlyName: string | null;
+  manufacturer: string | null;
+  modelName: string | null;
+  modelNumber: string | null;
+  modelDescription: string | null;
+  serialNumber: string | null;
+  deviceType: string | null;      // e.g. "urn:schemas-upnp-org:device:MediaServer:1"
+  udn: string | null;             // "uuid:..."
+  presentationUrl: string | null; // device web UI (from the device; open via opener rules)
+  services: string[];             // UPnP serviceType URNs (max 64)
+}
+
+interface OnvifInfo {
+  xaddrs: string[];               // WS-Discovery transport addresses (max 64)
+  types: string | null;           // e.g. "dn:NetworkVideoTransmitter tds:Device"
+  scopes: string[];               // onvif://www.onvif.org/... scope URIs (max 64)
+  name: string | null;            // ONVIF scope name, or a Windows computer name
+  location: string | null;        // ONVIF scope location
+  manufacturer: string | null;
+  model: string | null;
+  firmwareVersion: string | null;
+  serialNumber: string | null;
+  hardwareId: string | null;
+  isCamera: boolean;              // ONVIF NetworkVideoTransmitter
+  isWindows: boolean;             // WSD pub:Computer
+  rtspUrl: string | null;         // ONLY a URL the camera itself returned (unauthenticated)
+  rtspHints: string[];            // vendor templates when rtspUrl is null; each ends with
+                                  // "(guess, no credentials tried)"; never verified
+}
+
+interface SipInfo {
+  status: string | null;          // final status line, e.g. "200 OK" / "405 Method Not Allowed"
+  server: string | null;
+  userAgent: string | null;
+  allow: string | null;
+  supported: string | null;
+  transport: "udp" | "tcp" | null;
+  vendor: string | null;          // e.g. "Yealink", "Asterisk", "3CX"
+  model: string | null;           // e.g. "SIP-T54W"
+  firmware: string | null;        // e.g. "96.86.0.5"
+  kind: "voip_phone" | "pbx" | null;
+}
+
+interface PoeInfo {
+  watts: number | null;           // power drawn / requested, W
+  maxWatts: number | null;        // allocated / available budget, W
+  class: number | null;           // IEEE class 0-8
+  status: "delivering" | "searching" | "disabled" | "fault" | "test" | null;
+  source: "pse" | "local" | "pse+local" | null;   // LLDP-MED / 802.3at power source
+  priority: "critical" | "high" | "low" | null;
+  switchName: string | null;      // set for SNMP-derived port data
+  port: string | null;            // e.g. "Gi1/0/5"
+}
+
+interface PoeBudget {
+  nominalWatts: number | null;    // PSE nominal power (sum over PSE groups)
+  consumedWatts: number | null;   // measured consumption
+  usageThresholdPct: number | null;
+  portsDelivering: number;
+}
+
+interface DhcpFingerprint {       // best-effort heuristic, never authoritative
+  os: string | null;              // e.g. "Windows", "Android 14", "macOS", "Cisco IP phone"
+  confidence: "high" | "medium" | "low" | null;
+  vendorClass: string | null;     // option 60
+  hostname: string | null;        // option 12 (client-chosen; not a DNS name)
+  paramList: number[];            // option 55, in the client's order
+}
+
+// New CdpLldpNeighbor fields (from CDP / LLDP power TLVs).
+interface CdpLldpNeighbor {
+  // ...existing fields...
+  poeWatts: number | null;        // headline: drawn power, else the advertised budget
+  poeInfo: PoeInfo | null;        // switchName / port are null here
+}
+
+// Returned by discover_services.
+interface ServiceDiscovery {
+  ip: string | null;
+  deviceKind: DeviceKind | null;
+  ssdp: SsdpInfo | null;
+  onvif: OnvifInfo | null;
+  sip: SipInfo | null;
+}
+```
+
+Event behaviour of these features:
+
+- Service discovery runs during the enrichment phase (`progress.phase === "enriching"`), after
+  names / ports and before SNMP. It streams `device` snapshots carrying `ssdp` / `onvif` /
+  `sip` / `deviceKind`, then one `log` line (`services: N SSDP/UPnP, ...`).
+- With `dhcpFingerprint`, fingerprints arrive during discovery as `device` snapshots with
+  `dhcpFingerprint` (and source `"dhcp"`). A client that already has an address keys its own
+  row (which may be a host no probe found); one that has none is merged into the row with
+  the same MAC. In `start_vlan_discovery`, address-less clients become `log` lines instead.
+  A capture that cannot start (no root / BPF) is reported as a `warn` log, never a failure.
+- `poe` / `voiceVlan` on an endpoint come from its chosen `switchPort` mapping when the switch
+  reported them (re-evaluated whenever the switch-port choice changes), else from the
+  endpoint's own CDP/LLDP advert. A switch's own adverts describe the scanning host's port
+  and are not copied onto the switch row.
+
+`discover_services` is a single-device drawer helper like `scan_ports`: it runs independently
+of any scan job, emits no `scan-event`s, holds one of 4 slots, and is cancelled by
+`stop_scan`. It uses unicast SSDP / WS-Discovery straight to the host, so it also works for
+hosts on routed subnets.
+
+Exports (CSV / XLSX / terminal table) add the columns **Device Kind**, **Model/Firmware**
+(SIP, then ONVIF, then UPnP), **PoE (W)**, **Voice VLAN** and **OS (DHCP)** (as
+`OS (confidence)`), between *TCP Ports* and *Comments*. In the terminal table they are
+hidden when empty for every device; in XLSX, PoE and Voice VLAN are numeric cells.

@@ -1,14 +1,19 @@
 //! `sweepr-core`: the SweepR scan engine shared by the `sweepr` CLI and the Tauri GUI.
 
 pub mod arp_vlan;
+pub mod dhcp_fp;
 pub mod engine;
 pub mod enricher;
 pub mod export;
 pub mod limits;
 pub mod models;
 pub mod progress;
+pub mod services;
+pub mod sip;
 pub mod snmp_infra;
+pub mod ssdp;
 pub mod sweep;
+pub mod wsd;
 
 /// Install a `tracing` subscriber writing to stderr. The filter comes from `RUST_LOG`
 /// (default `warn`). Safe to call more than once.
