@@ -31,7 +31,7 @@ tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
 tokio-util = "0.7"
 futures = "0.3"
-clap = { version = "4", features = ["derive", "wrap_help"] }
+clap = { version = "4", features = ["derive", "wrap_help", "env"] }
 comfy-table = "8"
 
 # --- Packet engine ---

@@ -327,6 +327,47 @@ pub fn default_interface_name() -> Option<String> {
     }
 }
 
+/// The default IPv4 gateway, if it can be determined (used to prioritize SNMP polling).
+pub fn default_gateway_v4() -> Option<Ipv4Addr> {
+    if cfg!(target_os = "linux") {
+        fs::read_to_string("/proc/net/route")
+            .ok()
+            .and_then(|t| parse_proc_net_route_gateway(&t))
+    } else {
+        command_stdout("/sbin/route", &["-n", "get", "default"])
+            .and_then(|t| parse_route_get_gateway(&t))
+    }
+}
+
+/// The `gateway:` of macOS/BSD `route -n get default` output.
+pub fn parse_route_get_gateway(text: &str) -> Option<Ipv4Addr> {
+    text.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("gateway:"))
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// The gateway of the lowest-metric default route in Linux `/proc/net/route` (the gateway
+/// column is a little-endian hex IPv4 address).
+pub fn parse_proc_net_route_gateway(text: &str) -> Option<Ipv4Addr> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (dest, gw, metric, mask) = (f.get(1)?, f.get(2)?, f.get(6)?, f.get(7)?);
+            if *dest != "00000000" || *mask != "00000000" {
+                return None;
+            }
+            let raw = u32::from_str_radix(gw, 16).ok().filter(|v| *v != 0)?;
+            Some((
+                metric.parse::<u32>().unwrap_or(u32::MAX),
+                Ipv4Addr::from(raw.swap_bytes()),
+            ))
+        })
+        .min()
+        .map(|(_, gw)| gw)
+}
+
 /// Choose an interface by name, or the best default when `name` is `None`.
 pub fn select_interface(all: &[InterfaceInfo], name: Option<&str>) -> Result<InterfaceInfo> {
     match name {
@@ -3484,6 +3525,16 @@ mod tests {
                     eth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
                     eth0\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(parse_proc_net_route(proc).as_deref(), Some("eth0"));
+        // Gateways: the lowest-metric default route, little-endian hex on Linux.
+        assert_eq!(
+            parse_route_get_gateway(route),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+        assert_eq!(
+            parse_proc_net_route_gateway(proc),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        assert_eq!(parse_route_get_gateway("interface: en0\n"), None);
         let ns = "\nHardware Port: Ethernet\nDevice: en0\nEthernet Address: 00:11:22:33:44:55\n\n\
                   Hardware Port: Wi-Fi\nDevice: en1\nEthernet Address: 00:11:22:33:44:66\n";
         let ports = parse_networksetup_ports(ns);

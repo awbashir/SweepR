@@ -22,7 +22,11 @@ import { deviceKey, ipSortKey } from "./ip.ts";
 export interface DeviceRow {
   key: string;
   device: Device;
-  /** User override, else the device's own hostname. */
+  /**
+   * The user's label from the override store ("" when none). In the GUI the engine never
+   * fills `device.hostname` / `device.comments` (they are user fields owned by the override
+   * store), so clearing an override clears the cell immediately.
+   */
   hostname: string;
   comments: string;
   /** `Cisco-SW01 [Gi1/0/24]` */
@@ -62,6 +66,8 @@ export interface StoreSnapshot {
 
 const MAX_LOGS = 1000;
 const MAX_BUFFERED = 200_000;
+/** CAM-table entries kept (mirrors the backend aggregator's cap). */
+export const MAX_MAPPINGS = 200_000;
 
 export function neighborKey(n: CdpLldpNeighbor): string {
   return `${n.protocol}|${n.deviceId}|${n.portId ?? ""}`;
@@ -85,8 +91,10 @@ function overrideText(o: DeviceOverride | undefined, field: keyof DeviceOverride
 }
 
 export function buildRow(key: string, device: Device, override: DeviceOverride | undefined): DeviceRow {
-  const hostname = overrideText(override, "hostname") ?? device.hostname ?? "";
-  const comments = overrideText(override, "comments") ?? device.comments ?? "";
+  // User fields come only from the override store: falling back to `device.hostname` would
+  // resurrect a label the user just cleared.
+  const hostname = overrideText(override, "hostname") ?? "";
+  const comments = overrideText(override, "comments") ?? "";
   const switchPort = switchPortLabel(device.switchPort);
   const ports = device.openPorts.join(", ");
   const search = [
@@ -153,6 +161,13 @@ export class ScanStore {
   private scanId: number | null = null;
   /** Events that arrived before `start_*` resolved with their job id. */
   private buffer: ScanEventPayload[] = [];
+  /** Token of the latest `beginStart`; replies to older starts are ignored. */
+  private startToken = 0;
+  /** A job id an outdated start resolved with (adopted if the newer start fails). */
+  private orphanId: number | null = null;
+  /** The latest start failed (so an older start that resolves late may be adopted). */
+  private latestFailed = false;
+  private mappingCapWarned = false;
 
   private listeners = new Set<() => void>();
   private snapshot: StoreSnapshot;
@@ -235,33 +250,65 @@ export class ScanStore {
 
   // --- Job lifecycle ------------------------------------------------------------------------
 
-  /** Call right before invoking `start_scan` / `start_vlan_discovery`. */
-  beginStart(kind: JobKind): void {
+  /**
+   * Call right before invoking `start_scan` / `start_vlan_discovery`. Returns a token to pass
+   * to `startResolved` / `startFailed`, so a reply to an earlier, superseded start (two rapid
+   * starts) cannot adopt the wrong job or throw away the newer job's buffered events.
+   */
+  beginStart(kind: JobKind): number {
     this.starting = true;
     this.running = true;
     this.jobKind = kind;
     this.scanId = null;
     this.buffer = [];
+    this.orphanId = null;
+    this.latestFailed = false;
     this.progress = null;
     this.summary = null;
     this.markDirty("other");
+    return ++this.startToken;
   }
 
   /** The start command resolved: adopt its id and replay events that raced ahead of it. */
-  startResolved(scanId: number): void {
+  startResolved(scanId: number, token: number = this.startToken): void {
+    if (token !== this.startToken) {
+      // An older start finished after a newer one began: the backend has already superseded
+      // (or is about to supersede) it. Keep buffering for the newer start.
+      if (this.starting) {
+        this.orphanId = Math.max(this.orphanId ?? 0, scanId);
+      } else if (this.latestFailed && this.scanId === null) {
+        // The newer start already failed; this older job is the one actually running.
+        this.running = true;
+        this.adopt(scanId);
+      }
+      return;
+    }
+    this.adopt(scanId);
+  }
+
+  startFailed(message: string, token: number = this.startToken): void {
+    this.log("error", message);
+    if (token !== this.startToken) return;
+    if (this.orphanId !== null) {
+      // The newer start failed before superseding the older job, which is still running.
+      this.adopt(this.orphanId);
+      return;
+    }
+    this.starting = false;
+    this.running = false;
+    this.latestFailed = true;
+    this.buffer = [];
+  }
+
+  private adopt(scanId: number): void {
     this.scanId = scanId;
     this.starting = false;
+    this.orphanId = null;
+    this.latestFailed = false;
     const pending = this.buffer;
     this.buffer = [];
     for (const p of pending) if (p.scanId === scanId) this.apply(p.event);
     this.markDirty("other");
-  }
-
-  startFailed(message: string): void {
-    this.starting = false;
-    this.running = false;
-    this.buffer = [];
-    this.log("error", message);
   }
 
   /** Route a `scan-event` payload: only the current job's events are applied. */
@@ -292,8 +339,7 @@ export class ScanStore {
         this.markDirty("neighbors");
         break;
       case "port_mapping":
-        this.mappings.set(mappingKey(event.data), event.data);
-        this.markDirty("mappings");
+        if (this.addMapping(event.data)) this.markDirty("mappings");
         break;
       case "progress":
         this.progress = event.data;
@@ -313,6 +359,20 @@ export class ScanStore {
         );
         break;
     }
+  }
+
+  /** Store one CAM entry; beyond `MAX_MAPPINGS` new entries are ignored (warned once). */
+  private addMapping(m: SwitchPortMapping): boolean {
+    const key = mappingKey(m);
+    if (!this.mappings.has(key) && this.mappings.size >= MAX_MAPPINGS) {
+      if (!this.mappingCapWarned) {
+        this.mappingCapWarned = true;
+        this.log("warn", `More than ${MAX_MAPPINGS.toLocaleString()} MAC-to-port entries; ignoring further entries.`);
+      }
+      return false;
+    }
+    this.mappings.set(key, m);
+    return true;
   }
 
   // --- Local mutations ------------------------------------------------------------------------
@@ -351,7 +411,7 @@ export class ScanStore {
       const existing = this.vlans.get(v.id);
       this.vlans.set(v.id, existing ? { ...existing, ...v, name: v.name ?? existing.name } : v);
     }
-    for (const m of info.portMappings ?? []) this.mappings.set(mappingKey(m), m);
+    for (const m of info.portMappings ?? []) this.addMapping(m);
     this.markDirty("vlans");
     this.markDirty("mappings");
   }
@@ -366,10 +426,26 @@ export class ScanStore {
     this.markDirty("rows");
   }
 
-  removeDevices(keys: Iterable<string>): void {
+  /** Remove rows from the results; returns what was removed (for Undo). */
+  removeDevices(keys: Iterable<string>): Array<[string, Device]> {
+    const removed: Array<[string, Device]> = [];
     for (const k of keys) {
+      const dev = this.devices.get(k);
+      if (dev) removed.push([k, dev]);
       this.devices.delete(k);
       this.rowCache.delete(k);
+    }
+    this.markDirty("rows");
+    return removed;
+  }
+
+  /** Undo `removeDevices`. A row the scan re-emitted in the meantime keeps its newer data. */
+  restoreDevices(entries: Array<[string, Device]>): void {
+    for (const [k, dev] of entries) {
+      if (!this.devices.has(k)) {
+        this.devices.set(k, dev);
+        this.rowCache.delete(k);
+      }
     }
     this.markDirty("rows");
   }
@@ -384,6 +460,7 @@ export class ScanStore {
     this.vlans.clear();
     this.neighbors.clear();
     this.mappings.clear();
+    this.mappingCapWarned = false;
     this.snmp = {};
     this.summary = null;
     if (!this.running) this.progress = null;

@@ -180,6 +180,8 @@ export interface ScanConfig {
   discoverVlans: boolean;
   cdpLldp: boolean;
   snmp: SnmpConfig | null;
+  /** Poll every discovered host over SNMP, not only likely infrastructure (default false). */
+  snmpAll: boolean;
   ipv6: boolean;
   ports: number[];
   resolveNames: boolean;
@@ -257,6 +259,10 @@ export interface SnmpDeviceInfo {
   vlans: VlanInfo[];
   portMappings: SwitchPortMapping[];
   portMacCounts: PortMacCount[];
+  /** Some table walks failed or were cut short; the data above is what was collected. */
+  partial: boolean;
+  /** Why the result is partial (one line per failed / truncated walk). */
+  warnings: string[];
 }
 
 /** Longest hostname / comment the backend keeps (`MAX_OVERRIDE_LEN`). */

@@ -19,6 +19,8 @@ export interface ScanSettings {
   resolveNames: boolean;
   ports: string;
   snmpEnabled: boolean;
+  /** Poll every host over SNMP instead of only likely infrastructure. */
+  snmpAll: boolean;
   snmp: SnmpConfig;
 }
 
@@ -42,6 +44,7 @@ export const DEFAULT_SETTINGS: ScanSettings = {
   resolveNames: true,
   ports: formatPorts(DEFAULT_SCAN_PORTS),
   snmpEnabled: false,
+  snmpAll: false,
   snmp: DEFAULT_SNMP,
 };
 
@@ -89,8 +92,9 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
   if (!vlans.ok) return { ok: false, error: `VLAN: ${vlans.error}` };
   const ports = parsePorts(s.ports);
   if (!ports.ok) return { ok: false, error: `Ports: ${ports.error}` };
-  if (s.snmpEnabled && s.snmp.version === "v3" && !s.snmp.v3?.username) {
-    return { ok: false, error: "SNMPv3 requires a username (SNMP Settings)" };
+  if (s.snmpEnabled && s.snmp.version === "v3") {
+    const problem = snmpV3Problem(s.snmp);
+    if (problem) return { ok: false, error: `${problem} (SNMP Settings)` };
   }
   const config: ScanConfig = {
     interface: s.iface === "" ? null : s.iface,
@@ -99,6 +103,7 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
     discoverVlans: s.discoverVlans || vlans.value.mode === "auto_detect",
     cdpLldp: s.cdpLldp,
     snmp: s.snmpEnabled ? snmpForWire(s.snmp) : null,
+    snmpAll: s.snmpEnabled && s.snmpAll,
     ipv6: s.ipv6,
     ports: ports.value,
     resolveNames: s.resolveNames,
@@ -109,6 +114,23 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
     listenSecs: 10,
   };
   return { ok: true, value: { config, targetCount: range.value.spec === null ? null : range.value.count } };
+}
+
+/** RFC 3414 minimum SNMPv3 password length (the backend rejects shorter ones). */
+export const MIN_SNMPV3_PASSWORD_LEN = 8;
+
+/** Why an SNMPv3 configuration would be rejected by the backend, or `null` when it is fine. */
+export function snmpV3Problem(c: SnmpConfig): string | null {
+  if (c.version !== "v3") return null;
+  const v3 = c.v3;
+  if (!v3 || v3.username.trim() === "") return "SNMPv3 requires a username";
+  const auth = v3.authPassword ?? "";
+  const priv = v3.privPassword ?? "";
+  if ((auth !== "" && auth.length < MIN_SNMPV3_PASSWORD_LEN) || (priv !== "" && priv.length < MIN_SNMPV3_PASSWORD_LEN)) {
+    return `SNMPv3 passwords must be at least ${MIN_SNMPV3_PASSWORD_LEN} characters`;
+  }
+  if (auth === "" && priv !== "") return "SNMPv3 privacy needs an authentication password";
+  return null;
 }
 
 /** Drop v3 credentials for v1/v2c and empty passwords → null. */

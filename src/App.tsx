@@ -161,17 +161,17 @@ function Main() {
         toast.push("error", "Cannot start scan", built.error);
         return;
       }
-      store.beginStart("scan");
+      const token = store.beginStart("scan");
       store.log(
         "info",
         `Starting scan on ${built.value.config.interface ?? "default interface"}: ${built.value.config.range ?? "interface subnet"}, ${vlanSelectionLabel(built.value.config.vlans)}`,
       );
       try {
         const id = await backend.startScan(built.value.config);
-        store.startResolved(id);
+        store.startResolved(id, token);
       } catch (e) {
         const msg = errorMessage(e);
-        store.startFailed(`Scan failed to start: ${msg}`);
+        store.startFailed(`Scan failed to start: ${msg}`, token);
         toast.push("error", "Scan failed to start", msg);
       }
     },
@@ -190,13 +190,13 @@ function Main() {
   }, [snap.scanId, toast]);
 
   const passiveDiscovery = useCallback(async () => {
-    store.beginStart("vlan_discovery");
+    const token = store.beginStart("vlan_discovery");
     try {
       const id = await backend.startVlanDiscovery(settings.iface === "" ? null : settings.iface, ui.discoveryTimeout);
-      store.startResolved(id);
+      store.startResolved(id, token);
     } catch (e) {
       const msg = errorMessage(e);
-      store.startFailed(`VLAN discovery failed to start: ${msg}`);
+      store.startFailed(`VLAN discovery failed to start: ${msg}`, token);
       toast.push("error", "VLAN discovery failed to start", msg);
     }
   }, [settings.iface, ui.discoveryTimeout, toast]);
@@ -350,9 +350,20 @@ function Main() {
     [settings.snmp, toast],
   );
 
-  const removeRow = useCallback((key: string) => {
-    store.removeDevices([key]);
-  }, []);
+  // Removal (Delete / Backspace or the context menu) is immediate but undoable.
+  const removeRow = useCallback(
+    (key: string) => {
+      const removed = store.removeDevices([key]);
+      const first = removed[0];
+      if (!first) return;
+      const ip = first[1].ip;
+      toast.push("info", `Removed ${ip} from the results`, undefined, {
+        label: "Undo",
+        onClick: () => store.restoreDevices(removed),
+      });
+    },
+    [toast],
+  );
 
   const clearResults = useCallback(() => {
     store.clearResults();
@@ -621,8 +632,9 @@ function Main() {
       {snmpOpen && (
         <SnmpDialog
           enabled={settings.snmpEnabled}
+          pollAll={settings.snmpAll}
           config={settings.snmp}
-          onSave={(snmpEnabled, snmp) => patchSettings({ snmpEnabled, snmp })}
+          onSave={(snmpEnabled, snmpAll, snmp) => patchSettings({ snmpEnabled, snmpAll, snmp })}
           onClose={() => setSnmpOpen(false)}
         />
       )}
