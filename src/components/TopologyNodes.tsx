@@ -14,7 +14,9 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { AlertTriangle, ChevronDown, ChevronRight, CircleHelp, Globe, Laptop, Users, Wifi } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, CircleHelp, Globe, Laptop, ShieldAlert, Users, Wifi } from "lucide-react";
+import { formatLoss, formatMs, latencyTone, type Tone } from "../lib/latency.ts";
+import { useLatency } from "../tools.ts";
 import type { DeviceRole } from "../types.ts";
 import { ROLE_LABEL } from "../types.ts";
 import type { TopoEdge, TopoMember, TopoNode } from "../lib/topology.ts";
@@ -53,6 +55,40 @@ export interface TopoActions {
 }
 
 export const TopoActionsContext = createContext<TopoActions | null>(null);
+
+/** Live overlays: latency accents (while live latency is on) and device warnings by key. */
+export interface TopoLive {
+  live: boolean;
+  warnings: ReadonlyMap<string, readonly string[]>;
+}
+
+export const TopoLiveContext = createContext<TopoLive>({ live: false, warnings: new Map() });
+
+const TONE_VAR: Record<Tone, string> = {
+  ok: "var(--ok)",
+  warn: "var(--warn)",
+  bad: "var(--danger)",
+  down: "var(--danger)",
+  none: "var(--faint)",
+};
+
+/** Small coloured dot + average ms; the text says the same as the colour. */
+function LatencyAccent({ ip }: { ip: string }) {
+  const e = useLatency(ip);
+  if (!e) return null;
+  const s = e.stats;
+  const tone = latencyTone(s);
+  return (
+    <span
+      className="flex shrink-0 items-center gap-0.5 font-mono text-[9.5px] text-muted"
+      title={`avg ${formatMs(s.avgMs)} ms · loss ${formatLoss(s.lossPct)} · jitter ${formatMs(s.jitterMs)} ms`}
+    >
+      <span className="inline-block size-[7px] rounded-full" style={{ background: TONE_VAR[tone] }} aria-hidden />
+      {tone === "down" ? "down" : `${formatMs(s.avgMs)} ms`}
+      {s.lossPct > 0 && tone !== "down" && <span style={{ color: TONE_VAR[tone] }}>{formatLoss(s.lossPct)}</span>}
+    </span>
+  );
+}
 
 function useActions(): TopoActions {
   const a = useContext(TopoActionsContext);
@@ -128,6 +164,8 @@ export const DeviceNode = memo(function DeviceNode({ data }: NodeProps<TopoRfNod
   const role = n.role ?? "host";
   const Icon = ROLE_ICON[role];
   const infra = n.kind === "infra";
+  const live = useContext(TopoLiveContext);
+  const warnings = n.deviceKey ? live.warnings.get(n.deviceKey) : undefined;
   return (
     <div className={frameClass(data)} style={{ borderLeft: `4px solid ${ROLE_VAR[role]}` }}>
       <Handles dir={data.dir} />
@@ -136,11 +174,23 @@ export const DeviceNode = memo(function DeviceNode({ data }: NodeProps<TopoRfNod
           <Icon size={infra ? 15 : 13} strokeWidth={1.9} aria-hidden className="shrink-0" style={{ color: ROLE_VAR[role] }} />
           <span className={cx("min-w-0 flex-1 truncate font-semibold", infra ? "text-[12.5px]" : "text-[12px]")}>{n.label}</span>
           {infra && <span className="topo-detail shrink-0 text-[9.5px] tracking-wide text-muted uppercase">{ROLE_LABEL[role]}</span>}
+          {warnings && warnings.length > 0 && (
+            <span className="shrink-0 text-warn" title={warnings.join("\n")}>
+              <ShieldAlert size={12} aria-hidden />
+              <span className="sr-only">{warnings.length} warning(s): {warnings.join("; ")}</span>
+            </span>
+          )}
           <StatusMark node={n} />
         </div>
         <div className="topo-detail flex min-w-0 items-center gap-1 font-mono text-[10.5px] text-muted">
           <span className="truncate">{n.ip ?? n.mac ?? ""}</span>
           {n.port && <span className="shrink-0 truncate">· {n.port}</span>}
+          {live.live && n.ip && (
+            <>
+              <span className="flex-1" />
+              <LatencyAccent ip={n.ip} />
+            </>
+          )}
         </div>
         {(n.detail || n.vlans.length > 0) && (
           <div className="topo-detail flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted">

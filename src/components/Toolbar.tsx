@@ -2,7 +2,9 @@
 
 import { forwardRef, useRef, useState } from "react";
 import {
+  Activity,
   Download,
+  Ellipsis,
   Eraser,
   FileBraces,
   FileSpreadsheet,
@@ -16,12 +18,14 @@ import {
   Square,
   Table2,
   Network,
+  Power,
   X,
 } from "lucide-react";
 import type { DeviceRole, ExportFormat, InterfaceInfo } from "../types.ts";
 import { ROLE_LABEL } from "../types.ts";
 import { interfaceLabel, subnetHint, vlanSelectionFrom, type ScanSettings, type VlanMode } from "../settings.ts";
 import { parsePorts, parseRange } from "../lib/parse.ts";
+import { LATENCY_INTERVALS } from "../lib/latency.ts";
 import { ContextMenu, type MenuState } from "./Menu.tsx";
 import { Button, RoleIcon, Select, Separator, TextInput, Toggle, cx } from "./ui.tsx";
 
@@ -43,12 +47,28 @@ interface ToolbarProps {
   exportCount: number;
   drawerOpen: boolean;
   onToggleDrawer: () => void;
+  liveLatency: boolean;
+  onLiveLatency: (on: boolean) => void;
+  latencyIntervalMs: number;
+  onLatencyInterval: (ms: number) => void;
+  onWakeByMac: () => void;
 }
 
 export function Toolbar(p: ToolbarProps) {
   const s = p.settings;
   const [exportMenu, setExportMenu] = useState<MenuState | null>(null);
   const exportBtn = useRef<HTMLButtonElement>(null);
+  const moreBtn = useRef<HTMLButtonElement>(null);
+
+  const openMore = (): void => {
+    const r = moreBtn.current?.getBoundingClientRect();
+    setExportMenu({
+      x: r ? r.right - 200 : 0,
+      y: r ? r.bottom + 4 : 0,
+      label: "More actions",
+      items: [{ kind: "item", label: "Wake by MAC…", icon: Power, onSelect: p.onWakeByMac }],
+    });
+  };
   const iface = p.interfaces.find((i) => i.name === s.iface) ?? p.interfaces.find((i) => i.isDefault);
   const hint = subnetHint(iface);
   const range = parseRange(s.range);
@@ -173,16 +193,52 @@ export function Toolbar(p: ToolbarProps) {
         SNMP{s.snmpEnabled ? ` ${s.snmp.version}` : ""}
       </Button>
       <Separator />
+      <div className="flex items-center rounded-[6px]" title="Ping the visible, selected and pinned devices continuously">
+        <Toggle
+          checked={p.liveLatency}
+          onChange={p.onLiveLatency}
+          label={
+            <span className="flex items-center gap-1">
+              <Activity size={13} strokeWidth={1.75} aria-hidden className={p.liveLatency ? "text-accent" : "text-muted"} />
+              Live latency
+            </span>
+          }
+        />
+        <Select
+          value={p.latencyIntervalMs}
+          onChange={(e) => p.onLatencyInterval(Number(e.target.value))}
+          aria-label="Latency probe interval"
+          title="Probe interval"
+          disabled={!p.liveLatency}
+          className="w-[64px]"
+        >
+          {LATENCY_INTERVALS.map((ms) => (
+            <option key={ms} value={ms}>
+              {ms / 1000} s
+            </option>
+          ))}
+        </Select>
+      </div>
+      <Separator />
       <Button
         ref={exportBtn}
         icon={Download}
         onClick={openExport}
         aria-haspopup="menu"
-        aria-expanded={exportMenu !== null}
+        aria-expanded={exportMenu?.label === "Export"}
         title="Export results"
       >
         Export
       </Button>
+      <Button
+        ref={moreBtn}
+        variant="ghost"
+        icon={Ellipsis}
+        onClick={openMore}
+        aria-haspopup="menu"
+        aria-label="More actions"
+        title="More actions"
+      />
       <Button
         variant="ghost"
         icon={PanelRight}

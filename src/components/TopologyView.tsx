@@ -68,6 +68,8 @@ import { useToasts } from "./Toasts.tsx";
 import {
   ROLE_VAR,
   TopoActionsContext,
+  TopoLiveContext,
+  type TopoLive,
   edgeTypes,
   nodeTypes,
   type TopoActions,
@@ -95,6 +97,8 @@ export interface TopologyViewProps {
   onPassiveListen: () => void;
   cdpLldp: boolean;
   snmpEnabled: boolean;
+  /** Show latency accents on device nodes. */
+  liveLatency?: boolean;
 }
 
 interface TopoPrefs {
@@ -191,6 +195,28 @@ function TopologyCanvas(p: TopologyViewProps) {
   // Hover lives outside React state so mouse moves never re-render the canvas.
   const hover = useMemo(() => createHoverStore(), []);
   const pRef = useRef(p);
+  // Device warnings by key; the map keeps its identity while the warnings do not change, so
+  // streamed rows do not re-render every node.
+  const warnSig = useRef("");
+  const warnMap = useRef<ReadonlyMap<string, readonly string[]>>(new Map());
+  const warnings = useMemo(() => {
+    const m = new Map<string, readonly string[]>();
+    let sig = "";
+    for (const r of p.rows) {
+      const w = r.device.warnings;
+      if (w && w.length > 0) {
+        m.set(r.key, w);
+        sig += `${r.key}:${w.length};`;
+      }
+    }
+    if (sig !== warnSig.current) {
+      warnSig.current = sig;
+      warnMap.current = m;
+    }
+    return warnMap.current;
+  }, [p.rows]);
+  const live = !!p.liveLatency;
+  const liveCtx = useMemo<TopoLive>(() => ({ live, warnings }), [live, warnings]);
   pRef.current = p;
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [farOut, setFarOut] = useState(false);
@@ -729,6 +755,7 @@ function TopologyCanvas(p: TopologyViewProps) {
 
   return (
     <TopoActionsContext.Provider value={actions}>
+      <TopoLiveContext.Provider value={liveCtx}>
       <div
         ref={wrapRef}
         className={cx("sweepr-topo relative min-h-0 flex-1", farOut && "topo-far")}
@@ -876,6 +903,7 @@ function TopologyCanvas(p: TopologyViewProps) {
         {!menu && <HoverTooltip store={hover} graph={graph} />}
         {menu && <ContextMenu menu={menu} onClose={() => setMenu(null)} />}
       </div>
+      </TopoLiveContext.Provider>
     </TopoActionsContext.Provider>
   );
 }

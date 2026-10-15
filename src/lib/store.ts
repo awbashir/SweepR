@@ -7,6 +7,7 @@ import type {
   Device,
   DeviceOverride,
   DeviceRole,
+  LatencyStats,
   LogLevel,
   Overrides,
   ScanEvent,
@@ -16,6 +17,7 @@ import type {
   SnmpDeviceInfo,
   SwitchPortMapping,
   VlanInfo,
+  WebIdentity,
 } from "../types.ts";
 import { deviceKey, ipSortKey } from "./ip.ts";
 
@@ -114,6 +116,11 @@ export function buildRow(key: string, device: Device, override: DeviceOverride |
     comments,
     device.neighbor?.platform,
     device.neighbor?.systemName,
+    device.webTitle,
+    device.webIdentity,
+    device.webServer,
+    device.tlsCert?.subjectCn,
+    ...(device.warnings ?? []),
   ]
     .filter((v) => v !== null && v !== undefined && v !== "")
     .join("\u0001")
@@ -131,12 +138,32 @@ export function buildRow(key: string, device: Device, override: DeviceOverride |
   };
 }
 
-/** Device as it should be exported: user hostname/comments applied. */
-export function exportDevice(row: DeviceRow): Device {
+/**
+ * Device as it should be exported: user hostname/comments applied, and the live latency the
+ * GUI measured (the engine never fills `device.latency`).
+ */
+export function exportDevice(row: DeviceRow, latency?: LatencyStats | null): Device {
   return {
     ...row.device,
     hostname: row.hostname === "" ? null : row.hostname,
     comments: row.comments === "" ? null : row.comments,
+    latency: latency ?? row.device.latency ?? null,
+  };
+}
+
+/** A device with a `grab_web_identity` result merged in (warnings de-duplicated). */
+export function withWebIdentity(dev: Device, wi: WebIdentity): Device {
+  const warnings = [...new Set([...(dev.warnings ?? []), ...wi.warnings])];
+  const promote = dev.role === "host" && wi.roleHint !== null && wi.roleHint !== "host";
+  return {
+    ...dev,
+    webTitle: wi.title ?? dev.webTitle,
+    webServer: wi.server ?? dev.webServer,
+    tlsCert: wi.tlsCert ?? dev.tlsCert,
+    webIdentity: wi.identity ?? dev.webIdentity,
+    warnings,
+    role: promote && wi.roleHint ? wi.roleHint : dev.role,
+    openPorts: [...new Set([...dev.openPorts, ...wi.services.filter((s) => s.status !== null).map((s) => s.port)])].sort((a, b) => a - b),
   };
 }
 
@@ -422,6 +449,15 @@ export class ScanStore {
     if (!dev) return;
     const merged = [...new Set([...dev.openPorts, ...ports])].sort((a, b) => a - b);
     this.devices.set(key, { ...dev, openPorts: merged });
+    this.rowCache.delete(key);
+    this.markDirty("rows");
+  }
+
+  /** Merge a `grab_web_identity` result into the device (local only, like `setOpenPorts`). */
+  setWebIdentity(key: string, wi: WebIdentity): void {
+    const dev = this.devices.get(key);
+    if (!dev) return;
+    this.devices.set(key, withWebIdentity(dev, wi));
     this.rowCache.delete(key);
     this.markDirty("rows");
   }

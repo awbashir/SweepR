@@ -12,6 +12,8 @@ export type MenuItem =
       onSelect: () => void;
       disabled?: boolean;
       shortcut?: string;
+      /** Tooltip (e.g. why the item is disabled). */
+      title?: string;
     }
   | { kind: "check"; label: string; checked: boolean; onSelect: () => void; keepOpen?: boolean; disabled?: boolean }
   | { kind: "separator" }
@@ -127,6 +129,7 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState; onClose: () =>
             role={item.kind === "check" ? "menuitemcheckbox" : "menuitem"}
             aria-checked={item.kind === "check" ? item.checked : undefined}
             aria-disabled={item.disabled || undefined}
+            title={item.kind === "item" ? item.title : undefined}
             onMouseEnter={() => actionable(item) && setActive(i)}
             onClick={() => activate(i)}
             className={cx(

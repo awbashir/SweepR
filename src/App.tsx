@@ -2,9 +2,12 @@ import { Suspense, lazy, useCallback, useDeferredValue, useEffect, useMemo, useR
 import {
   Copy,
   ExternalLink,
+  Gauge,
   Globe,
   MessageSquare,
   Pencil,
+  Power,
+  Route,
   ScanLine,
   Server,
   ShieldAlert,
@@ -12,7 +15,9 @@ import {
   Trash,
 } from "lucide-react";
 import { backend, errorMessage } from "./api.ts";
-import type { DeviceOverride, ExportFormat, InterfaceInfo } from "./types.ts";
+import type { DeviceOverride, ExportFormat, InterfaceInfo, WakeOptions } from "./types.ts";
+import { clearTools, grabWebIdentity, initTools, latencyCtl, latencyStore, onLatencyError, webStore } from "./tools.ts";
+import { webProbePorts, webTargets } from "./lib/webid.ts";
 import { ScanStore, exportDevice, type DeviceRow } from "./lib/store.ts";
 import { urlHost } from "./lib/ip.ts";
 import { formatPorts, parsePorts, vlanSelectionLabel } from "./lib/parse.ts";
@@ -29,10 +34,10 @@ import {
 } from "./settings.ts";
 import { usePersistentState } from "./hooks/usePersistentState.ts";
 import { DeviceTable, type EditField } from "./components/DeviceTable.tsx";
-import { DetailsDrawer, type PortScanState, type SnmpQueryState } from "./components/DetailsDrawer.tsx";
-import { CustomUrlDialog, SnmpDialog } from "./components/Dialogs.tsx";
+import { DetailsDrawer, type DrawerSection, type PortScanState, type SnmpQueryState } from "./components/DetailsDrawer.tsx";
+import { CustomUrlDialog, SnmpDialog, WakeDialog } from "./components/Dialogs.tsx";
 import { NeighborView, VlanView } from "./components/InfraViews.tsx";
-import { ContextMenu, type MenuState } from "./components/Menu.tsx";
+import { ContextMenu, type MenuItem, type MenuState } from "./components/Menu.tsx";
 import { LogPanel, StatusBar } from "./components/StatusBar.tsx";
 import { ToastProvider, useToasts } from "./components/Toasts.tsx";
 import { FilterBar, Toolbar, type DevicesMode, type RoleFilter, type View } from "./components/Toolbar.tsx";
@@ -55,7 +60,15 @@ interface UiPrefs {
   /** Devices drawn as the table or the topology map. */
   devicesMode: DevicesMode;
   urlTemplate: string;
+  /** Ping visible / selected / pinned devices continuously. */
+  liveLatency: boolean;
+  latencyIntervalMs: number;
+  /** IPs monitored whenever live latency is on, visible or not. */
+  pinned: string[];
 }
+
+/** Pinned devices kept at most (live latency monitors at most `MAX_MONITORED` hosts). */
+const MAX_PINNED = 100;
 
 const DEFAULT_UI: UiPrefs = {
   drawerOpen: true,
@@ -66,6 +79,9 @@ const DEFAULT_UI: UiPrefs = {
   view: "devices",
   devicesMode: "table",
   urlTemplate: "http://{ip}:8080/",
+  liveLatency: false,
+  latencyIntervalMs: 1000,
+  pinned: [],
 };
 
 export default function App() {
@@ -101,6 +117,10 @@ function Main() {
   const [portScans, setPortScans] = useState<Record<string, PortScanState>>({});
   const [snmpQueries, setSnmpQueries] = useState<Record<string, SnmpQueryState>>({});
   const [focusToken, setFocusToken] = useState(0);
+  const [wakeOpen, setWakeOpen] = useState(false);
+  const [drawerFocus, setDrawerFocus] = useState<{ section: DrawerSection; token: number } | null>(null);
+  const [traceToken, setTraceToken] = useState(0);
+  const [iperfToken, setIperfToken] = useState(0);
   const searchRef = useRef<HTMLInputElement>(null);
 
   // --- startup: event subscription, interfaces, overrides ---------------------------------------
@@ -139,6 +159,21 @@ function Main() {
     }
   }, [toast, setRawSettings]);
 
+  // --- network utilities: event subscriptions and live latency selection -------------------------
+
+  useEffect(() => {
+    initTools().catch((e: unknown) => toast.push("error", "Could not subscribe to utility events", errorMessage(e)));
+    return onLatencyError((msg) => toast.push("error", "Live latency monitor failed", msg));
+  }, [toast]);
+
+  useEffect(() => {
+    latencyCtl.setIntervalMs(ui.latencyIntervalMs);
+    latencyCtl.setEnabled(ui.liveLatency);
+  }, [ui.liveLatency, ui.latencyIntervalMs]);
+
+  const pinned = useMemo(() => (Array.isArray(ui.pinned) ? ui.pinned.filter((v) => typeof v === "string").slice(0, MAX_PINNED) : []), [ui.pinned]);
+  useEffect(() => latencyCtl.setSource("pinned", pinned), [pinned]);
+
   // --- derived data -----------------------------------------------------------------------------
 
   const filtered = useMemo(() => {
@@ -153,6 +188,42 @@ function Main() {
     () => (selectedKey === null ? undefined : snap.rows.find((r) => r.key === selectedKey)),
     [snap.rows, selectedKey],
   );
+  const selectedIp = selectedRow?.device.ip ?? null;
+  useEffect(() => latencyCtl.setSource("selected", selectedIp ? [selectedIp] : []), [selectedIp]);
+
+  // The table reports its visible rows; elsewhere (topology map, VLAN / neighbor views) the
+  // infrastructure devices are monitored instead.
+  const tableShown = ui.view === "devices" && ui.devicesMode === "table";
+  useEffect(() => {
+    if (!ui.liveLatency) return;
+    if (tableShown) {
+      latencyCtl.setSource("infra", []);
+      return;
+    }
+    latencyCtl.setSource("viewport", []);
+    const infra: string[] = [];
+    for (const r of snap.rows) {
+      if (r.device.role !== "host") infra.push(r.device.ip);
+      if (infra.length >= 200) break;
+    }
+    latencyCtl.setSource("infra", infra);
+  }, [ui.liveLatency, tableShown, snap.rows]);
+  const onViewport = useCallback(
+    (count: number, ipAt: (i: number) => string | undefined, start: number, end: number) => latencyCtl.setViewport(count, ipAt, start, end),
+    [],
+  );
+
+  const autoColumns = useMemo(() => {
+    let webTitle = false;
+    let certExpires = false;
+    for (const r of snap.rows) {
+      if (r.device.webTitle) webTitle = true;
+      if (r.device.tlsCert) certExpires = true;
+      if (webTitle && certExpires) break;
+    }
+    return { liveLatency: ui.liveLatency, webTitle, certExpires };
+  }, [snap.rows, ui.liveLatency]);
+
   const vlanSel = vlanSelectionFrom(settings);
   const vlanLabel = vlanSel.ok ? vlanSelectionLabel(vlanSel.value) : "Invalid VLANs";
   const warnCount = useMemo(() => snap.logs.filter((l) => l.level !== "info").length, [snap.logs]);
@@ -219,7 +290,8 @@ function Main() {
 
   const exportAs = useCallback(
     async (format: ExportFormat) => {
-      const devices = filtered.map(exportDevice);
+      // Live latency (when measured) goes into the Latency / Loss % export columns.
+      const devices = filtered.map((r) => exportDevice(r, latencyStore.get(r.device.ip)?.stats));
       if (devices.length === 0) return;
       try {
         const path = await backend.exportDevices(devices, format);
@@ -357,6 +429,54 @@ function Main() {
     [settings.snmp, toast],
   );
 
+  const wake = useCallback(
+    async (mac: string, opts: WakeOptions): Promise<boolean> => {
+      try {
+        const r = await backend.wakeDevice(mac, opts);
+        const detail = `${r.packetsSent} packet${r.packetsSent === 1 ? "" : "s"} to ${r.targets.join(", ")}${r.interface ? ` via ${r.interface}` : ""}`;
+        toast.push("success", `Magic packet sent to ${r.mac}`, detail);
+        store.log("info", `Wake-on-LAN ${r.mac}: ${detail}`);
+        return true;
+      } catch (e) {
+        toast.push("error", `Wake-on-LAN for ${mac} failed`, errorMessage(e));
+        return false;
+      }
+    },
+    [toast],
+  );
+
+  const wakeRow = useCallback(
+    (row: DeviceRow) => {
+      if (row.device.mac) void wake(row.device.mac, { interface: row.device.interface });
+    },
+    [wake],
+  );
+
+  const grabWeb = useCallback(
+    async (row: DeviceRow) => {
+      try {
+        const wi = await grabWebIdentity(row.key, row.device.ip, webProbePorts(row.device));
+        store.setWebIdentity(row.key, wi);
+        if (wi.services.length === 0) toast.push("info", `No web interface answered on ${row.device.ip}`);
+        else store.log("info", `Web identity ${row.device.ip}: ${[wi.identity, wi.title].filter(Boolean).join(" · ") || `${wi.services.length} service(s)`}`);
+      } catch (e) {
+        toast.push("error", `Web identity of ${row.device.ip} failed`, errorMessage(e));
+      }
+    },
+    [toast],
+  );
+
+  const togglePin = useCallback(
+    (ip: string) =>
+      setUi((u) => {
+        const list = Array.isArray(u.pinned) ? u.pinned : [];
+        return { ...u, pinned: list.includes(ip) ? list.filter((x) => x !== ip) : [...list, ip].slice(-MAX_PINNED) };
+      }),
+    [setUi],
+  );
+
+  const focusDrawer = useCallback((section: DrawerSection) => setDrawerFocus({ section, token: Date.now() }), []);
+
   // Removal (Delete / Backspace or the context menu) is immediate but undoable.
   const removeRow = useCallback(
     (key: string) => {
@@ -374,6 +494,7 @@ function Main() {
 
   const clearResults = useCallback(() => {
     store.clearResults();
+    clearTools();
     setSelectedKey(null);
     setEditing(null);
     setPortScans({});
@@ -407,18 +528,78 @@ function Main() {
     (row: DeviceRow, x: number, y: number) => {
       const ip = row.device.ip;
       const host = urlHost(ip);
+      // Detected web UIs (scan / "Grab Web Identity") first, with their real port and scheme.
+      const web = webTargets(row.device, webStore.get(row.key)?.result?.services).slice(0, 4);
+      const isPinned = pinned.includes(ip);
       setRowMenu({
         x,
         y,
         label: `Actions for ${ip}`,
         items: [
           { kind: "header", label: row.hostname || ip },
-          { kind: "item", label: `Open http://${host}`, icon: Globe, onSelect: () => openScheme(row, "http") },
-          { kind: "item", label: `Open https://${host}`, icon: Globe, onSelect: () => openScheme(row, "https") },
+          ...web.map(
+            (t): MenuItem => ({
+              kind: "item",
+              label: `Open Web UI ${t.url.replace(/\/$/, "")}`,
+              title: t.title ?? undefined,
+              icon: Globe,
+              onSelect: () => void openUrl(t.url),
+            }),
+          ),
+          ...(web.some((t) => t.scheme === "http" && t.port === 80) ? [] : [{ kind: "item", label: `Open http://${host}`, icon: Globe, onSelect: () => openScheme(row, "http") } as MenuItem]),
+          ...(web.some((t) => t.scheme === "https" && t.port === 443) ? [] : [{ kind: "item", label: `Open https://${host}`, icon: Globe, onSelect: () => openScheme(row, "https") } as MenuItem]),
           { kind: "item", label: "Open Custom URL…", icon: ExternalLink, onSelect: () => setCustomUrlFor(row) },
           { kind: "separator" },
           { kind: "item", label: "SSH", icon: Terminal, onSelect: () => openScheme(row, "ssh") },
           { kind: "item", label: "Telnet", icon: Terminal, onSelect: () => openScheme(row, "telnet") },
+          { kind: "separator" },
+          {
+            kind: "item",
+            label: "Wake on LAN",
+            icon: Power,
+            disabled: !row.device.mac,
+            title: row.device.mac ? `Send a magic packet to ${row.device.mac}` : "Needs the device's MAC address (only learned on the local subnet or from switch CAM tables)",
+            onSelect: () => wakeRow(row),
+          },
+          {
+            kind: "item",
+            label: "Trace Route",
+            icon: Route,
+            onSelect: () => {
+              openDetails(row.key);
+              setTraceToken(Date.now());
+              focusDrawer("trace");
+            },
+          },
+          {
+            kind: "item",
+            label: "iPerf3 Throughput Test",
+            icon: Gauge,
+            onSelect: () => {
+              openDetails(row.key);
+              setIperfToken(Date.now());
+              focusDrawer("iperf");
+            },
+          },
+          {
+            kind: "item",
+            label: "Grab Web Identity",
+            icon: Globe,
+            onSelect: () => {
+              openDetails(row.key);
+              focusDrawer("web");
+              void grabWeb(row);
+            },
+          },
+          {
+            kind: "check",
+            label: "Pin Live Latency",
+            checked: isPinned,
+            onSelect: () => {
+              togglePin(ip);
+              if (!isPinned && !ui.liveLatency) toast.push("info", `Pinned ${ip}`, "Turn on Live latency in the toolbar to start pinging.");
+            },
+          },
           { kind: "separator" },
           {
             kind: "item",
@@ -455,7 +636,7 @@ function Main() {
         ],
       });
     },
-    [openScheme, openDetails, runPortScan, querySnmp, startEdit, copy, removeRow],
+    [openScheme, openUrl, openDetails, runPortScan, querySnmp, startEdit, copy, removeRow, wakeRow, grabWeb, focusDrawer, togglePin, pinned, ui.liveLatency, toast],
   );
 
   // Topology map callbacks (stable identities keep the map from re-rendering needlessly).
@@ -562,6 +743,11 @@ function Main() {
         exportCount={filtered.length}
         drawerOpen={ui.drawerOpen}
         onToggleDrawer={() => patchUi({ drawerOpen: !ui.drawerOpen })}
+        liveLatency={ui.liveLatency}
+        onLiveLatency={(liveLatency) => patchUi({ liveLatency })}
+        latencyIntervalMs={ui.latencyIntervalMs}
+        onLatencyInterval={(latencyIntervalMs) => patchUi({ latencyIntervalMs })}
+        onWakeByMac={() => setWakeOpen(true)}
       />
       <FilterBar
         ref={searchRef}
@@ -607,6 +793,7 @@ function Main() {
                 onPassiveListen={passiveListen}
                 cdpLldp={settings.cdpLldp}
                 snmpEnabled={settings.snmpEnabled}
+                liveLatency={ui.liveLatency}
               />
             </Suspense>
           )}
@@ -625,6 +812,8 @@ function Main() {
               onCopyIp={(row) => void copy(row.device.ip, "IP address")}
               empty={empty}
               focusToken={focusToken}
+              autoColumns={autoColumns}
+              onViewport={ui.liveLatency ? onViewport : undefined}
             />
           )}
           {ui.view === "vlans" && (
@@ -660,6 +849,16 @@ function Main() {
             onCopy={(text, what) => void copy(text, what)}
             onSelectIp={selectIp}
             onClose={() => patchUi({ drawerOpen: false })}
+            liveLatency={ui.liveLatency}
+            onEnableLive={() => patchUi({ liveLatency: true })}
+            pinned={selectedIp !== null && pinned.includes(selectedIp)}
+            onTogglePin={() => selectedIp && togglePin(selectedIp)}
+            onWake={() => selectedRow && wakeRow(selectedRow)}
+            onGrabWeb={() => selectedRow && void grabWeb(selectedRow)}
+            onOpenWebUrl={(url) => void openUrl(url)}
+            traceToken={traceToken}
+            iperfToken={iperfToken}
+            focus={drawerFocus}
           />
         )}
       </div>
@@ -690,6 +889,7 @@ function Main() {
           onClose={() => setSnmpOpen(false)}
         />
       )}
+      {wakeOpen && <WakeDialog interfaces={interfaces} onWake={wake} onClose={() => setWakeOpen(false)} />}
       {customUrlFor && (
         <CustomUrlDialog
           ip={customUrlFor.device.ip}
