@@ -42,7 +42,9 @@ surge-ping = "0.9"
 libc = "0.2"
 
 # --- Infrastructure discovery & enrichment ---
-snmp2 = "0.5"
+# `heap_buffers` moves snmp2's two 64 KiB per-session scratch buffers off the stack onto the
+# heap, so polling many devices concurrently cannot overflow a worker thread's stack.
+snmp2 = { version = "0.5", features = ["heap_buffers"] }
 hickory-resolver = "0.26"
 mdns-sd = "0.21"
 

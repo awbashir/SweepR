@@ -12,6 +12,7 @@ use std::{
     fmt::Display,
     future::Future,
     io::{self, IsTerminal, Write},
+    net::IpAddr,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
@@ -27,13 +28,14 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, ContentArrangement, Table};
 use serde::Serialize;
 use sweepr_core::{
     arp_vlan::{self, L2Error, PassiveResults},
-    engine,
+    engine, enricher,
     export::{self, ExportFormat},
     models::{
-        parse_ports, sanitize_text, CdpLldpNeighbor, Device, InterfaceInfo, LogLevel, ScanConfig,
-        ScanEvent, ScanPhase, ScanSummary, SnmpConfig, VlanInfo, VlanSelection, VlanSource,
-        DEFAULT_PORTS, MAX_LISTEN_SECS,
+        parse_ports, sanitize_text, CdpLldpNeighbor, Device, DeviceOverride, InterfaceInfo,
+        LogLevel, ScanConfig, ScanEvent, ScanPhase, ScanSummary, SnmpConfig, SnmpDeviceInfo,
+        VlanInfo, VlanSelection, VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
     },
+    snmp_infra::SnmpClient,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -115,6 +117,8 @@ enum Command {
     Scan(ScanArgs),
     /// Passively discover VLANs and CDP/LLDP neighbors (switches, APs, firewalls)
     Vlans(VlansArgs),
+    /// Poll one device over SNMP: system info, VLAN table and MAC-to-port table
+    Snmp(SnmpArgs),
     /// List network interfaces with their kind, VLAN and addresses
     Interfaces,
 }
@@ -167,6 +171,10 @@ struct ScanArgs {
     #[arg(short, long, value_name = "PORTS", value_parser = parse_ports_arg)]
     ports: Option<PortList>,
 
+    /// Do not resolve DNS / mDNS / NetBIOS names
+    #[arg(long)]
+    no_resolve: bool,
+
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -211,6 +219,39 @@ struct VlansArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SnmpOutput {
+    Table,
+    Json,
+}
+
+#[derive(Args, Debug)]
+struct SnmpArgs {
+    /// Device IP address to poll
+    #[arg(value_name = "IP")]
+    ip: String,
+
+    /// SNMP v2c community string
+    #[arg(long, value_name = "COMMUNITY", default_value = "public")]
+    snmp_community: String,
+
+    /// UDP port
+    #[arg(long, value_name = "PORT", default_value_t = 161)]
+    snmp_port: u16,
+
+    /// Per-request timeout in milliseconds
+    #[arg(long, value_name = "MS", default_value_t = 2000)]
+    timeout_ms: u64,
+
+    /// Retries per request
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    retries: u8,
+
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = SnmpOutput::Table)]
+    output: SnmpOutput,
+}
+
 fn parse_vlan_arg(s: &str) -> Result<VlanSelection, String> {
     s.parse()
         .map_err(|e: sweepr_core::models::ModelError| e.to_string())
@@ -221,24 +262,6 @@ fn parse_ports_arg(s: &str) -> Result<PortList, String> {
 }
 
 impl ScanArgs {
-    /// Warnings for options that are accepted but not acted on yet.
-    fn deferred_feature_warnings(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if self.ports.is_some() {
-            out.push(
-                "-p/--ports is accepted, but TCP port probing arrives in a later release; no \
-                 ports will be scanned",
-            );
-        }
-        if self.snmp_community.is_some() {
-            out.push(
-                "--snmp-community is accepted, but SNMP polling arrives in a later release; no \
-                 SNMP queries will be sent",
-            );
-        }
-        out
-    }
-
     fn to_config(&self) -> ScanConfig {
         ScanConfig {
             interface: self.interface.clone(),
@@ -252,7 +275,7 @@ impl ScanArgs {
                 .ports
                 .clone()
                 .map_or_else(|| DEFAULT_PORTS.to_vec(), |p| p.0),
-            resolve_names: true,
+            resolve_names: !self.no_resolve,
             timeout_ms: self.timeout_ms,
             retries: self.retries,
             rate_pps: self.rate_pps,
@@ -315,6 +338,7 @@ async fn run_cli(command: Command) -> ExitCode {
     let result = match command {
         Command::Scan(args) => cmd_scan(args, cancel.clone()).await,
         Command::Vlans(args) => cmd_vlans(args, cancel.clone()).await,
+        Command::Snmp(args) => cmd_snmp(args, cancel.clone()).await,
         Command::Interfaces => cmd_interfaces().await,
     };
     match result {
@@ -598,9 +622,6 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
     }
     let cfg = args.to_config();
     cfg.validate()?;
-    for w in args.deferred_feature_warnings() {
-        diag!("warning: {w}");
-    }
 
     let (tx, mut rx) = mpsc::channel(1024);
     let scan = tokio::spawn(engine::run_scan(cfg, tx, cancel.clone()));
@@ -720,6 +741,101 @@ async fn cmd_vlans(args: VlansArgs, cancel: CancellationToken) -> Result<()> {
         print_summary(&s);
     }
     Ok(())
+}
+
+async fn cmd_snmp(args: SnmpArgs, cancel: CancellationToken) -> Result<()> {
+    let ip: IpAddr = args
+        .ip
+        .parse()
+        .with_context(|| format!("'{}' is not an IP address", args.ip))?;
+    let cfg = SnmpConfig {
+        port: args.snmp_port,
+        timeout_ms: args.timeout_ms.clamp(1, MAX_TIMEOUT_MS),
+        retries: args.retries,
+        ..SnmpConfig::v2c(&args.snmp_community)
+    };
+    let client = SnmpClient::new(cfg);
+    let info = tokio::select! {
+        _ = cancel.cancelled() => return Ok(()),
+        res = client.poll_device(ip) => res.with_context(|| format!("SNMP poll of {ip} failed"))?,
+    };
+
+    if args.output == SnmpOutput::Json {
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &info)?;
+        writeln!(out)?;
+        out.flush()?;
+        return Ok(());
+    }
+
+    let opt = |s: &Option<String>| s.as_deref().map(sanitize_text).unwrap_or_default();
+    let mut sys = new_table(["Field", "Value"]);
+    sys.add_row(["IP".to_string(), ip.to_string()]);
+    sys.add_row(["sysName".to_string(), opt(&info.sys_name)]);
+    sys.add_row(["sysDescr".to_string(), opt(&info.sys_descr)]);
+    sys.add_row(["sysObjectID".to_string(), opt(&info.sys_object_id)]);
+    sys.add_row([
+        "sysUpTime".to_string(),
+        info.sys_uptime_ticks
+            .map(|t| format!("{} ({} ticks)", format_uptime(t), t))
+            .unwrap_or_default(),
+    ]);
+    sys.add_row(["Role".to_string(), info.role.label().to_string()]);
+    let mut text = format!("System\n{sys}\n");
+
+    if info.vlans.is_empty() {
+        text.push_str("\nNo VLANs reported over SNMP.\n");
+    } else {
+        text.push_str(&format!("\nVLANs\n{}\n", render_vlan_table(&info.vlans)));
+    }
+
+    if info.port_mappings.is_empty() {
+        text.push_str("\nNo MAC-to-port entries reported over SNMP.\n");
+    } else {
+        let mut t = new_table(["VLAN", "MAC", "Port", "ifIndex"]);
+        for pm in &info.port_mappings {
+            t.add_row([
+                pm.vlan_id.map(|v| v.to_string()).unwrap_or_default(),
+                sanitize_text(&pm.mac),
+                sanitize_text(&pm.port_name),
+                pm.port_index.map(|i| i.to_string()).unwrap_or_default(),
+            ]);
+        }
+        text.push_str(&format!("\nMAC address table\n{t}\n"));
+        // Ports learning many MACs are likely uplinks/trunks, not endpoints.
+        let busy: Vec<&_> = info
+            .port_mac_counts
+            .iter()
+            .filter(|c| c.mac_count >= 10)
+            .collect();
+        if !busy.is_empty() {
+            let mut t = new_table(["Port", "MAC count"]);
+            for c in busy {
+                t.add_row([sanitize_text(&c.port_name), c.mac_count.to_string()]);
+            }
+            text.push_str(&format!(
+                "\nPorts learning many MACs (likely uplinks/trunks)\n{t}\n"
+            ));
+        }
+    }
+    write_stdout(text.trim_end())?;
+    Ok(())
+}
+
+/// Render SNMP sysUpTime (hundredths of a second) as `Nd HH:MM:SS`.
+fn format_uptime(ticks: u32) -> String {
+    let secs = u64::from(ticks) / 100;
+    let (d, h, m, s) = (
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d {h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
+    }
 }
 
 async fn cmd_interfaces() -> Result<()> {
@@ -996,6 +1112,61 @@ async fn export_devices(
     Ok(Some(written.display().to_string()))
 }
 
+/// Largest port count a single `scan_ports` command accepts (GUI drawer input bound).
+const SCAN_PORTS_CAP: usize = 4096;
+
+/// Load the local device-override store (keyed by `Device::key()`); empty when none exist.
+#[tauri::command]
+async fn load_overrides() -> HashMap<String, DeviceOverride> {
+    tauri::async_runtime::spawn_blocking(enricher::load_overrides)
+        .await
+        .unwrap_or_default()
+}
+
+/// Insert / update / clear one device override, persisting it atomically. A field set to
+/// `null` (or whitespace-only) clears it; clearing both removes the entry.
+#[tauri::command]
+async fn save_override(
+    key: String,
+    hostname: Option<String>,
+    comments: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || enricher::save_override(key, hostname, comments))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// TCP connect scan of `ports` on `ip` for the GUI details drawer. Validates the address and
+/// caps the number of ports.
+#[tauri::command]
+async fn scan_ports(ip: String, ports: Vec<u16>) -> Result<Vec<u16>, String> {
+    let ip: IpAddr = ip
+        .parse()
+        .map_err(|_| format!("'{ip}' is not an IP address"))?;
+    if ports.len() > SCAN_PORTS_CAP {
+        return Err(format!("too many ports (max {SCAN_PORTS_CAP})"));
+    }
+    let cancel = CancellationToken::new();
+    Ok(enricher::scan_ports(ip, &ports, 128, Duration::from_millis(800), &cancel).await)
+}
+
+/// Poll one device over SNMP for the GUI details drawer. `snmp` defaults to the v2c `public`
+/// community when omitted.
+#[tauri::command]
+async fn query_snmp(ip: String, snmp: Option<SnmpConfig>) -> Result<SnmpDeviceInfo, String> {
+    let ip: IpAddr = ip
+        .parse()
+        .map_err(|_| format!("'{ip}' is not an IP address"))?;
+    let cfg = snmp.unwrap_or_default();
+    cfg.validate().map_err(|e| e.to_string())?;
+    SnmpClient::new(cfg)
+        .poll_device(ip)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 fn run_gui() -> ExitCode {
     sweepr_core::init_tracing();
     let result = tauri::Builder::default()
@@ -1007,7 +1178,11 @@ fn run_gui() -> ExitCode {
             start_scan,
             stop_scan,
             start_vlan_discovery,
-            export_devices
+            export_devices,
+            load_overrides,
+            save_override,
+            scan_ports,
+            query_snmp
         ])
         .run(tauri::generate_context!());
     match result {
@@ -1135,20 +1310,37 @@ mod tests {
     }
 
     #[test]
-    fn deferred_features_warn() {
-        let cli = Cli::try_parse_from(["sweepr", "scan", "-p", "22", "--snmp-community", "public"])
-            .unwrap();
+    fn no_resolve_flag_disables_name_resolution() {
+        let cli = Cli::try_parse_from(["sweepr", "scan", "--no-resolve"]).unwrap();
         let Some(Command::Scan(args)) = cli.command else {
             panic!("expected scan")
         };
-        let w = args.deferred_feature_warnings();
-        assert_eq!(w.len(), 2);
-        assert!(w[0].contains("--ports") && w[1].contains("--snmp-community"));
+        assert!(!args.to_config().resolve_names);
         let cli = Cli::try_parse_from(["sweepr", "scan"]).unwrap();
         let Some(Command::Scan(args)) = cli.command else {
             panic!("expected scan")
         };
-        assert!(args.deferred_feature_warnings().is_empty());
+        assert!(args.to_config().resolve_names);
+    }
+
+    #[test]
+    fn snmp_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "sweepr",
+            "snmp",
+            "10.0.0.1",
+            "--snmp-community",
+            "private",
+            "-o",
+            "json",
+        ])
+        .unwrap();
+        let Some(Command::Snmp(args)) = cli.command else {
+            panic!("expected snmp")
+        };
+        assert_eq!(args.ip, "10.0.0.1");
+        assert_eq!(args.snmp_community, "private");
+        assert_eq!(args.output, SnmpOutput::Json);
     }
 
     #[test]

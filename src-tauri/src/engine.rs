@@ -8,6 +8,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::IpAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,14 +18,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     arp_vlan::{self, L2Error, PassiveResults},
+    enricher,
     models::{
-        CdpLldpNeighbor, Device, DiscoverySource, InterfaceInfo, InterfaceKind, Ipv4Range,
-        NeighborProtocol, ScanConfig, ScanEvent, ScanPhase, ScanProgress, ScanSummary, VlanInfo,
-        VlanSource, MAX_LISTEN_SECS,
+        normalize_mac, CdpLldpNeighbor, Device, DeviceOverride, DiscoverySource, InterfaceInfo,
+        InterfaceKind, Ipv4Range, NeighborProtocol, ScanConfig, ScanEvent, ScanPhase, ScanProgress,
+        ScanSummary, SwitchPortMapping, VlanInfo, VlanSource, MAX_LISTEN_SECS,
     },
     progress::{ProgressCounter, ProgressScope},
-    sweep,
+    snmp_infra, sweep,
 };
+
+/// Shared, read-only map of user device overrides applied to every emitted [`Device`].
+type Overrides = Arc<HashMap<String, DeviceOverride>>;
 
 /// Interval of combined progress events while probing.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -179,6 +184,8 @@ pub struct Aggregate {
     neighbors_by_ip: HashMap<IpAddr, BTreeSet<String>>,
     devices_by_mac: HashMap<String, BTreeSet<String>>,
     devices_by_ip: HashMap<IpAddr, BTreeSet<String>>,
+    /// Latest SNMP MAC-to-switch-port mapping for each endpoint MAC (canonical lowercase).
+    port_mappings_by_mac: HashMap<String, SwitchPortMapping>,
     neighbor_limit_warned: bool,
 }
 
@@ -275,12 +282,39 @@ impl Aggregate {
         key
     }
 
-    /// Re-index a device after it changed and apply the neighbors that now match it.
+    /// Re-index a device after it changed and apply the neighbors (and any known switch-port
+    /// mapping) that now match it.
     fn refresh_device(&mut self, key: &str) {
         self.index_device(key);
         if let Some(mut dev) = self.devices.remove(key) {
             self.apply_neighbors(&mut dev);
+            self.apply_port_mapping(&mut dev);
             self.devices.insert(key.to_string(), dev);
+        }
+    }
+
+    /// Fill in `dev.switch_port` from a stored SNMP mapping that matches its MAC.
+    fn apply_port_mapping(&self, dev: &mut Device) {
+        if dev.switch_port.is_some() {
+            return;
+        }
+        if let Some(mac) = &dev.mac {
+            if let Some(pm) = self.port_mappings_by_mac.get(mac) {
+                dev.switch_port = Some(pm.clone());
+            }
+        }
+    }
+
+    /// Rebuild the lookup indexes for a pre-populated state (used to seed the enrichment pass
+    /// with the devices, neighbors and VLANs discovery already found).
+    fn reindex(&mut self) {
+        let keys: Vec<String> = self.devices.keys().cloned().collect();
+        for key in &keys {
+            self.index_device(key);
+        }
+        let neighbors: Vec<CdpLldpNeighbor> = self.neighbors.values().cloned().collect();
+        for n in &neighbors {
+            self.index_neighbor(n, true);
         }
     }
 
@@ -352,26 +386,45 @@ fn apply_neighbor(dev: &mut Device, n: &CdpLldpNeighbor) -> bool {
     before != (dev.role, dev.neighbor.clone(), dev.sources.len())
 }
 
+/// Clone `dev`, apply any user override, and forward it as a `device` event.
+async fn send_device(out: &Sender<ScanEvent>, overrides: &Overrides, dev: &Device) {
+    let mut dev = dev.clone();
+    enricher::apply_override(&mut dev, overrides);
+    let _ = out.send(ScanEvent::device(dev)).await;
+}
+
 /// Consume engine-internal events, merge them and forward the merged view to `out`.
 ///
+/// Starts from `state` (empty for discovery, the discovery result when seeding enrichment)
+/// and applies `overrides` to every emitted device.
+///
 /// * IPv6 observations are held back until the end and folded into the IPv4 row with the
-///   same MAC and VLAN (as `extraIps`), so the stream never shows a row that later
-///   disappears. When several IPv4 rows share that MAC (multi-homed hosts, proxy ARP), the
-///   lowest IPv4 address wins, so the result does not depend on hash order.
+///   same MAC and VLAN (as `extraIps`) when `fold_ipv6` is set, so the discovery stream never
+///   shows a row that later disappears. When several IPv4 rows share that MAC (multi-homed
+///   hosts, proxy ARP), the lowest IPv4 address wins, so the result does not depend on hash
+///   order. The enrichment pass sets `fold_ipv6 = false`: rows already exist, so updates are
+///   upserted directly.
 /// * Neighbor events are forwarded only when new or changed, and at most
 ///   [`arp_vlan::MAX_NEIGHBORS`] are kept.
 /// * VLAN events are cumulative snapshots ([`VlanInfo::merge_snapshot`]); unchanged ones
 ///   are not forwarded.
+/// * PortMapping events set `switchPort` on the matching (by MAC) device rows.
 /// * Progress events get the current device count.
-async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggregate {
-    let mut state = Aggregate::default();
+async fn aggregate(
+    mut state: Aggregate,
+    overrides: Overrides,
+    fold_ipv6: bool,
+    mut rx: Receiver<ScanEvent>,
+    out: Sender<ScanEvent>,
+) -> Aggregate {
+    state.reindex();
     let mut pending_v6: HashMap<String, Device> = HashMap::new();
 
     while let Some(ev) = rx.recv().await {
         match ev {
             ScanEvent::Device(d) => {
                 let d = *d;
-                if d.ip.is_ipv6() {
+                if fold_ipv6 && d.ip.is_ipv6() {
                     pending_v6
                         .entry(d.key())
                         .and_modify(|e| e.merge(&d))
@@ -379,9 +432,8 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
                     continue;
                 }
                 let key = state.upsert_device(d);
-                let _ = out
-                    .send(ScanEvent::device(state.devices[&key].clone()))
-                    .await;
+                let dev = state.devices[&key].clone();
+                send_device(&out, &overrides, &dev).await;
             }
             ScanEvent::Neighbor(n) => {
                 match state.upsert_neighbor(&n) {
@@ -401,13 +453,41 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
                 }
                 let _ = out.send(ScanEvent::Neighbor(n.clone())).await;
                 for key in state.device_keys_for(&n) {
-                    let Some(dev) = state.devices.get_mut(&key) else {
-                        continue;
-                    };
-                    if apply_neighbor(dev, &n) {
-                        let _ = out.send(ScanEvent::device(dev.clone())).await;
+                    let changed = state
+                        .devices
+                        .get_mut(&key)
+                        .is_some_and(|dev| apply_neighbor(dev, &n));
+                    if changed {
+                        let dev = state.devices[&key].clone();
+                        send_device(&out, &overrides, &dev).await;
                     }
                 }
+            }
+            ScanEvent::PortMapping(pm) => {
+                let mac = normalize_mac(&pm.mac).unwrap_or_else(|| pm.mac.clone());
+                state.port_mappings_by_mac.insert(mac.clone(), pm.clone());
+                // Apply to every device that currently carries this MAC.
+                let keys: Vec<String> = state
+                    .devices_by_mac
+                    .get(&mac)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                for key in keys {
+                    let changed = state.devices.get_mut(&key).is_some_and(|dev| {
+                        if dev.switch_port.is_none() {
+                            dev.switch_port = Some(pm.clone());
+                            dev.add_source(DiscoverySource::Snmp);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if changed {
+                        let dev = state.devices[&key].clone();
+                        send_device(&out, &overrides, &dev).await;
+                    }
+                }
+                let _ = out.send(ScanEvent::PortMapping(pm)).await;
             }
             ScanEvent::Vlan(v) => {
                 let merged = match state.vlans.get_mut(&v.id) {
@@ -465,9 +545,8 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
             }
             None => state.upsert_device(d6),
         };
-        let _ = out
-            .send(ScanEvent::device(state.devices[&key].clone()))
-            .await;
+        let dev = state.devices[&key].clone();
+        send_device(&out, &overrides, &dev).await;
     }
     state
 }
@@ -508,10 +587,13 @@ fn range_count(r: &[Ipv4Range]) -> u64 {
 /// [`ScanEvent::Finished`] on success; returns the summary.
 ///
 /// Progress events report one combined, monotonic `probesSent / probesTotal` for all
-/// probing subsystems (L2 jobs, routed ICMP sweep, ICMP fallback).
+/// probing subsystems (L2 jobs, routed ICMP sweep, ICMP fallback, enrichment).
 ///
-/// SNMP polling, name resolution and port scanning settings are accepted but not acted on
-/// by this engine version.
+/// After discovery, an enrichment phase ([`ScanPhase::Enriching`]) resolves names
+/// (DNS/mDNS/NetBIOS), scans TCP ports, fills vendors from the embedded OUI database and —
+/// when `cfg.snmp` is set — polls infrastructure over SNMP and maps endpoint MACs to switch
+/// ports, honouring cancellation throughout. User overrides are applied to every emitted
+/// device.
 pub async fn run_scan(
     cfg: ScanConfig,
     tx: Sender<ScanEvent>,
@@ -519,6 +601,7 @@ pub async fn run_scan(
 ) -> Result<ScanSummary> {
     let started = Instant::now();
     cfg.validate()?;
+    let overrides: Overrides = Arc::new(enricher::load_overrides());
     let all = interfaces().await?;
     let iface = arp_vlan::select_interface(&all, cfg.interface.as_deref())?;
     let explicit_range = cfg.range.is_some();
@@ -533,7 +616,13 @@ pub async fn run_scan(
     };
 
     let (itx, irx) = mpsc::channel(EVENT_BUFFER);
-    let aggregator = tokio::spawn(aggregate(irx, tx.clone()));
+    let aggregator = tokio::spawn(aggregate(
+        Aggregate::default(),
+        overrides.clone(),
+        true,
+        irx,
+        tx.clone(),
+    ));
     let _ = itx.send(progress(ScanPhase::Preparing, None)).await;
     let _ = itx
         .send(ScanEvent::info(format!(
@@ -681,6 +770,12 @@ pub async fn run_scan(
 
     drop(itx);
     let state = aggregator.await.context("event aggregator crashed")?;
+
+    // Enrichment phase: DNS/mDNS/NetBIOS names, TCP ports, OUI vendors and SNMP infrastructure
+    // polling with endpoint-to-switch-port mapping. Seeds a second aggregator with the
+    // discovery result so updates upsert onto the existing rows.
+    let state = run_enrichment(state, &cfg, &counter, overrides, &tx, &cancel).await?;
+
     let summary = ScanSummary {
         devices: state.devices.len() as u64,
         vlans: state.vlans.len() as u64,
@@ -699,6 +794,111 @@ pub async fn run_scan(
         .await;
     let _ = tx.send(ScanEvent::Finished(summary.clone())).await;
     Ok(summary)
+}
+
+/// Run the enrichment phase on the discovery result and return the enriched state.
+///
+/// Enrichment runs when name resolution, port scanning or SNMP is requested. A second
+/// aggregator is seeded with `state` so every enrichment update (sparse device snapshots,
+/// SNMP VLANs / port mappings / role) upserts onto the discovery rows and streams the merged
+/// result to `tx`. Returns `state` unchanged when there is nothing to do or the scan was
+/// cancelled before enrichment began.
+async fn run_enrichment(
+    state: Aggregate,
+    cfg: &ScanConfig,
+    counter: &ProgressCounter,
+    overrides: Overrides,
+    tx: &Sender<ScanEvent>,
+    cancel: &CancellationToken,
+) -> Result<Aggregate> {
+    let wants_snmp = cfg.snmp.is_some();
+    let wants_enrich = cfg.resolve_names || !cfg.ports.is_empty();
+    let devices = state.sorted_devices();
+    if cancel.is_cancelled() || devices.is_empty() || !(wants_snmp || wants_enrich) {
+        return Ok(state);
+    }
+
+    // Candidates for SNMP: every responsive host's primary IP (the user opted in by setting a
+    // community / credentials). Bounded, de-duplicated.
+    let snmp_candidates: Vec<IpAddr> = if wants_snmp {
+        devices
+            .iter()
+            .map(|d| d.ip)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let enrich_scope = counter.scope(if wants_enrich {
+        devices.len() as u64
+    } else {
+        0
+    });
+    let snmp_scope = counter.scope(snmp_candidates.len() as u64);
+
+    let (etx, erx) = mpsc::channel(EVENT_BUFFER);
+    let aggregator = tokio::spawn(aggregate(state, overrides, false, erx, tx.clone()));
+    let _ = etx
+        .send(progress(ScanPhase::Enriching, Some(counter)))
+        .await;
+
+    // Periodic progress while enrichment runs.
+    let ticker_stop = CancellationToken::new();
+    let ticker = {
+        let (etx, counter, stop) = (etx.clone(), counter.clone(), ticker_stop.clone());
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(PROGRESS_INTERVAL);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = every.tick() => {
+                        let _ = etx.try_send(progress(ScanPhase::Enriching, Some(&counter)));
+                    }
+                }
+            }
+        })
+    };
+
+    if wants_enrich {
+        enricher::enrich_devices(
+            devices.clone(),
+            cfg,
+            etx.clone(),
+            cancel.clone(),
+            enrich_scope.clone(),
+        )
+        .await;
+    }
+    enrich_scope.finish();
+
+    if wants_snmp && !cancel.is_cancelled() {
+        if let Some(snmp) = &cfg.snmp {
+            let version = match snmp.version {
+                crate::models::SnmpVersion::V1 => "v1",
+                crate::models::SnmpVersion::V2c => "v2c",
+                crate::models::SnmpVersion::V3 => "v3",
+            };
+            let _ = etx
+                .send(ScanEvent::info(format!(
+                    "SNMP: polling {} candidate host(s) over SNMP{version}",
+                    snmp_candidates.len(),
+                )))
+                .await;
+            snmp_infra::probe_candidates(snmp_candidates, snmp, etx.clone(), cancel.clone()).await;
+        }
+    }
+    snmp_scope.finish();
+
+    ticker_stop.cancel();
+    let _ = ticker.await;
+    let _ = etx
+        .send(progress(ScanPhase::Enriching, Some(counter)))
+        .await;
+    drop(etx);
+    aggregator.await.context("enrichment aggregator crashed")
 }
 
 /// An L2 job whose targets are swept with ICMP instead (raw access unavailable).
@@ -891,6 +1091,10 @@ mod tests {
     use super::*;
     use crate::models::{Capability, DeviceRole, IfAddr, InterfaceKind};
 
+    fn test_overrides() -> Overrides {
+        Arc::new(HashMap::new())
+    }
+
     fn iface(name: &str, addr: &str, prefix: u8) -> InterfaceInfo {
         InterfaceInfo {
             name: name.into(),
@@ -1008,7 +1212,13 @@ mod tests {
     async fn aggregator_merges_devices_neighbors_and_ipv6() {
         let (itx, irx) = mpsc::channel(64);
         let (otx, mut orx) = mpsc::channel(256);
-        let agg = tokio::spawn(aggregate(irx, otx));
+        let agg = tokio::spawn(aggregate(
+            Aggregate::default(),
+            test_overrides(),
+            true,
+            irx,
+            otx,
+        ));
 
         let mut a = Device::new("10.0.0.2".parse().unwrap());
         a.mac = Some("aa:aa:aa:aa:aa:01".into());
@@ -1080,7 +1290,13 @@ mod tests {
     async fn vlan_snapshots_are_not_double_counted() {
         let (itx, irx) = mpsc::channel(64);
         let (otx, mut orx) = mpsc::channel(256);
-        let agg = tokio::spawn(aggregate(irx, otx));
+        let agg = tokio::spawn(aggregate(
+            Aggregate::default(),
+            test_overrides(),
+            true,
+            irx,
+            otx,
+        ));
         let snap = |frames: u64| {
             let mut v = VlanInfo::new(30, VlanSource::Tagged8021q);
             v.frames_seen = frames;
@@ -1106,7 +1322,13 @@ mod tests {
         for _ in 0..20 {
             let (itx, irx) = mpsc::channel(64);
             let (otx, _orx) = mpsc::channel(256);
-            let agg = tokio::spawn(aggregate(irx, otx));
+            let agg = tokio::spawn(aggregate(
+                Aggregate::default(),
+                test_overrides(),
+                true,
+                irx,
+                otx,
+            ));
             // Proxy-ARP style: several IPv4 rows share one MAC.
             for ip in ["10.0.0.30", "10.0.0.4", "10.0.0.200", "10.0.0.17"] {
                 let mut d = Device::new(ip.parse().unwrap());
@@ -1137,7 +1359,13 @@ mod tests {
     async fn neighbors_are_deduplicated_and_indexed() {
         let (itx, irx) = mpsc::channel(64);
         let (otx, mut orx) = mpsc::channel(256);
-        let agg = tokio::spawn(aggregate(irx, otx));
+        let agg = tokio::spawn(aggregate(
+            Aggregate::default(),
+            test_overrides(),
+            true,
+            irx,
+            otx,
+        ));
         let n = switch_neighbor("cc:cc:cc:cc:cc:cc", "10.0.0.9");
         itx.send(ScanEvent::Neighbor(n.clone())).await.unwrap();
         let mut again = n.clone();
@@ -1175,10 +1403,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn port_mapping_is_applied_to_matching_device() {
+        let (itx, irx) = mpsc::channel(64);
+        let (otx, mut orx) = mpsc::channel(256);
+        let agg = tokio::spawn(aggregate(
+            Aggregate::default(),
+            test_overrides(),
+            false,
+            irx,
+            otx,
+        ));
+        let mut d = Device::new("10.0.0.40".parse().unwrap());
+        d.mac = Some("aa:bb:cc:00:11:22".into());
+        itx.send(ScanEvent::device(d)).await.unwrap();
+        let pm = SwitchPortMapping {
+            switch_name: "core-sw-01".into(),
+            switch_ip: Some("10.0.0.1".parse().unwrap()),
+            port_name: "Gi1/0/24".into(),
+            port_index: Some(10024),
+            vlan_id: Some(20),
+            mac: "AA:BB:CC:00:11:22".into(), // different case: must still match
+        };
+        itx.send(ScanEvent::PortMapping(pm)).await.unwrap();
+        drop(itx);
+        let state = agg.await.unwrap();
+        let dev = &state.devices["10.0.0.40"];
+        assert_eq!(dev.switch_port.as_ref().unwrap().port_name, "Gi1/0/24");
+        assert!(dev.sources.contains(&DiscoverySource::Snmp));
+        // A device learned *after* the mapping also picks it up.
+        let events = drain(&mut orx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Device(d) if d.switch_port.is_some())));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::PortMapping(_))));
+    }
+
+    #[tokio::test]
+    async fn overrides_are_applied_to_emitted_devices() {
+        let (itx, irx) = mpsc::channel(64);
+        let (otx, mut orx) = mpsc::channel(256);
+        let mut ov = HashMap::new();
+        ov.insert(
+            "10.0.0.7".to_string(),
+            DeviceOverride {
+                hostname: Some("edge-fw".into()),
+                comments: Some("rack 2".into()),
+            },
+        );
+        let agg = tokio::spawn(aggregate(
+            Aggregate::default(),
+            Arc::new(ov),
+            true,
+            irx,
+            otx,
+        ));
+        itx.send(ScanEvent::device(Device::new("10.0.0.7".parse().unwrap())))
+            .await
+            .unwrap();
+        drop(itx);
+        let _ = agg.await.unwrap();
+        let events = drain(&mut orx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ScanEvent::Device(d) if d.hostname.as_deref() == Some("edge-fw")
+                && d.comments.as_deref() == Some("rack 2")
+        )));
+    }
+
+    #[tokio::test]
     async fn neighbor_table_is_capped() {
         let (itx, irx) = mpsc::channel(64);
         let (otx, mut orx) = mpsc::channel(64);
-        let agg = tokio::spawn(aggregate(irx, otx));
+        let agg = tokio::spawn(aggregate(
+            Aggregate::default(),
+            test_overrides(),
+            true,
+            irx,
+            otx,
+        ));
         let drain_task = tokio::spawn(async move {
             let mut warns = 0;
             while let Some(ev) = orx.recv().await {

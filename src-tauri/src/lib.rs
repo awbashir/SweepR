@@ -2,9 +2,11 @@
 
 pub mod arp_vlan;
 pub mod engine;
+pub mod enricher;
 pub mod export;
 pub mod models;
 pub mod progress;
+pub mod snmp_infra;
 pub mod sweep;
 
 /// Install a `tracing` subscriber writing to stderr. The filter comes from `RUST_LOG`
