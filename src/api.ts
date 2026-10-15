@@ -8,11 +8,19 @@ import type {
   Device,
   ExportFormat,
   InterfaceInfo,
+  IperfAvailability,
+  IperfOptions,
+  IperfUpdate,
+  LatencyUpdate,
   Overrides,
   ScanConfig,
   ScanEventPayload,
   SnmpConfig,
   SnmpDeviceInfo,
+  TraceUpdate,
+  WakeOptions,
+  WakeResult,
+  WebIdentity,
 } from "./types.ts";
 import { createMockBackend } from "./mock.ts";
 
@@ -31,6 +39,20 @@ export interface Backend {
   /** Subscribe to `scan-event`; resolves to an unsubscribe function. */
   onScanEvent(handler: (payload: ScanEventPayload) => void): Promise<() => void>;
   openUrl(url: string): Promise<void>;
+
+  // Network utilities (independent of scans).
+  wakeDevice(mac: string, opts?: WakeOptions): Promise<WakeResult>;
+  startLatencyMonitor(ips: string[], intervalMs?: number | null, tcpPorts?: Record<string, number[]> | null): Promise<number>;
+  stopLatencyMonitor(monitorId: number): Promise<boolean>;
+  onLatencyUpdate(handler: (u: LatencyUpdate) => void): Promise<() => void>;
+  startTrace(ip: string, maxHops?: number | null, rounds?: number | null): Promise<number>;
+  stopTrace(traceId: number): Promise<boolean>;
+  onTraceUpdate(handler: (u: TraceUpdate) => void): Promise<() => void>;
+  grabWebIdentity(ip: string, ports?: number[] | null): Promise<WebIdentity>;
+  iperfAvailable(): Promise<IperfAvailability>;
+  startIperf(ip: string, options?: IperfOptions | null): Promise<number>;
+  stopIperf(runId: number): Promise<boolean>;
+  onIperfUpdate(handler: (u: IperfUpdate) => void): Promise<() => void>;
 }
 
 /** Tauri command errors are plain strings; everything else is normalized to one. */
@@ -63,6 +85,27 @@ function createTauriBackend(): Backend {
     querySnmp: (ip, snmp) => invoke<SnmpDeviceInfo>("query_snmp", { ip, snmp }),
     onScanEvent: (handler) => listen<ScanEventPayload>("scan-event", (e) => handler(e.payload)),
     openUrl: (url) => tauriOpenUrl(url),
+    wakeDevice: (mac, o) =>
+      invoke<WakeResult>("wake_device", {
+        mac,
+        interface: o?.interface ?? null,
+        broadcast: o?.broadcast ?? null,
+        port: o?.port ?? null,
+        repeat: o?.repeat ?? null,
+        password: o?.password ?? null,
+      }),
+    startLatencyMonitor: (ips, intervalMs, tcpPorts) =>
+      invoke<number>("start_latency_monitor", { ips, intervalMs: intervalMs ?? null, tcpPorts: tcpPorts ?? null }),
+    stopLatencyMonitor: (monitorId) => invoke<boolean>("stop_latency_monitor", { monitorId }),
+    onLatencyUpdate: (handler) => listen<LatencyUpdate>("latency-update", (e) => handler(e.payload)),
+    startTrace: (ip, maxHops, rounds) => invoke<number>("start_trace", { ip, maxHops: maxHops ?? null, rounds: rounds ?? null }),
+    stopTrace: (traceId) => invoke<boolean>("stop_trace", { traceId }),
+    onTraceUpdate: (handler) => listen<TraceUpdate>("trace-update", (e) => handler(e.payload)),
+    grabWebIdentity: (ip, ports) => invoke<WebIdentity>("grab_web_identity", { ip, ports: ports ?? null }),
+    iperfAvailable: () => invoke<IperfAvailability>("iperf_available"),
+    startIperf: (ip, options) => invoke<number>("start_iperf", { ip, options: options ?? null }),
+    stopIperf: (runId) => invoke<boolean>("stop_iperf", { runId }),
+    onIperfUpdate: (handler) => listen<IperfUpdate>("iperf-update", (e) => handler(e.payload)),
   };
 }
 

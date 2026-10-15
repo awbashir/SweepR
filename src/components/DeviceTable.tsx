@@ -25,10 +25,15 @@ import {
   type VisibilityState,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowDown, ArrowUp, RotateCw } from "lucide-react";
+import { ArrowDown, ArrowUp, RotateCw, ShieldAlert, ShieldX, TriangleAlert } from "lucide-react";
 import type { DeviceRow } from "../lib/store.ts";
 import { MAX_OVERRIDE_LEN, ROLE_LABEL } from "../types.ts";
 import { usePersistentState } from "../hooks/usePersistentState.ts";
+import { formatLoss, formatMs, lossTone, type Tone } from "../lib/latency.ts";
+import { certSortKey, classifyCert } from "../lib/webid.ts";
+import { completeOrder, effectiveVisibility, type AutoColumns } from "../lib/columns.ts";
+import { latencyStore, useLatency } from "../tools.ts";
+import { Sparkline } from "./Charts.tsx";
 import { ContextMenu, type MenuItem } from "./Menu.tsx";
 import { RoleIcon, cx } from "./ui.tsx";
 
@@ -48,6 +53,12 @@ export type ColId =
   | "smb"
   | "smbDomain"
   | "ports"
+  | "latency"
+  | "loss"
+  | "webTitle"
+  | "webIdentity"
+  | "certCn"
+  | "certExpires"
   | "comments";
 
 export type EditField = "hostname" | "comments";
@@ -65,6 +76,8 @@ export const COL_META: Record<ColId, ColMeta> = {
   mac: { label: "MAC Address", size: 140, align: "left", mono: true },
   vlan: { label: "VLAN ID", size: 74, align: "right" },
   role: { label: "Device Role", size: 108, align: "left" },
+  latency: { label: "Latency", size: 180, align: "left" },
+  loss: { label: "Loss %", size: 64, align: "right" },
   hostname: { label: "Hostname", size: 150, align: "left" },
   vendor: { label: "Vendor", size: 160, align: "left" },
   switchPort: { label: "Switch / Port", size: 170, align: "left" },
@@ -73,7 +86,20 @@ export const COL_META: Record<ColId, ColMeta> = {
   smb: { label: "SMB Name", size: 110, align: "left" },
   smbDomain: { label: "SMB Domain", size: 90, align: "left" },
   ports: { label: "TCP Ports", size: 120, align: "left" },
+  webTitle: { label: "Web Title", size: 180, align: "left" },
+  webIdentity: { label: "Web Identity", size: 140, align: "left" },
+  certCn: { label: "Cert CN", size: 170, align: "left" },
+  certExpires: { label: "Cert Expires", size: 130, align: "left" },
   comments: { label: "Comments", size: 200, align: "left" },
+};
+
+/** Text colour per loss / latency tone (every colour also has a text cue). */
+export const TONE_TEXT: Record<Tone, string> = {
+  ok: "text-muted",
+  warn: "text-warn",
+  bad: "text-danger",
+  down: "text-danger font-semibold",
+  none: "text-faint",
 };
 
 const ALL_COLS = Object.keys(COL_META) as ColId[];
@@ -121,6 +147,13 @@ const COLUMNS: ColumnDef<DeviceRow>[] = [
       ? undefined
       : `${String(r.device.openPorts.length).padStart(5, "0")}:${String(r.device.openPorts[0]).padStart(5, "0")}`,
   ),
+  // Live values: sorted by the snapshot taken when the rows last changed.
+  col("latency", (r) => latencyStore.get(r.device.ip)?.stats.avgMs ?? undefined),
+  col("loss", (r) => latencyStore.get(r.device.ip)?.stats.lossPct ?? undefined),
+  col("webTitle", (r) => blank(r.device.webTitle)),
+  col("webIdentity", (r) => blank(r.device.webIdentity)),
+  col("certCn", (r) => blank(r.device.tlsCert?.subjectCn)),
+  col("certExpires", (r) => certSortKey(r.device.tlsCert)),
   col("comments", (r) => blank(r.comments)),
 ];
 
@@ -141,8 +174,7 @@ const DEFAULT_PREFS: ColumnPrefs = {
 };
 
 function sanitizePrefs(p: ColumnPrefs): ColumnPrefs {
-  const order = (Array.isArray(p.order) ? p.order : []).filter(isColId);
-  for (const c of ALL_COLS) if (!order.includes(c)) order.push(c);
+  const order = completeOrder(Array.isArray(p.order) ? p.order : [], ALL_COLS);
   const sorting = (Array.isArray(p.sorting) ? p.sorting : []).filter((s) => isColId(s.id));
   return {
     visibility: p.visibility && typeof p.visibility === "object" ? p.visibility : {},
@@ -172,6 +204,10 @@ export interface DeviceTableProps {
   empty: ReactNode;
   /** Bumped by the parent to move keyboard focus into the grid. */
   focusToken: number;
+  /** Drives the automatic visibility of the latency / web columns. */
+  autoColumns: AutoColumns;
+  /** Visible rows changed (for live latency): sorted row count, IP lookup and visible range. */
+  onViewport?: (count: number, ipAt: (i: number) => string | undefined, start: number, end: number) => void;
 }
 
 interface VisibleCol {
@@ -184,6 +220,11 @@ export function DeviceTable(props: DeviceTableProps) {
   const { rows, selectedKey, onSelect, onOpenDetails, editing, onStartEdit, onRowMenu, onDeleteRow, onCopyIp } = props;
   const [prefsRaw, setPrefs] = usePersistentState<ColumnPrefs>("sweepr.columns.v1", DEFAULT_PREFS);
   const prefs = useMemo(() => sanitizePrefs(prefsRaw), [prefsRaw]);
+  const { liveLatency, webTitle: autoTitle, certExpires: autoCert } = props.autoColumns;
+  const visibility = useMemo(
+    () => effectiveVisibility(prefs.visibility, { liveLatency, webTitle: autoTitle, certExpires: autoCert }),
+    [prefs.visibility, liveLatency, autoTitle, autoCert],
+  );
   const [headerMenu, setHeaderMenu] = useState<{ x: number; y: number; colId: ColId | null } | null>(null);
   const [dragOver, setDragOver] = useState<ColId | null>(null);
 
@@ -193,7 +234,7 @@ export function DeviceTable(props: DeviceTableProps) {
     getRowId: (r) => r.key,
     state: {
       sorting: prefs.sorting,
-      columnVisibility: prefs.visibility,
+      columnVisibility: visibility,
       columnOrder: prefs.order,
       columnSizing: prefs.sizing,
     },
@@ -249,6 +290,15 @@ export function DeviceTable(props: DeviceTableProps) {
   useEffect(() => {
     if (props.focusToken > 0) scrollRef.current?.focus();
   }, [props.focusToken]);
+
+  // Report the visible rows (live latency monitors follow them).
+  const onViewport = props.onViewport;
+  const rangeStart = virtualizer.range?.startIndex ?? 0;
+  const rangeEnd = virtualizer.range?.endIndex ?? -1;
+  useEffect(() => {
+    if (!onViewport) return;
+    onViewport(sortedRows.length, (i) => sortedRows[i]?.original.device.ip, rangeStart, rangeEnd);
+  }, [onViewport, sortedRows, rangeStart, rangeEnd]);
 
   // An edit started from the toolbar must have its row rendered (virtualized) to show the editor.
   const editingKey = editing?.key ?? null;
@@ -364,7 +414,8 @@ export function DeviceTable(props: DeviceTableProps) {
         checked: visible,
         keepOpen: true,
         disabled: visible && visibleCount <= 1,
-        onSelect: () => column.toggleVisibility(!visible),
+        // Stored explicitly so it overrides the automatic default.
+        onSelect: () => setPrefs((p) => ({ ...p, visibility: { ...(p.visibility ?? {}), [id]: !visible } })),
       });
     }
     items.push(
@@ -601,7 +652,7 @@ const DeviceRowView = memo(function DeviceRowView(p: RowViewProps) {
               onCancel={p.onCancelEdit}
             />
           ) : (
-            <CellContent id={c.id} row={row} selected={selected} />
+            <CellContent id={c.id} row={row} selected={selected} width={c.width} />
           )}
         </div>
       ))}
@@ -613,7 +664,7 @@ function Faint({ selected, children }: { selected: boolean; children: ReactNode 
   return <span className={cx(!selected && "text-faint", selected && "opacity-60")}>{children}</span>;
 }
 
-function CellContent({ id, row, selected }: { id: ColId; row: DeviceRow; selected: boolean }) {
+function CellContent({ id, row, selected, width }: { id: ColId; row: DeviceRow; selected: boolean; width: number }) {
   const d = row.device;
   const text = (v: string | null | undefined) =>
     v ? (
@@ -647,6 +698,16 @@ function CellContent({ id, row, selected }: { id: ColId; row: DeviceRow; selecte
         <span className="flex min-w-0 items-center gap-1.5">
           <RoleIcon role={d.role} inherit={selected} />
           <span className="truncate">{ROLE_LABEL[d.role]}</span>
+          {(d.warnings?.length ?? 0) > 0 && (
+            <span
+              className={cx("ml-auto flex shrink-0 items-center gap-0.5 text-[10px]", !selected && "text-warn")}
+              title={d.warnings.join("\n")}
+              aria-label={`${d.warnings.length} warning${d.warnings.length === 1 ? "" : "s"}: ${d.warnings.join("; ")}`}
+            >
+              <TriangleAlert size={11} strokeWidth={2} aria-hidden />
+              {d.warnings.length > 1 && <span className="tabular">{d.warnings.length}</span>}
+            </span>
+          )}
         </span>
       );
     case "hostname":
@@ -665,9 +726,86 @@ function CellContent({ id, row, selected }: { id: ColId; row: DeviceRow; selecte
       return text(d.smbDomain);
     case "ports":
       return text(row.ports);
+    case "latency":
+      return <LatencyCell ip={d.ip} width={width} selected={selected} />;
+    case "loss":
+      return <LossCell ip={d.ip} selected={selected} />;
+    case "webTitle":
+      return text(d.webTitle);
+    case "webIdentity":
+      return text(d.webIdentity);
+    case "certCn":
+      return text(d.tlsCert?.subjectCn);
+    case "certExpires":
+      return <CertExpiresCell row={row} selected={selected} />;
     case "comments":
       return text(row.comments);
   }
+}
+
+/** Renders whenever this host's entry changes (store notifications are throttled to ≤ 4/s). */
+function LatencyCell({ ip, width, selected }: { ip: string; width: number; selected: boolean }) {
+  const e = useLatency(ip);
+  if (import.meta.env.DEV) countLatencyRender();
+  if (!e) return <Faint selected={selected}>—</Faint>;
+  const s = e.stats;
+  // Room for "12.3 / 45.6" (about 76 px) plus the cell padding.
+  const sparkW = Math.max(0, Math.min(120, width - 96));
+  // Few samples yet: widen them instead of a sliver at the right edge (full window = 120 slots).
+  const slots = Math.max(30, Math.min(120, e.history.length));
+  const lost = s.lastMs === null;
+  return (
+    <span
+      className="flex min-w-0 items-center gap-1.5"
+      title={`last ${formatMs(s.lastMs)} ms · avg ${formatMs(s.avgMs)} · min ${formatMs(s.minMs)} · max ${formatMs(s.maxMs)} · jitter ${formatMs(s.jitterMs)} ms · loss ${formatLoss(s.lossPct)} (${s.received}/${s.sent}, ${s.method.toUpperCase()})`}
+    >
+      {sparkW >= 24 && (
+        <span className={cx(!selected && "text-accent")}>
+          <Sparkline history={e.history} width={sparkW} height={14} slots={slots} />
+        </span>
+      )}
+      <span className="min-w-0 shrink-0 truncate font-mono text-[11px] tabular">
+        {lost ? <span className={cx(!selected && "text-danger")}>lost</span> : formatMs(s.lastMs)}
+        <span className={cx(selected ? "opacity-70" : "text-muted")}> / {formatMs(s.avgMs)}</span>
+      </span>
+    </span>
+  );
+}
+
+function LossCell({ ip, selected }: { ip: string; selected: boolean }) {
+  const e = useLatency(ip);
+  if (!e) return <Faint selected={selected}>—</Faint>;
+  const tone = lossTone(e.stats.lossPct);
+  return <span className={cx("font-mono text-[11px] tabular", !selected && TONE_TEXT[tone])}>{formatLoss(e.stats.lossPct)}</span>;
+}
+
+function CertExpiresCell({ row, selected }: { row: DeviceRow; selected: boolean }) {
+  const cert = row.device.tlsCert;
+  const c = classifyCert(cert, Date.now());
+  if (!cert || !c) return null;
+  const tone = c.status === "expired" ? "text-danger" : c.status === "expiring" ? "text-warn" : "";
+  const Icon = c.status === "expired" ? ShieldX : c.status === "expiring" ? TriangleAlert : null;
+  return (
+    <span
+      className={cx("flex min-w-0 items-center gap-1", !selected && tone)}
+      title={`${cert.subjectCn ?? ""} (port ${cert.port}): ${c.text}${c.selfSigned ? ", self-signed" : ""}`}
+    >
+      {Icon && <Icon size={12} strokeWidth={2} aria-hidden className="shrink-0" />}
+      <span className="truncate tabular">{c.date || "—"}</span>
+      {c.status !== "ok" && c.days !== null && <span className="shrink-0 text-[10.5px] opacity-80">({c.days < 0 ? "expired" : `${c.days} d`})</span>}
+      {c.selfSigned && (
+        <span className={cx("ml-auto shrink-0", !selected && "text-muted")} title="Self-signed certificate">
+          <ShieldAlert size={12} strokeWidth={1.75} aria-label="self-signed" />
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Dev-only render counter for performance checks (`window.__sweeprLatencyRenders`). */
+function countLatencyRender(): void {
+  const w = window as unknown as { __sweeprLatencyRenders?: number };
+  w.__sweeprLatencyRenders = (w.__sweeprLatencyRenders ?? 0) + 1;
 }
 
 function CellEditor({

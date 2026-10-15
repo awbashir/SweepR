@@ -1,8 +1,10 @@
 // SNMP settings and "Open custom URL" dialogs.
 
 import { useState, type ReactNode } from "react";
-import type { SnmpAuthProtocol, SnmpConfig, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion } from "../types.ts";
-import { DEFAULT_SNMP, snmpV3Problem } from "../settings.ts";
+import type { InterfaceInfo, SnmpAuthProtocol, SnmpConfig, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, WakeOptions } from "../types.ts";
+import { DEFAULT_SNMP, interfaceLabel, snmpV3Problem } from "../settings.ts";
+import { ipv4ToNumber } from "../lib/ip.ts";
+import { parseSecureOn, parseWolMac } from "../lib/wol.ts";
 import { Modal } from "./Modal.tsx";
 import { Button, Select, TextInput, Toggle } from "./ui.tsx";
 
@@ -280,6 +282,119 @@ export function CustomUrlDialog({
         />
         <p className="mt-2 text-[11px] text-muted">
           <code className="font-mono">{"{ip}"}</code> is replaced with the device address. Allowed schemes: http, https, ssh, telnet.
+        </p>
+      </form>
+    </Modal>
+  );
+}
+
+/** "Wake by MAC…": send a magic packet to a host that is not in the results. */
+export function WakeDialog({
+  interfaces,
+  initialMac,
+  onWake,
+  onClose,
+}: {
+  interfaces: InterfaceInfo[];
+  initialMac?: string;
+  onWake: (mac: string, opts: WakeOptions) => Promise<boolean>;
+  onClose: () => void;
+}) {
+  const [mac, setMac] = useState(initialMac ?? "");
+  const [iface, setIface] = useState("");
+  const [broadcast, setBroadcast] = useState("");
+  const [port, setPort] = useState(9);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const m = parseWolMac(mac);
+  const pw = parseSecureOn(password);
+  const bcastOk = broadcast.trim() === "" || ipv4ToNumber(broadcast.trim()) !== null;
+  const valid = m.ok && pw.ok && bcastOk;
+  const submit = async (): Promise<void> => {
+    if (!valid || busy || !m.ok || !pw.ok) return;
+    setBusy(true);
+    const ok = await onWake(m.value, {
+      interface: iface === "" ? null : iface,
+      broadcast: broadcast.trim() === "" ? null : broadcast.trim(),
+      port,
+      password: pw.value,
+    });
+    setBusy(false);
+    if (ok) onClose();
+  };
+  const usable = interfaces.filter((i) => i.kind !== "loopback" && i.addrs.some((a) => !a.ip.includes(":")));
+  return (
+    <Modal
+      title="Wake on LAN"
+      onClose={onClose}
+      width={460}
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant="primary" disabled={!valid || busy} onClick={() => void submit()}>
+            Send Magic Packet
+          </Button>
+        </>
+      }
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <Row label="MAC address" htmlFor="wol-mac">
+          <TextInput
+            id="wol-mac"
+            value={mac}
+            onChange={(e) => setMac(e.target.value)}
+            placeholder="aa:bb:cc:dd:ee:ff"
+            invalid={mac.trim() !== "" && !m.ok}
+            title={!m.ok ? m.error : undefined}
+            className="flex-1 font-mono"
+          />
+        </Row>
+        {mac.trim() !== "" && !m.ok && <p className="pb-1 pl-[142px] text-[11px] text-danger">{m.error}</p>}
+        <Row label="Interface" htmlFor="wol-iface">
+          <Select id="wol-iface" value={iface} onChange={(e) => setIface(e.target.value)} className="flex-1">
+            <option value="">Default interface</option>
+            {usable.map((i) => (
+              <option key={i.name} value={i.name}>
+                {interfaceLabel(i)}
+              </option>
+            ))}
+          </Select>
+        </Row>
+        <Row label="Broadcast" htmlFor="wol-bcast">
+          <TextInput
+            id="wol-bcast"
+            value={broadcast}
+            onChange={(e) => setBroadcast(e.target.value)}
+            placeholder="subnet broadcast + 255.255.255.255"
+            invalid={!bcastOk}
+            className="flex-1 font-mono"
+          />
+        </Row>
+        <Row label="UDP port" htmlFor="wol-port">
+          <Select id="wol-port" value={port} onChange={(e) => setPort(Number(e.target.value))}>
+            <option value={9}>9 (discard)</option>
+            <option value={7}>7 (echo)</option>
+          </Select>
+        </Row>
+        <Row label="SecureOn" htmlFor="wol-pw">
+          <TextInput
+            id="wol-pw"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="optional, e.g. 01:02:03:04:05:06"
+            invalid={!pw.ok}
+            title={!pw.ok ? pw.error : undefined}
+            className="flex-1 font-mono"
+          />
+        </Row>
+        <p className="mt-2 text-[11px] text-muted">
+          A directed broadcast (e.g. <code className="font-mono">10.20.0.255</code>) reaches a remote subnet only if its router forwards
+          directed broadcasts.
         </p>
       </form>
     </Modal>

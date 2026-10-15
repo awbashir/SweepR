@@ -1,8 +1,8 @@
 // Right-hand details drawer: device summary, port scanner, SNMP, CDP/LLDP neighbors and,
 // for infrastructure roles, configured VLANs and the MAC → switch-port table.
 
-import { useMemo, type ReactNode } from "react";
-import { Copy, ExternalLink, Globe, LoaderCircle, ScanLine, Server, Terminal, X } from "lucide-react";
+import { useEffect, useMemo, useRef, type ReactNode } from "react";
+import { Copy, ExternalLink, Globe, LoaderCircle, Power, ScanLine, Server, Terminal, X } from "lucide-react";
 import type { CdpLldpNeighbor, SnmpDeviceInfo, SwitchPortMapping, VlanInfo } from "../types.ts";
 import { ROLE_LABEL } from "../types.ts";
 import type { DeviceRow } from "../lib/store.ts";
@@ -18,6 +18,9 @@ import {
 import { PORT_PRESETS, serviceName } from "../lib/ports.ts";
 import { parsePorts } from "../lib/parse.ts";
 import { Button, RoleIcon, SectionTitle, Select, TextInput, cx } from "./ui.tsx";
+import { IperfSection, LatencySection, TraceSection, WebSection } from "./DrawerTools.tsx";
+
+export type DrawerSection = "latency" | "web" | "trace" | "iperf";
 
 export interface PortScanState {
   status: "running" | "done" | "error";
@@ -51,6 +54,18 @@ interface DrawerProps {
   onCopy: (text: string, what: string) => void;
   onSelectIp: (ip: string) => void;
   onClose: () => void;
+  liveLatency: boolean;
+  onEnableLive: () => void;
+  pinned: boolean;
+  onTogglePin: () => void;
+  onWake: () => void;
+  onGrabWeb: () => void;
+  onOpenWebUrl: (url: string) => void;
+  /** Start requests from the row menu (increasing tokens). */
+  traceToken: number;
+  iperfToken: number;
+  /** Scroll a section into view (token changes per request). */
+  focus: { section: DrawerSection; token: number } | null;
 }
 
 function KV({ k, children }: { k: string; children: ReactNode }) {
@@ -135,11 +150,25 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
   const custom = parsePorts(p.customPorts);
   const scanPorts = preset ? preset.ports : custom.ok ? custom.value : [];
   const scan = p.portScan;
+  // Row-menu actions scroll their section into view.
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const focusToken = p.focus?.token ?? 0;
+  const focusSection = p.focus?.section;
+  useEffect(() => {
+    if (!focusToken || !focusSection) return;
+    const body = bodyRef.current;
+    const el = body?.querySelector<HTMLElement>(`#drawer-${focusSection}`);
+    if (!body || !el) return;
+    // Scroll only the drawer (scrollIntoView would also shift overflow-hidden ancestors).
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop - 4;
+    body.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
+  }, [focusToken, focusSection]);
   const httpish = (port: number): "http" | "https" | null =>
     [443, 8443, 10443, 4443].includes(port) ? "https" : [80, 8080, 8000, 8008, 8081, 8888].includes(port) ? "http" : null;
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-6">
+    <div ref={bodyRef} className="min-h-0 flex-1 overflow-y-auto px-3 pb-6">
       <div className="flex items-start gap-2.5 pt-3">
         <div className="mt-0.5 rounded-[8px] border border-line bg-field p-1.5">
           <RoleIcon role={d.role} size={20} />
@@ -172,6 +201,14 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
             MAC
           </Button>
         )}
+        <Button
+          icon={Power}
+          onClick={p.onWake}
+          disabled={!d.mac}
+          title={d.mac ? `Send a Wake-on-LAN magic packet to ${d.mac}` : "Wake-on-LAN needs the device's MAC address (only known on the local subnet)"}
+        >
+          Wake
+        </Button>
       </div>
 
       <SectionTitle>Summary</SectionTitle>
@@ -194,13 +231,16 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
         <KV k="SMB name">{orDash(d.smbName && (d.smbDomain ? `${d.smbDomain}\\${d.smbName}` : d.smbName))}</KV>
         <KV k="Open ports">{orDash(row.ports)}</KV>
         <KV k="Interface">{orDash(d.interface)}</KV>
-        <KV k="Latency">{d.rttMs !== null ? `${d.rttMs.toFixed(2)} ms` : null}</KV>
+        <KV k="Discovery RTT">{d.rttMs !== null ? `${d.rttMs.toFixed(2)} ms` : null}</KV>
         <KV k="Learned via">{orDash(d.sources.join(", ").toUpperCase())}</KV>
         <KV k="First / last">
           {time(d.firstSeenMs)} / {time(d.lastSeenMs)}
         </KV>
         <KV k="Comments">{orDash(row.comments)}</KV>
       </dl>
+
+      <LatencySection ip={d.ip} live={p.liveLatency} pinned={p.pinned} onTogglePin={p.onTogglePin} onEnableLive={p.onEnableLive} />
+      <WebSection row={row} onGrab={p.onGrabWeb} onOpenUrl={p.onOpenWebUrl} onCopy={p.onCopy} />
 
       <SectionTitle>Port Scanner</SectionTitle>
       <div className="flex items-center gap-1.5">
@@ -264,6 +304,9 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
             </div>
           ))}
       </div>
+
+      <TraceSection row={row} autoStart={p.traceToken} />
+      <IperfSection row={row} autoStart={p.iperfToken} />
 
       <SectionTitle
         right={

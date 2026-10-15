@@ -32,6 +32,12 @@ function device(ip: string, patch: Partial<Device> = {}): Device {
     neighbor: null,
     firstSeenMs: 0,
     lastSeenMs: 0,
+    latency: null,
+    webTitle: null,
+    webServer: null,
+    tlsCert: null,
+    webIdentity: null,
+    warnings: [],
     ...patch,
   };
 }

@@ -112,6 +112,7 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
     ratePps: 2000,
     concurrency: 512,
     listenSecs: 10,
+    webIdentity: true,
   };
   return { ok: true, value: { config, targetCount: range.value.spec === null ? null : range.value.count } };
 }

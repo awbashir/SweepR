@@ -21,6 +21,8 @@ import type {
 import { ipv4ToNumber, numberToIpv4 } from "./lib/ip.ts";
 import { parseRange, type Ipv4Span } from "./lib/parse.ts";
 import { MockNet, macFor } from "./mockTopology.ts";
+import { createMockTools, mockWebIdentity } from "./mockTools.ts";
+import { withWebIdentity } from "./lib/store.ts";
 
 const INTERFACES: InterfaceInfo[] = [
   {
@@ -148,7 +150,23 @@ function blankDevice(ip: string, now: number): Device {
     neighbor: null,
     firstSeenMs: now,
     lastSeenMs: now,
+    latency: null,
+    webTitle: null,
+    webServer: null,
+    tlsCert: null,
+    webIdentity: null,
+    warnings: [],
   };
+}
+
+const WEB_PORTS = [80, 443, 8443, 8080, 8000, 10443];
+
+/** Enrichment: web title / TLS certificate for devices with a web port open (as the engine does). */
+function withWeb(dev: Device): Device {
+  if (!dev.openPorts.some((p) => WEB_PORTS.includes(p))) return dev;
+  const wi = mockWebIdentity(dev.ip, dev.role === "host" ? null : dev.role, Date.now());
+  if (wi.services.length === 0) return dev;
+  return withWebIdentity(dev, wi);
 }
 
 /**
@@ -429,9 +447,10 @@ export function createMockBackend(): Backend {
       const sample = discovered.filter((_, i) => i % (big ? 50 : 4) === 0);
       later(j, big ? 100 : 600, () => {
         for (const d of sample) {
-          const named = makeDevice(ipv4ToNumber(d.ip) ?? 0, d.vlanId, iface.name, true, net, withSnmp);
+          let named = makeDevice(ipv4ToNumber(d.ip) ?? 0, d.vlanId, iface.name, true, net, withSnmp);
           if (named.role === "host" && named.openPorts.length === 0) named.openPorts = [443];
           named.neighbor = d.neighbor;
+          if (config.webIdentity !== false && config.ports.length > 0) named = withWeb(named);
           emit(j, { type: "device", data: { ...named, sources: [...named.sources, "tcp"], lastSeenMs: Date.now() } });
         }
         if (config.cdpLldp) {
@@ -463,8 +482,16 @@ export function createMockBackend(): Backend {
     later(j, duration, () => finish(j, 0, ids.length, 1));
   }
 
+  const roleOf = (ip: string): Device["role"] | null => {
+    const n = ipv4ToNumber(ip);
+    const spec = n === null ? undefined : (lastNet ?? new MockNet([ifaceBlock(INTERFACES[0]!)], false)).infraAt(n);
+    return spec?.role ?? null;
+  };
+  const tools = createMockTools(roleOf);
+
   return {
     isMock: true,
+    ...tools,
     listInterfaces: async () => INTERFACES,
     startScan: async (config) => {
       const j = newJob();
@@ -502,6 +529,14 @@ export function createMockBackend(): Backend {
           ["SMB", (d) => d.smbName],
           ["SMB Domain", (d) => d.smbDomain],
           ["Ports", (d) => d.openPorts.join(" ")],
+          ["Latency (ms)", (d) => (d.latency?.avgMs != null ? d.latency.avgMs.toFixed(2) : "")],
+          ["Loss %", (d) => (d.latency ? d.latency.lossPct.toFixed(1) : "")],
+          ["Web Title", (d) => d.webTitle],
+          ["Cert CN", (d) => d.tlsCert?.subjectCn],
+          [
+            "Cert Expires",
+            (d) => (d.tlsCert?.notAfter ? `${d.tlsCert.notAfter.slice(0, 10)}${d.tlsCert.expired ? " (expired)" : ""}` : ""),
+          ],
           ["Comments", (d) => d.comments],
         ];
         const lines = [cols.map((c) => c[0]).join(",")];
