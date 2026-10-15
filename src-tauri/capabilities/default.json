@@ -6,10 +6,18 @@
   "permissions": [
     "core:default",
     "opener:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "ssh://*" }, { "url": "telnet://*" }]
+    },
     "allow-list-interfaces",
     "allow-start-scan",
     "allow-stop-scan",
     "allow-start-vlan-discovery",
-    "allow-export-devices"
+    "allow-export-devices",
+    "allow-load-overrides",
+    "allow-save-override",
+    "allow-scan-ports",
+    "allow-query-snmp"
   ]
 }

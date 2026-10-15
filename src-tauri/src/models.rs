@@ -1110,6 +1110,28 @@ impl SnmpConfig {
             ..Self::default()
         }
     }
+
+    /// Validate the SNMP settings in isolation (SNMPv3 needs a username; timeout and retries
+    /// are bounded). Used by both [`ScanConfig::validate`] and the GUI `query_snmp` command.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        if self.version == SnmpVersion::V3 && self.v3.as_ref().is_none_or(|c| c.username.is_empty())
+        {
+            return Err(ModelError::InvalidConfig(
+                "SNMPv3 requires a username".into(),
+            ));
+        }
+        if !(1..=MAX_TIMEOUT_MS).contains(&self.timeout_ms) {
+            return Err(ModelError::InvalidConfig(format!(
+                "snmp.timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
+            )));
+        }
+        if u64::from(self.retries) > MAX_RETRIES {
+            return Err(ModelError::InvalidConfig(format!(
+                "snmp.retries must be at most {MAX_RETRIES}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Upper bounds enforced by [`ScanConfig::validate`]. They keep arithmetic (deadlines,
@@ -1225,6 +1247,79 @@ impl ScanConfig {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SNMP infrastructure poll result & device overrides
+// ---------------------------------------------------------------------------------------------
+
+/// MAC addresses learned on one switch port (used to flag uplink/trunk ports, which learn
+/// far more MACs than an access port with a single endpoint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortMacCount {
+    pub port_name: String,
+    pub port_index: Option<u32>,
+    pub mac_count: u32,
+}
+
+/// Everything a single SNMP poll of one infrastructure device yields. Serialized camelCase
+/// for the GUI's `query_snmp` command and the CLI `snmp` subcommand.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnmpDeviceInfo {
+    pub sys_name: Option<String>,
+    pub sys_descr: Option<String>,
+    pub sys_uptime_ticks: Option<u32>,
+    pub sys_object_id: Option<String>,
+    pub role: DeviceRole,
+    pub vlans: Vec<VlanInfo>,
+    pub port_mappings: Vec<SwitchPortMapping>,
+    pub port_mac_counts: Vec<PortMacCount>,
+}
+
+/// Longest override text kept (hostname / comments the user types in the GUI).
+pub const MAX_OVERRIDE_LEN: usize = 1024;
+
+/// A user-assigned label and free-form note for one device, persisted locally by the GUI and
+/// applied to emitted [`Device`]s by the engine. Keyed by [`Device::key`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeviceOverride {
+    pub hostname: Option<String>,
+    pub comments: Option<String>,
+}
+
+impl DeviceOverride {
+    /// Sanitize and length-cap both fields; empty strings become `None`. Returns `None` when
+    /// nothing is left (so a cleared override can be dropped from the store).
+    pub fn sanitized(hostname: Option<String>, comments: Option<String>) -> Option<Self> {
+        let clean = |s: Option<String>| s.map(|t| sanitize_override(&t)).filter(|t| !t.is_empty());
+        let o = DeviceOverride {
+            hostname: clean(hostname),
+            comments: clean(comments),
+        };
+        (o.hostname.is_some() || o.comments.is_some()).then_some(o)
+    }
+}
+
+/// Like [`sanitize_text`] but with the larger [`MAX_OVERRIDE_LEN`] cap for user notes.
+pub fn sanitize_override(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MAX_OVERRIDE_LEN));
+    let mut chars = 0usize;
+    for c in s.chars() {
+        let c = match c {
+            '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}' => ' ',
+            c if c.is_control() || is_bidi_or_invisible(c) => continue,
+            c => c,
+        };
+        if chars == MAX_OVERRIDE_LEN {
+            break;
+        }
+        out.push(c);
+        chars += 1;
+    }
+    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------------------------

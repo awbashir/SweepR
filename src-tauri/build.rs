@@ -17,6 +17,10 @@ fn main() {
             "stop_scan",
             "start_vlan_discovery",
             "export_devices",
+            "load_overrides",
+            "save_override",
+            "scan_ports",
+            "query_snmp",
         ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }
