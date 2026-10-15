@@ -19,7 +19,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -31,10 +31,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{
-    format_mac, now_ms, parse_mac, Capability, CdpLldpNeighbor, Device, DeviceRole,
-    DiscoverySource, IfAddr, InterfaceInfo, InterfaceKind, Ipv4Range, NeighborProtocol, ScanConfig,
-    ScanEvent, ScanPhase, ScanProgress, VlanInfo, VlanSelection, VlanSource, MAX_VLAN_ID,
+use crate::{
+    models::{
+        format_mac, is_link_local_v6, now_ms, parse_mac, sanitize_text, Capability,
+        CdpLldpNeighbor, Device, DeviceRole, DiscoverySource, IfAddr, InterfaceInfo, InterfaceKind,
+        Ipv4Range, NeighborProtocol, ScanConfig, ScanEvent, VlanInfo, VlanSelection, VlanSource,
+        MAX_VLAN_ID,
+    },
+    progress::ProgressScope,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -95,6 +99,21 @@ const PASSIVE_FILTER: &str =
 /// Poll interval of blocking capture loops (bounds cancellation latency).
 const CAPTURE_POLL_MS: i32 = 100;
 
+/// Bytes of a binary LLDP ID rendered as hex (longer IDs are truncated).
+const MAX_HEX_ID_BYTES: usize = 64;
+/// Management addresses kept per neighbor.
+const MAX_MGMT_ADDRS: usize = 16;
+/// Distinct CDP/LLDP neighbors a passive listener tracks; frames from further neighbors
+/// are ignored so a flood of spoofed advertisements cannot exhaust memory.
+pub const MAX_NEIGHBORS: usize = 2048;
+/// Distinct VTP domains / DTP speakers remembered (for de-duplication).
+const MAX_VTP_DOMAINS: usize = 2048;
+const MAX_DTP_SOURCES: usize = 2048;
+/// Distinct VTP domain / DTP speaker log lines per listener; the rest are summarized.
+const MAX_PROTOCOL_LOGS: usize = 16;
+/// Minimum interval between re-announcements of a changed neighbor.
+const NEIGHBOR_UPDATE_INTERVAL_MS: u64 = 5_000;
+
 // ---------------------------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------------------------
@@ -102,10 +121,7 @@ const CAPTURE_POLL_MS: i32 = 100;
 /// Errors the engine reacts to (e.g. by falling back to unprivileged ICMP probing).
 #[derive(Debug, thiserror::Error)]
 pub enum L2Error {
-    #[error(
-        "raw packet access requires root: run with sudo / on macOS grant BPF access \
-         (e.g. Wireshark's ChmodBPF) ({0})"
-    )]
+    #[error("raw packet access requires root: run with sudo ({0})")]
     PermissionDenied(String),
     #[error("interface {0} has no Ethernet link layer; layer-2 probing is not possible on it")]
     NoLinkLayer(String),
@@ -193,11 +209,11 @@ fn ipv6_at(b: &[u8], off: usize) -> Option<Ipv6Addr> {
     Some(Ipv6Addr::from(o))
 }
 
-/// Decode a protocol string field: lossy UTF-8, trailing NULs and whitespace trimmed.
+/// Decode a protocol string field: lossy UTF-8, then [`sanitize_text`] (control and
+/// escape characters removed, whitespace trimmed, length capped). These bytes come from
+/// any host on the segment and end up on terminals and in exports.
 fn text(v: &[u8]) -> String {
-    String::from_utf8_lossy(v)
-        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
-        .to_string()
+    sanitize_text(&String::from_utf8_lossy(v))
 }
 
 fn opt_text(v: &[u8]) -> Option<String> {
@@ -206,6 +222,7 @@ fn opt_text(v: &[u8]) -> Option<String> {
 
 fn hex_string(v: &[u8]) -> String {
     v.iter()
+        .take(MAX_HEX_ID_BYTES)
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(":")
@@ -214,6 +231,13 @@ fn hex_string(v: &[u8]) -> String {
 fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {
     if !v.contains(&item) {
         v.push(item);
+    }
+}
+
+/// Add a management address, de-duplicated and capped at [`MAX_MGMT_ADDRS`].
+fn push_addr(v: &mut Vec<IpAddr>, ip: IpAddr) {
+    if v.len() < MAX_MGMT_ADDRS {
+        push_unique(v, ip);
     }
 }
 
@@ -326,6 +350,16 @@ pub fn select_interface(all: &[InterfaceInfo], name: Option<&str>) -> Result<Int
                 anyhow!("no usable network interface (up, non-loopback, with IPv4) found")
             }),
     }
+}
+
+/// `true` when the OS hides link-layer addresses from this process: on recent macOS,
+/// unprivileged processes get a placeholder MAC for every interface (filtered out by
+/// [`list_interfaces`], so Ethernet / Wi-Fi interfaces end up without a MAC).
+pub fn macs_hidden(all: &[InterfaceInfo]) -> bool {
+    !is_root()
+        && all.iter().any(|i| {
+            matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi) && i.mac.is_none()
+        })
 }
 
 /// [`select_interface`] over a fresh [`list_interfaces`].
@@ -730,10 +764,11 @@ fn build_icmpv6_frame(
     f
 }
 
-/// ICMPv6 echo request to `ff02::1` (all nodes), sourced from our link-local address.
+/// ICMPv6 echo request to `ff02::1` (all nodes) from `src` (one of our link-local, global
+/// or unique-local addresses). Carries [`ECHO_IDENT`].
 pub fn build_icmpv6_echo_multicast(
     src_mac: [u8; 6],
-    src_ll: Ipv6Addr,
+    src: Ipv6Addr,
     vlan: Option<VlanTag>,
 ) -> Vec<u8> {
     let mut icmp = vec![ICMPV6_ECHO_REQUEST, 0, 0, 0];
@@ -743,7 +778,7 @@ pub fn build_icmpv6_echo_multicast(
     build_icmpv6_frame(
         src_mac,
         ipv6_multicast_mac(ALL_NODES_V6),
-        src_ll,
+        src,
         ALL_NODES_V6,
         vlan,
         icmp,
@@ -919,7 +954,8 @@ pub fn parse_icmpv6_discovery(frame: &[u8]) -> Option<Ipv6Observation> {
     let icmp = p.get(40..)?;
     let icmp_type = *icmp.first()?;
     let (ip, mac) = match icmp_type {
-        ICMPV6_ECHO_REPLY => (src, eth.src),
+        // Only replies to our own probes (other pingers' replies are not ours to report).
+        ICMPV6_ECHO_REPLY if be16(icmp, 4)? == ECHO_IDENT => (src, eth.src),
         ICMPV6_ROUTER_ADVERT => (
             src,
             icmp.get(16..)
@@ -1049,7 +1085,11 @@ pub fn parse_cdp(frame: &[u8], local_if: &str) -> Option<CdpLldpNeighbor> {
         off += len;
         match t {
             0x0001 => device_id = opt_text(v),
-            0x0002 => n.management_addrs.extend(parse_cdp_addresses(v)),
+            0x0002 => {
+                for ip in parse_cdp_addresses(v) {
+                    push_addr(&mut n.management_addrs, ip);
+                }
+            }
             0x0003 => n.port_id = opt_text(v),
             0x0004 => n.capabilities = be32(v, 0).map(cdp_capabilities).unwrap_or_default(),
             0x0005 => n.software_version = opt_text(v),
@@ -1059,7 +1099,7 @@ pub fn parse_cdp(frame: &[u8], local_if: &str) -> Option<CdpLldpNeighbor> {
             0x000e => n.voice_vlan = be16(v, 1).filter(|id| (1..=MAX_VLAN_ID).contains(id)),
             0x0016 => {
                 for ip in parse_cdp_addresses(v) {
-                    push_unique(&mut n.management_addrs, ip);
+                    push_addr(&mut n.management_addrs, ip);
                 }
             }
             _ => {}
@@ -1210,7 +1250,7 @@ pub fn parse_lldp(frame: &[u8], local_if: &str) -> Option<CdpLldpNeighbor> {
                     _ => None,
                 };
                 if let Some(ip) = ip {
-                    push_unique(&mut n.management_addrs, ip);
+                    push_addr(&mut n.management_addrs, ip);
                 }
             }
             127 => parse_lldp_org_tlv(v, &mut n),
@@ -1333,24 +1373,96 @@ pub struct PassiveResults {
     pub frames_seen: u64,
 }
 
+/// Source MACs our active probes are transmitted with, across every L2 job of this process.
+fn transmit_macs() -> &'static Mutex<HashSet<[u8; 6]>> {
+    static MACS: OnceLock<Mutex<HashSet<[u8; 6]>>> = OnceLock::new();
+    MACS.get_or_init(Mutex::default)
+}
+
+/// Remember `mac` as one of ours so passive listeners never report our own probes
+/// (e.g. our 802.1Q-tagged ARP requests) as discovered VLANs or neighbors.
+pub fn register_transmit_mac(mac: [u8; 6]) {
+    if let Ok(mut set) = transmit_macs().lock() {
+        set.insert(mac);
+    }
+}
+
+fn is_transmit_mac(mac: &[u8; 6]) -> bool {
+    transmit_macs()
+        .lock()
+        .map(|set| set.contains(mac))
+        .unwrap_or(false)
+}
+
+/// Real (unmasked) MAC addresses of all local interfaces.
+pub fn local_macs(all: &[InterfaceInfo]) -> Vec<[u8; 6]> {
+    let mut macs: Vec<[u8; 6]> = all
+        .iter()
+        .filter_map(|i| i.mac.as_deref().and_then(parse_mac))
+        .collect();
+    macs.sort_unstable();
+    macs.dedup();
+    macs
+}
+
+/// Per-neighbor state of the passive listener.
+#[derive(Debug)]
+struct NeighborState {
+    neighbor: CdpLldpNeighbor,
+    last_emit_ms: u64,
+    /// Changed since it was last announced.
+    dirty: bool,
+}
+
+/// `true` when two advertisements carry the same information (timestamps aside).
+fn same_advert(a: &CdpLldpNeighbor, b: &CdpLldpNeighbor) -> bool {
+    CdpLldpNeighbor {
+        last_seen_ms: a.last_seen_ms,
+        ..b.clone()
+    } == *a
+}
+
 /// Folds captured frames into VLAN / neighbor state. Pure (no I/O) so it is unit testable;
 /// [`PassiveAggregator::ingest`] returns the events to stream for each frame.
+///
+/// Frames sent by this host (any local interface MAC, or a MAC registered with
+/// [`register_transmit_mac`]) are ignored. All state is bounded ([`MAX_NEIGHBORS`] etc.) and
+/// log events are de-duplicated and capped, since any host on the segment can send these
+/// frames.
 #[derive(Debug, Default)]
 pub struct PassiveAggregator {
     if_name: String,
+    own_macs: HashSet<[u8; 6]>,
     vlans: BTreeMap<u16, VlanInfo>,
-    neighbors: HashMap<String, CdpLldpNeighbor>,
+    neighbors: HashMap<String, NeighborState>,
+    neighbor_limit_warned: bool,
     dtp_sources: HashSet<[u8; 6]>,
     vtp_domains: HashSet<String>,
+    vtp_logs: usize,
+    dtp_logs: usize,
     frames: u64,
+    own_frames: u64,
 }
 
 impl PassiveAggregator {
     pub fn new(if_name: &str) -> Self {
         Self {
             if_name: if_name.to_string(),
+            // macOS' placeholder for hidden link addresses is never a real neighbor.
+            own_macs: HashSet::from([MASKED_MAC]),
             ..Self::default()
         }
+    }
+
+    /// Also ignore frames sent from `macs` (this host's interface addresses).
+    pub fn with_own_macs(mut self, macs: impl IntoIterator<Item = [u8; 6]>) -> Self {
+        self.own_macs.extend(macs);
+        self
+    }
+
+    /// Frames ignored because this host sent them.
+    pub fn own_frames(&self) -> u64 {
+        self.own_frames
     }
 
     /// Record a VLAN observation; returns an event when the VLAN is new or gained a new
@@ -1385,7 +1497,7 @@ impl PassiveAggregator {
         }
     }
 
-    fn observe_neighbor(&mut self, n: CdpLldpNeighbor, events: &mut Vec<ScanEvent>) {
+    fn observe_neighbor(&mut self, n: CdpLldpNeighbor, now: u64, events: &mut Vec<ScanEvent>) {
         let source = match n.protocol {
             NeighborProtocol::Cdp => VlanSource::Cdp,
             NeighborProtocol::Lldp => VlanSource::Lldp,
@@ -1395,19 +1507,61 @@ impl PassiveAggregator {
             events.extend(self.observe_vlan(id, source, None, Some(&switch), 0));
         }
         let key = n.key();
-        let is_new = !self.neighbors.contains_key(&key);
-        if is_new {
-            events.push(ScanEvent::Neighbor(n.clone()));
+        let full = self.neighbors.len() >= MAX_NEIGHBORS;
+        match self.neighbors.get_mut(&key) {
+            Some(state) => {
+                if !same_advert(&state.neighbor, &n) {
+                    state.dirty = true;
+                }
+                state.neighbor = n;
+                // Re-announce changes, but at most once per interval per neighbor.
+                if state.dirty
+                    && now.saturating_sub(state.last_emit_ms) >= NEIGHBOR_UPDATE_INTERVAL_MS
+                {
+                    state.dirty = false;
+                    state.last_emit_ms = now;
+                    events.push(ScanEvent::Neighbor(state.neighbor.clone()));
+                }
+            }
+            None if full => {
+                if !self.neighbor_limit_warned {
+                    self.neighbor_limit_warned = true;
+                    events.push(ScanEvent::warn(format!(
+                        "more than {MAX_NEIGHBORS} CDP/LLDP neighbors on {}; ignoring further \
+                         neighbors (possible advertisement flood)",
+                        self.if_name
+                    )));
+                }
+            }
+            None => {
+                events.push(ScanEvent::Neighbor(n.clone()));
+                self.neighbors.insert(
+                    key,
+                    NeighborState {
+                        neighbor: n,
+                        last_emit_ms: now,
+                        dirty: false,
+                    },
+                );
+            }
         }
-        self.neighbors.insert(key, n);
     }
 
     /// Process one captured frame.
     pub fn ingest(&mut self, frame: &[u8]) -> Vec<ScanEvent> {
+        self.ingest_at(frame, now_ms())
+    }
+
+    fn ingest_at(&mut self, frame: &[u8], now: u64) -> Vec<ScanEvent> {
         let mut events = Vec::new();
         let Some(eth) = parse_frame(frame) else {
             return events;
         };
+        // Our own probes (tagged ARP / NDP) must never count as observed VLANs.
+        if self.own_macs.contains(&eth.src) || is_transmit_mac(&eth.src) {
+            self.own_frames += 1;
+            return events;
+        }
         self.frames += 1;
 
         for vid in eth.vlans.iter().copied().filter(|v| *v != 0) {
@@ -1416,16 +1570,27 @@ impl PassiveAggregator {
 
         if eth.dst == CDP_MULTICAST {
             if let Some(n) = parse_cdp(frame, &self.if_name) {
-                self.observe_neighbor(n, &mut events);
+                self.observe_neighbor(n, now, &mut events);
             } else if let Some(vtp) = parse_vtp(frame) {
-                if self.vtp_domains.insert(vtp.domain.clone()) {
-                    events.push(ScanEvent::info(format!(
-                        "VTP v{} domain '{}' (revision {}) advertised by {}",
-                        vtp.version,
-                        vtp.domain,
-                        vtp.revision,
-                        format_mac(&vtp.source_mac)
-                    )));
+                let new_domain = self.vtp_domains.len() < MAX_VTP_DOMAINS
+                    && self.vtp_domains.insert(vtp.domain.clone());
+                if new_domain {
+                    self.vtp_logs += 1;
+                    if self.vtp_logs <= MAX_PROTOCOL_LOGS {
+                        events.push(ScanEvent::info(format!(
+                            "VTP v{} domain '{}' (revision {}) advertised by {}",
+                            vtp.version,
+                            vtp.domain,
+                            vtp.revision,
+                            format_mac(&vtp.source_mac)
+                        )));
+                    } else if self.vtp_logs == MAX_PROTOCOL_LOGS + 1 {
+                        events.push(ScanEvent::warn(format!(
+                            "more than {MAX_PROTOCOL_LOGS} VTP domains on {}; not logging further \
+                             domains",
+                            self.if_name
+                        )));
+                    }
                 }
                 let domain = (!vtp.domain.is_empty()).then(|| format!("VTP {}", vtp.domain));
                 for (id, name) in vtp.vlans {
@@ -1437,23 +1602,36 @@ impl PassiveAggregator {
                         0,
                     ));
                 }
-            } else if is_dtp(frame) && self.dtp_sources.insert(eth.src) {
-                events.push(ScanEvent::info(format!(
-                    "trunk negotiation (DTP) from {} on {}",
-                    format_mac(&eth.src),
-                    self.if_name
-                )));
+            } else if is_dtp(frame)
+                && self.dtp_sources.len() < MAX_DTP_SOURCES
+                && self.dtp_sources.insert(eth.src)
+            {
+                self.dtp_logs += 1;
+                if self.dtp_logs <= MAX_PROTOCOL_LOGS {
+                    events.push(ScanEvent::info(format!(
+                        "trunk negotiation (DTP) from {} on {}",
+                        format_mac(&eth.src),
+                        self.if_name
+                    )));
+                } else if self.dtp_logs == MAX_PROTOCOL_LOGS + 1 {
+                    events.push(ScanEvent::warn(format!(
+                        "more than {MAX_PROTOCOL_LOGS} DTP speakers on {}; not logging further \
+                         speakers",
+                        self.if_name
+                    )));
+                }
             }
         } else if eth.ethertype == ETHERTYPE_LLDP {
             if let Some(n) = parse_lldp(frame, &self.if_name) {
-                self.observe_neighbor(n, &mut events);
+                self.observe_neighbor(n, now, &mut events);
             }
         }
         events
     }
 
     pub fn finish(self) -> PassiveResults {
-        let mut neighbors: Vec<CdpLldpNeighbor> = self.neighbors.into_values().collect();
+        let mut neighbors: Vec<CdpLldpNeighbor> =
+            self.neighbors.into_values().map(|s| s.neighbor).collect();
         neighbors.sort_by(|a, b| {
             a.display_name()
                 .cmp(b.display_name())
@@ -1480,13 +1658,20 @@ fn open_capture(if_name: &str, promisc: bool) -> Result<pcap::Capture<pcap::Acti
     if cap.get_datalink() != pcap::Linktype::ETHERNET {
         bail!(L2Error::NoLinkLayer(if_name.to_string()));
     }
+    // Only received frames: our own transmitted probes must not be captured. Not every
+    // platform supports this; source-MAC filtering in the consumers covers the rest.
+    if let Err(e) = cap.direction(pcap::Direction::In) {
+        tracing::debug!("cannot restrict capture on {if_name} to inbound frames: {e}");
+    }
     Ok(cap)
 }
 
 /// Passively listen on `if_name` for `duration`: 802.1Q tags, CDP, LLDP, VTP and DTP.
 /// Streams [`ScanEvent::Vlan`] / [`ScanEvent::Neighbor`] / log events as they are learned.
+/// Frames sent from `own_macs` (this host) are ignored.
 pub async fn run_passive_sniffer(
     if_name: &str,
+    own_macs: Vec<[u8; 6]>,
     duration: Duration,
     tx: Sender<ScanEvent>,
     cancel: CancellationToken,
@@ -1499,9 +1684,10 @@ pub async fn run_passive_sniffer(
                 "kernel capture filter rejected ({e}); filtering in user space"
             )));
         }
-        let deadline = Instant::now() + duration;
-        let mut agg = PassiveAggregator::new(&if_name);
-        while Instant::now() < deadline && !cancel.is_cancelled() {
+        // `None` (an absurdly long duration) means "until cancelled".
+        let deadline = Instant::now().checked_add(duration);
+        let mut agg = PassiveAggregator::new(&if_name).with_own_macs(own_macs);
+        while deadline.is_none_or(|d| Instant::now() < d) && !cancel.is_cancelled() {
             match cap.next_packet() {
                 Ok(pkt) => {
                     for ev in agg.ingest(pkt.data) {
@@ -1534,6 +1720,9 @@ pub async fn resolve_vlans(
     match &cfg.vlans {
         VlanSelection::Untagged => vec![None],
         VlanSelection::List(ids) => ids.iter().copied().map(Some).collect(),
+        VlanSelection::UntaggedAndList(ids) => std::iter::once(None)
+            .chain(ids.iter().copied().map(Some))
+            .collect(),
         VlanSelection::AutoDetect => {
             let mut ids: Vec<u16> = vlan_children(&iface.name, all_ifaces)
                 .filter_map(|i| i.vlan_id)
@@ -1547,13 +1736,20 @@ pub async fn resolve_vlans(
                 .await;
             match run_passive_sniffer(
                 &iface.name,
+                local_macs(all_ifaces),
                 Duration::from_secs(secs),
                 tx.clone(),
                 cancel.clone(),
             )
             .await
             {
-                Ok(res) => ids.extend(res.vlans.iter().map(|v| v.id)),
+                Ok(res) => {
+                    ids.extend(res.vlans.iter().map(|v| v.id));
+                    // Final cumulative counts (the live events only carry early snapshots).
+                    for v in res.vlans {
+                        let _ = tx.send(ScanEvent::Vlan(v)).await;
+                    }
+                }
                 Err(e) => {
                     let _ = tx
                         .send(ScanEvent::warn(format!(
@@ -1587,6 +1783,8 @@ pub async fn resolve_vlans(
 pub struct L2ScanReport {
     pub probes_sent: u64,
     pub devices_found: u64,
+    /// Frames the OS refused to queue (ENOBUFS / EAGAIN) even after backing off.
+    pub frames_dropped: u64,
 }
 
 /// One probing pass: which tag to send and which VLAN to report replies under.
@@ -1704,17 +1902,34 @@ fn attribute_vlan(groups: &[ProbeGroup], tag: Option<u16>) -> Option<u16> {
     }
 }
 
-/// Paced transmit through a pnet datalink sender.
+/// Slowest pace the transmitter backs off to under sustained back-pressure (50 pps).
+const MAX_PACE_INTERVAL: Duration = Duration::from_millis(20);
+/// Successful sends at a reduced pace before the pace is doubled again.
+const PACE_RECOVERY_SENDS: u32 = 64;
+/// First and largest single back-off sleep when the OS transmit queue is full.
+const BACKOFF_START: Duration = Duration::from_millis(1);
+const BACKOFF_MAX_STEP: Duration = Duration::from_millis(64);
+/// Total time spent retrying one frame before it is counted as dropped.
+const BACKOFF_BUDGET: Duration = Duration::from_millis(500);
+
+/// Paced transmit through a pnet datalink sender. Back-pressure from the OS temporarily
+/// lowers the rate (down to [`MAX_PACE_INTERVAL`]); it recovers after a run of good sends.
+#[derive(Debug)]
 struct Pacer {
+    base: Duration,
     interval: Duration,
     next: Instant,
+    good_streak: u32,
 }
 
 impl Pacer {
     fn new(rate_pps: u32) -> Self {
+        let base = Duration::from_secs_f64(1.0 / f64::from(rate_pps.max(1)));
         Self {
-            interval: Duration::from_secs_f64(1.0 / f64::from(rate_pps.max(1))),
+            base,
+            interval: base,
             next: Instant::now(),
+            good_streak: 0,
         }
     }
 
@@ -1728,67 +1943,204 @@ impl Pacer {
         }
         self.next += self.interval;
     }
+
+    /// The OS transmit queue is full: halve the effective rate.
+    fn on_backpressure(&mut self) {
+        self.good_streak = 0;
+        self.interval = (self.interval * 2).min(MAX_PACE_INTERVAL.max(self.base));
+    }
+
+    /// A frame was queued: after enough of them, step back towards the configured rate.
+    fn on_sent(&mut self) {
+        if self.interval > self.base {
+            self.good_streak += 1;
+            if self.good_streak >= PACE_RECOVERY_SENDS {
+                self.good_streak = 0;
+                self.interval = (self.interval / 2).max(self.base);
+            }
+        }
+    }
 }
 
-fn send_frame(sender: &mut dyn DataLinkSender, frame: &[u8]) -> io::Result<()> {
-    for attempt in 0..4 {
+/// Outcome of [`send_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    /// The OS kept refusing the frame (transmit queue full) or the scan was cancelled
+    /// while backing off.
+    Dropped,
+}
+
+/// `true` for "transmit queue full" errors, which are back-pressure, not failures.
+fn is_backpressure(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOBUFS)
+        || matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )
+}
+
+/// Send one frame. Back-pressure (ENOBUFS / EAGAIN) is retried with exponential back-off
+/// for up to [`BACKOFF_BUDGET`] and slows the pacer; a frame that still cannot be queued is
+/// dropped rather than failing the scan. Other errors are returned.
+fn send_frame(
+    sender: &mut dyn DataLinkSender,
+    frame: &[u8],
+    pacer: &mut Pacer,
+    cancel: &CancellationToken,
+) -> io::Result<SendOutcome> {
+    let mut delay = BACKOFF_START;
+    let mut waited = Duration::ZERO;
+    loop {
         match sender.send_to(frame, None) {
-            None | Some(Ok(())) => return Ok(()),
-            Some(Err(e)) if e.raw_os_error() == Some(libc::ENOBUFS) && attempt < 3 => {
-                thread::sleep(Duration::from_millis(2));
+            None | Some(Ok(())) => {
+                pacer.on_sent();
+                return Ok(SendOutcome::Sent);
+            }
+            Some(Err(e)) if is_backpressure(&e) => {
+                pacer.on_backpressure();
+                if waited >= BACKOFF_BUDGET || cancel.is_cancelled() {
+                    return Ok(SendOutcome::Dropped);
+                }
+                sleep_cancellable(delay, cancel);
+                waited += delay;
+                delay = (delay * 2).min(BACKOFF_MAX_STEP);
             }
             Some(Err(e)) => return Err(e),
         }
     }
-    Ok(())
 }
 
 /// Sleep for `d`, waking early on cancellation.
 fn sleep_cancellable(d: Duration, cancel: &CancellationToken) {
-    let end = Instant::now() + d;
+    let start = Instant::now();
     while !cancel.is_cancelled() {
-        let now = Instant::now();
-        if now >= end {
+        let elapsed = start.elapsed();
+        if elapsed >= d {
             break;
         }
-        thread::sleep((end - now).min(Duration::from_millis(50)));
+        thread::sleep((d - elapsed).min(Duration::from_millis(50)));
     }
 }
 
 /// `(ip, vlan)` pairs that have answered, shared between the RX and TX threads.
 type AnsweredSet = Arc<Mutex<HashSet<(IpAddr, Option<u16>)>>>;
+/// MACs that answered untagged ARP (candidates for EUI-64 neighbor solicitation).
+type LearnedMacs = Arc<Mutex<Vec<[u8; 6]>>>;
+
+/// IPv6 sources used for active NDP discovery on one interface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Ipv6Plan {
+    link_local: Option<Ipv6Addr>,
+    /// Global / ULA addresses with their prefix length.
+    routable: Vec<(Ipv6Addr, u8)>,
+}
+
+impl Ipv6Plan {
+    fn for_iface(iface: &InterfaceInfo) -> Option<Self> {
+        let plan = Self {
+            link_local: iface.link_local_v6(),
+            routable: iface.routable_v6().collect(),
+        };
+        (plan.link_local.is_some() || !plan.routable.is_empty()).then_some(plan)
+    }
+
+    /// Source addresses of the all-nodes echo for a probe group. Every address of the
+    /// interface is used on the native network (hosts answer an echo from the same scope,
+    /// so a global source finds global addresses); tagged VLANs only get the link-local
+    /// source since our routable prefixes do not exist there.
+    fn echo_sources(&self, tag: Option<VlanTag>) -> Vec<Ipv6Addr> {
+        let mut out: Vec<Ipv6Addr> = self.link_local.into_iter().collect();
+        if tag.is_none() {
+            out.extend(self.routable.iter().map(|(ip, _)| *ip));
+        }
+        out
+    }
+
+    /// Source address for neighbor solicitations.
+    fn ns_source(&self) -> Option<Ipv6Addr> {
+        self.link_local
+            .or_else(|| self.routable.first().map(|(ip, _)| *ip))
+    }
+
+    /// EUI-64 SLAAC candidates of `mac` in each routable /64 of the interface.
+    fn eui64_candidates(&self, mac: [u8; 6]) -> Vec<Ipv6Addr> {
+        let mut out: Vec<Ipv6Addr> = self
+            .routable
+            .iter()
+            .filter(|(_, prefix)| *prefix == 64)
+            .map(|(net, _)| eui64_address(*net, mac))
+            .collect();
+        out.dedup();
+        out
+    }
+}
+
+/// The modified EUI-64 address of `mac` inside the /64 of `prefix` (RFC 4291 appendix A).
+pub fn eui64_address(prefix: Ipv6Addr, mac: [u8; 6]) -> Ipv6Addr {
+    let p = prefix.octets();
+    let mut o = [0u8; 16];
+    o[..8].copy_from_slice(&p[..8]);
+    o[8..].copy_from_slice(&[
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ]);
+    Ipv6Addr::from(o)
+}
+
+/// Should an IPv6 observation from the active capture become a device? Echo replies must
+/// come from an on-link source: link-local, or (on the native network) inside one of the
+/// interface's prefixes. Other NDP messages are accepted as before.
+fn accept_ipv6_observation(o: &Ipv6Observation, iface: &InterfaceInfo) -> bool {
+    if o.icmp_type != ICMPV6_ECHO_REPLY {
+        return true;
+    }
+    match o.vlan {
+        Some(_) if o.vlan != iface.vlan_id => is_link_local_v6(o.ip),
+        _ => iface.is_on_link_v6(o.ip),
+    }
+}
 
 /// Shared state of the transmit thread.
 struct TxContext {
     groups: Arc<Vec<ProbeGroup>>,
     answered: AnsweredSet,
-    found: Arc<AtomicU64>,
-    sent: Arc<AtomicU64>,
-    tx: Sender<ScanEvent>,
+    learned_macs: LearnedMacs,
     cancel: CancellationToken,
+    progress: ProgressScope,
+    dropped: Arc<AtomicU64>,
     rate_pps: u32,
     retries: u8,
     grace: Duration,
-    total: u64,
     src_mac: [u8; 6],
-    ipv6_src: Option<Ipv6Addr>,
+    ipv6: Option<Ipv6Plan>,
 }
 
 impl TxContext {
-    fn progress(&self) -> ScanEvent {
-        ScanEvent::Progress(ScanProgress {
-            phase: ScanPhase::Discovering,
-            probes_sent: self.sent.load(Ordering::Relaxed),
-            probes_total: self.total,
-            devices_found: self.found.load(Ordering::Relaxed),
-        })
-    }
-
     fn is_answered(&self, ip: Ipv4Addr, vlan: Option<u16>) -> bool {
         self.answered
             .lock()
             .map(|s| s.contains(&(IpAddr::V4(ip), vlan)))
             .unwrap_or(false)
+    }
+
+    fn send(
+        &self,
+        sender: &mut dyn DataLinkSender,
+        pacer: &mut Pacer,
+        frame: &[u8],
+    ) -> io::Result<()> {
+        pacer.wait();
+        if send_frame(sender, frame, pacer, &self.cancel)? == SendOutcome::Dropped {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 
@@ -1796,7 +2148,8 @@ impl TxContext {
 /// then a `grace` period for late replies.
 fn transmit(ctx: &TxContext, sender: &mut dyn DataLinkSender) -> Result<()> {
     let mut pacer = Pacer::new(ctx.rate_pps);
-    let mut last_progress = Instant::now();
+    let mut solicited: HashSet<[u8; 6]> = HashSet::new();
+    let untagged_probed = ctx.groups.iter().any(|g| g.tag.is_none());
     for pass in 0..=ctx.retries {
         if ctx.cancel.is_cancelled() {
             return Ok(());
@@ -1804,16 +2157,21 @@ fn transmit(ctx: &TxContext, sender: &mut dyn DataLinkSender) -> Result<()> {
         if pass > 0 {
             sleep_cancellable(ctx.grace.min(Duration::from_secs(1)), &ctx.cancel);
         }
-        if let Some(ll) = ctx.ipv6_src {
+        if let Some(v6) = &ctx.ipv6 {
             let mut tags: Vec<Option<VlanTag>> = ctx.groups.iter().map(|g| g.tag).collect();
             if tags.is_empty() {
                 tags.push(None);
             }
             tags.dedup();
             for tag in tags {
-                pacer.wait();
-                send_frame(sender, &build_icmpv6_echo_multicast(ctx.src_mac, ll, tag))
+                for src in v6.echo_sources(tag) {
+                    ctx.send(
+                        sender,
+                        &mut pacer,
+                        &build_icmpv6_echo_multicast(ctx.src_mac, src, tag),
+                    )
                     .map_err(|e| map_open_error(e, "ICMPv6 send failed"))?;
+                }
             }
         }
         for g in ctx.groups.iter() {
@@ -1822,41 +2180,64 @@ fn transmit(ctx: &TxContext, sender: &mut dyn DataLinkSender) -> Result<()> {
                     return Ok(());
                 }
                 if pass == 0 || !ctx.is_answered(ip, g.report_vlan) {
-                    pacer.wait();
-                    send_frame(
+                    ctx.send(
                         sender,
+                        &mut pacer,
                         &build_arp_request(ctx.src_mac, g.sender_ip, ip, g.tag),
                     )
                     .map_err(|e| map_open_error(e, &format!("ARP send to {ip} failed")))?;
                 }
                 if pass == 0 {
-                    ctx.sent.fetch_add(1, Ordering::Relaxed);
-                    if last_progress.elapsed() >= Duration::from_millis(250) {
-                        last_progress = Instant::now();
-                        let _ = ctx.tx.try_send(ctx.progress());
+                    ctx.progress.add(1);
+                }
+            }
+        }
+        // Hosts using EUI-64 SLAAC addresses often ignore multicast echo: solicit the
+        // global address derived from each MAC that answered ARP on the native network.
+        if let (Some(v6), true) = (&ctx.ipv6, untagged_probed) {
+            if let Some(src) = v6.ns_source() {
+                let macs: Vec<[u8; 6]> = ctx
+                    .learned_macs
+                    .lock()
+                    .map(|m| m.clone())
+                    .unwrap_or_default();
+                for mac in macs.into_iter().filter(|m| solicited.insert(*m)) {
+                    for target in v6.eui64_candidates(mac) {
+                        if ctx.cancel.is_cancelled() {
+                            return Ok(());
+                        }
+                        ctx.send(
+                            sender,
+                            &mut pacer,
+                            &build_neighbor_solicitation(ctx.src_mac, src, target, None),
+                        )
+                        .map_err(|e| map_open_error(e, "ICMPv6 send failed"))?;
                     }
                 }
             }
         }
     }
-    let _ = ctx.tx.try_send(ctx.progress());
     sleep_cancellable(ctx.grace, &ctx.cancel);
     Ok(())
 }
 
 /// Active L2 discovery on `iface`: broadcast ARP (and with `cfg.ipv6` an ICMPv6 all-nodes
-/// echo) for every target, once per entry of `vlans` (`None` = untagged, `Some(id)` =
-/// 802.1Q-tagged). Untagged probing is restricted to the interface's connected subnet.
+/// echo from each of the interface's IPv6 addresses, plus neighbor solicitations for the
+/// EUI-64 addresses of ARP responders) for every target, once per entry of `vlans`
+/// (`None` = untagged, `Some(id)` = 802.1Q-tagged). Untagged probing is restricted to the
+/// interface's connected subnet.
 ///
 /// Probes are paced at `cfg.rate_pps`; `cfg.retries` extra passes re-probe unanswered
-/// addresses; replies are collected for a further `cfg.timeout_ms`. Each new `(ip, vlan)`
-/// is streamed as a [`ScanEvent::Device`]. Fails with [`L2Error::PermissionDenied`] when
-/// raw access is not available so callers can fall back to ICMP.
+/// addresses; replies are collected for a further `cfg.timeout_ms`. Each first-pass probe
+/// is counted in `progress`. Each new `(ip, vlan)` is streamed as a [`ScanEvent::Device`].
+/// Fails with [`L2Error::PermissionDenied`] when raw access is not available so callers
+/// can fall back to ICMP. A full OS transmit queue slows the scan down but never fails it.
 pub async fn run_l2_scan(
     iface: &InterfaceInfo,
     targets: Vec<Ipv4Range>,
     vlans: Vec<Option<u16>>,
     cfg: &ScanConfig,
+    progress: ProgressScope,
     tx: Sender<ScanEvent>,
     cancel: CancellationToken,
 ) -> Result<L2ScanReport> {
@@ -1868,25 +2249,26 @@ pub async fn run_l2_scan(
         // macOS hides link addresses from unprivileged processes; raw access needs root anyway.
         None if !is_root() && iface.kind != InterfaceKind::Vpn => {
             bail!(L2Error::PermissionDenied(format!(
-                "the MAC address of {} is not visible to this process",
+                "the MAC address of {} is hidden from unprivileged processes; active layer-2 \
+                 probes need it, so BPF device access alone is not enough",
                 iface.name
             )))
         }
         None => bail!(L2Error::NoLinkLayer(iface.name.clone())),
     };
     let groups = Arc::new(build_probe_groups(iface, &targets, &vlans, &tx));
-    let ipv6_src = if cfg.ipv6 {
-        iface.link_local_v6()
+    let ipv6 = if cfg.ipv6 {
+        Ipv6Plan::for_iface(iface)
     } else {
         None
     };
-    if cfg.ipv6 && ipv6_src.is_none() {
+    if cfg.ipv6 && ipv6.is_none() {
         let _ = tx.try_send(ScanEvent::warn(format!(
-            "{} has no IPv6 link-local address; skipping NDP discovery",
+            "{} has no IPv6 address; skipping NDP discovery",
             iface.name
         )));
     }
-    if groups.is_empty() && ipv6_src.is_none() {
+    if groups.is_empty() && ipv6.is_none() {
         return Ok(L2ScanReport::default());
     }
     let total: u64 = groups.iter().map(|g| range_count(&g.targets)).sum();
@@ -1924,38 +2306,43 @@ pub async fn run_l2_scan(
     })
     .await
     .context("raw channel setup task failed")??;
+    // Passive listeners on this host must not mistake our tagged probes for live VLANs.
+    register_transmit_mac(src_mac);
 
     let _ = tx.try_send(ScanEvent::info(format!(
         "L2 scan on {}: {} address(es) across {} probe group(s){}",
         iface.name,
         total,
         groups.len(),
-        if ipv6_src.is_some() {
-            " + IPv6 NDP"
-        } else {
-            ""
-        }
+        if ipv6.is_some() { " + IPv6 NDP" } else { "" }
     )));
 
     let answered: AnsweredSet = Arc::default();
+    let learned_macs: LearnedMacs = Arc::default();
     let done = Arc::new(AtomicBool::new(false));
     // Lets a failing receiver stop the transmitter without cancelling the whole scan.
     let cancel = cancel.child_token();
     let found = Arc::new(AtomicU64::new(0));
-    let sent = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let sent_before = progress.used();
 
     // --- RX -----------------------------------------------------------------------------
     let rx_task = {
-        let (groups, answered, done, found, tx, cancel) = (
+        let (groups, answered, learned_macs, done, found, tx, cancel) = (
             groups.clone(),
             answered.clone(),
+            learned_macs.clone(),
             done.clone(),
             found.clone(),
             tx.clone(),
             cancel.clone(),
         );
-        let if_name = iface.name.clone();
-        let want_v6 = ipv6_src.is_some();
+        let iface = iface.clone();
+        let want_v6 = ipv6.is_some();
+        let untagged_vlan = groups
+            .iter()
+            .find(|g| g.tag.is_none())
+            .map(|g| g.report_vlan);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut warned_untagged = false;
             while !done.load(Ordering::Acquire) && !cancel.is_cancelled() {
@@ -1964,7 +2351,10 @@ pub async fn run_l2_scan(
                     Err(pcap::Error::TimeoutExpired) => continue,
                     Err(e) => {
                         cancel.cancel();
-                        return Err(map_pcap_error(e, &format!("capture on {if_name} failed")));
+                        return Err(map_pcap_error(
+                            e,
+                            &format!("capture on {} failed", iface.name),
+                        ));
                     }
                 };
                 let observed = if let Some(r) = parse_arp_reply(data) {
@@ -1985,14 +2375,16 @@ pub async fn run_l2_scan(
                         .any(|g| g.targets.iter().any(|t| t.contains(r.ip)));
                     in_scope.then_some((IpAddr::V4(r.ip), r.mac, vlan, DiscoverySource::Arp))
                 } else if want_v6 {
-                    parse_icmpv6_discovery(data).map(|o| {
-                        (
-                            IpAddr::V6(o.ip),
-                            o.mac,
-                            attribute_vlan(&groups, o.vlan),
-                            DiscoverySource::Ndp,
-                        )
-                    })
+                    parse_icmpv6_discovery(data)
+                        .filter(|o| accept_ipv6_observation(o, &iface))
+                        .map(|o| {
+                            (
+                                IpAddr::V6(o.ip),
+                                o.mac,
+                                attribute_vlan(&groups, o.vlan),
+                                DiscoverySource::Ndp,
+                            )
+                        })
                 } else {
                     None
                 };
@@ -2009,12 +2401,19 @@ pub async fn run_l2_scan(
                 if !is_new {
                     continue;
                 }
+                if want_v6 && ip.is_ipv4() && untagged_vlan == Some(vlan) {
+                    if let Ok(mut macs) = learned_macs.lock() {
+                        if !macs.contains(&mac) {
+                            macs.push(mac);
+                        }
+                    }
+                }
                 found.fetch_add(1, Ordering::Relaxed);
                 let mut dev = Device::new(ip);
                 dev.mac = Some(format_mac(&mac));
                 dev.vlan_id = vlan;
                 dev.role = DeviceRole::Host;
-                dev.interface = Some(if_name.clone());
+                dev.interface = Some(iface.name.clone());
                 dev.add_source(source);
                 if tx.blocking_send(ScanEvent::device(dev)).is_err() {
                     break;
@@ -2029,16 +2428,15 @@ pub async fn run_l2_scan(
         let ctx = TxContext {
             groups,
             answered,
-            found: found.clone(),
-            sent: sent.clone(),
-            tx,
+            learned_macs,
             cancel,
+            progress: progress.clone(),
+            dropped: dropped.clone(),
             rate_pps: cfg.rate_pps,
             retries: cfg.retries,
             grace: Duration::from_millis(cfg.timeout_ms),
-            total,
             src_mac,
-            ipv6_src,
+            ipv6,
         };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let result = transmit(&ctx, sender.as_mut());
@@ -2050,10 +2448,21 @@ pub async fn run_l2_scan(
     let (tx_res, rx_res) = tokio::join!(tx_task, rx_task);
     tx_res.context("transmit task panicked")??;
     rx_res.context("receive task panicked")??;
-    Ok(L2ScanReport {
-        probes_sent: sent.load(Ordering::Relaxed),
+    let report = L2ScanReport {
+        probes_sent: progress.used().saturating_sub(sent_before),
         devices_found: found.load(Ordering::Relaxed),
-    })
+        frames_dropped: dropped.load(Ordering::Relaxed),
+    };
+    if report.frames_dropped > 0 {
+        let _ = tx
+            .send(ScanEvent::warn(format!(
+                "{}: {} probe frame(s) dropped because the OS transmit queue stayed full; \
+                 consider a lower --rate-pps",
+                iface.name, report.frames_dropped
+            )))
+            .await;
+    }
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2596,6 +3005,414 @@ mod tests {
         assert!(v10.sources.contains(&VlanSource::Cdp) && v10.sources.contains(&VlanSource::Vtp));
         assert_eq!(res.neighbors.len(), 2);
         assert_eq!(res.frames_seen, 8);
+    }
+
+    #[test]
+    fn passive_listener_ignores_own_tagged_probes() {
+        // Our own 802.1Q-tagged ARP probe, as captured on the wire.
+        let probe = build_arp_request(
+            MAC_A,
+            Ipv4Addr::UNSPECIFIED,
+            ip4("10.0.0.1"),
+            Some(VlanTag::new(777)),
+        );
+        let mut agg = PassiveAggregator::new("en0").with_own_macs([MAC_A]);
+        assert!(agg.ingest(&probe).is_empty());
+        assert_eq!(agg.own_frames(), 1);
+        // Same frame from another host is a real observation.
+        let mut foreign = probe.clone();
+        foreign[6..12].copy_from_slice(&MAC_B);
+        assert!(matches!(&agg.ingest(&foreign)[..], [ScanEvent::Vlan(v)] if v.id == 777));
+        let res = agg.finish();
+        assert_eq!(res.frames_seen, 1);
+        assert_eq!(res.vlans[0].frames_seen, 1);
+
+        // Unknown / masked interface MAC: the placeholder and every MAC registered by an
+        // active scan are still filtered.
+        let masked = build_arp_request(
+            MASKED_MAC,
+            Ipv4Addr::UNSPECIFIED,
+            ip4("10.0.0.1"),
+            Some(VlanTag::new(778)),
+        );
+        let mut agg = PassiveAggregator::new("en0");
+        assert!(agg.ingest(&masked).is_empty());
+        let tx_mac = [0x02, 0x5e, 0x10, 0x00, 0x00, 0x99];
+        let probe = build_arp_request(
+            tx_mac,
+            Ipv4Addr::UNSPECIFIED,
+            ip4("10.0.0.1"),
+            Some(VlanTag::new(779)),
+        );
+        assert!(!agg.ingest(&probe).is_empty(), "not registered yet");
+        register_transmit_mac(tx_mac);
+        let probe = build_arp_request(
+            tx_mac,
+            Ipv4Addr::UNSPECIFIED,
+            ip4("10.0.0.1"),
+            Some(VlanTag::new(780)),
+        );
+        assert!(agg.ingest(&probe).is_empty());
+        assert!(agg.finish().vlans.iter().all(|v| v.id == 779));
+    }
+
+    #[test]
+    fn vlan_frame_counts_are_exact() {
+        let mut agg = PassiveAggregator::new("en0");
+        let tagged = arp_reply_frame(&[(ETHERTYPE_VLAN, 30)]);
+        let mut events = Vec::new();
+        for _ in 0..6 {
+            events.extend(agg.ingest(&tagged));
+        }
+        let res = agg.finish();
+        assert_eq!(res.vlans[0].frames_seen, 6);
+        // Folding the live snapshot(s) and the final snapshot reports the true count.
+        let mut v = match &events[..] {
+            [ScanEvent::Vlan(v)] => v.clone(),
+            other => panic!("{other:?}"),
+        };
+        v.merge_snapshot(&res.vlans[0]);
+        v.merge_snapshot(&res.vlans[0]);
+        assert_eq!(v.frames_seen, 6);
+    }
+
+    #[test]
+    fn passive_state_is_bounded() {
+        let mut agg = PassiveAggregator::new("en0");
+        let mut warned = 0;
+        for i in 0..(MAX_NEIGHBORS + 50) {
+            let mut body = vec![2, 180, 0, 0];
+            body.extend(cdp_tlv(0x0001, format!("spoof-{i}").as_bytes()));
+            let f = snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_CDP, &body);
+            for ev in agg.ingest(&f) {
+                if matches!(ev, ScanEvent::Log { .. }) {
+                    warned += 1;
+                }
+            }
+        }
+        assert_eq!(warned, 1);
+        assert_eq!(agg.neighbors.len(), MAX_NEIGHBORS);
+
+        // DTP / VTP log lines are capped (sets stay bounded too).
+        let mut logs = 0;
+        for i in 0..(MAX_PROTOCOL_LOGS * 3) {
+            let src = [0x00, 0x11, 0x00, 0x00, (i >> 8) as u8, i as u8];
+            let dtp = snap_frame(src, CDP_MULTICAST, None, SNAP_PID_DTP, &[1]);
+            logs += agg.ingest(&dtp).len();
+        }
+        assert_eq!(logs, MAX_PROTOCOL_LOGS + 1);
+        assert_eq!(agg.dtp_sources.len(), MAX_PROTOCOL_LOGS * 3);
+        let mut logs = 0;
+        for i in 0..(MAX_PROTOCOL_LOGS * 2) {
+            let mut body = vec![2, 1, 1, 4];
+            let mut domain = format!("D{i:03}").into_bytes();
+            domain.resize(32, 0);
+            body.extend_from_slice(&domain);
+            body.extend_from_slice(&1u32.to_be_bytes());
+            let vtp = snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_VTP, &body);
+            logs += agg.ingest(&vtp).len();
+        }
+        assert_eq!(logs, MAX_PROTOCOL_LOGS + 1);
+    }
+
+    #[test]
+    fn changed_neighbors_are_reannounced_with_rate_limit() {
+        let mut agg = PassiveAggregator::new("en0");
+        let base = cdp_frame(None);
+        assert!(agg
+            .ingest_at(&base, 1_000)
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Neighbor(_))));
+        // Same key (device + port), new platform string.
+        let mut body = vec![2, 180, 0, 0];
+        body.extend(cdp_tlv(0x0001, b"CORE-SW01.example.com"));
+        body.extend(cdp_tlv(0x0003, b"GigabitEthernet1/0/24"));
+        body.extend(cdp_tlv(0x0006, b"cisco C9300-24P"));
+        let changed = snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_CDP, &body);
+        let neighbor_events = |evs: Vec<ScanEvent>| {
+            evs.into_iter()
+                .filter(|e| matches!(e, ScanEvent::Neighbor(_)))
+                .count()
+        };
+        assert_eq!(
+            neighbor_events(agg.ingest_at(&changed, 2_000)),
+            0,
+            "rate limited"
+        );
+        assert_eq!(neighbor_events(agg.ingest_at(&changed, 3_000)), 0);
+        assert_eq!(
+            neighbor_events(agg.ingest_at(&changed, 1_000 + NEIGHBOR_UPDATE_INTERVAL_MS)),
+            1,
+            "pending change announced once the interval passed"
+        );
+        assert_eq!(
+            neighbor_events(agg.ingest_at(&changed, 99_000)),
+            0,
+            "unchanged"
+        );
+        let res = agg.finish();
+        assert_eq!(
+            res.neighbors[0].platform.as_deref(),
+            Some("cisco C9300-24P")
+        );
+    }
+
+    #[test]
+    fn cdp_strings_cannot_inject_terminal_escapes() {
+        let mut body = vec![2, 180, 0, 0];
+        body.extend(cdp_tlv(0x0001, b"\x1b]0;pwned\x07\x1b[2Jsw01"));
+        body.extend(cdp_tlv(0x0003, b"Gi1/0/1\x1b[31m"));
+        body.extend(cdp_tlv(0x0006, &[b'x'; 900]));
+        let f = snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_CDP, &body);
+        let n = parse_cdp(&f, "en0").unwrap();
+        assert_eq!(n.device_id, "]0;pwned[2Jsw01");
+        assert_eq!(n.port_id.as_deref(), Some("Gi1/0/1[31m"));
+        assert_eq!(
+            n.platform.as_deref().map(str::len),
+            Some(crate::models::MAX_TEXT_LEN)
+        );
+        for s in [&n.device_id, n.port_id.as_ref().unwrap()] {
+            assert!(!s.chars().any(char::is_control), "{s:?}");
+        }
+        // LLDP system name and VTP VLAN names go through the same decoder.
+        let mut f = LLDP_MULTICAST.to_vec();
+        f.extend_from_slice(&MAC_B);
+        f.extend_from_slice(&ETHERTYPE_LLDP.to_be_bytes());
+        f.extend(lldp_tlv(1, b"\x07chassis\x1b[0m"));
+        f.extend(lldp_tlv(5, b"name\xc2\x9b\x07")); // U+009B (C1 CSI) + BEL
+        let n = parse_lldp(&f, "en0").unwrap();
+        assert!(!n.device_id.chars().any(char::is_control));
+        assert_eq!(n.system_name.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn management_addresses_are_capped() {
+        let ips: Vec<[u8; 4]> = (0..60).map(|i| [10, 0, 0, i]).collect();
+        let mut body = vec![2, 180, 0, 0];
+        body.extend(cdp_tlv(0x0001, b"sw"));
+        body.extend(cdp_tlv(0x0002, &cdp_ipv4_addrs(&ips)));
+        body.extend(cdp_tlv(0x0016, &cdp_ipv4_addrs(&ips)));
+        let n = parse_cdp(
+            &snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_CDP, &body),
+            "en0",
+        )
+        .unwrap();
+        assert_eq!(n.management_addrs.len(), MAX_MGMT_ADDRS);
+    }
+
+    // --- transmit back-pressure -------------------------------------------------------------
+
+    /// Fails `fail_first` sends with `errno`, then accepts everything.
+    struct MockSender {
+        fail_first: usize,
+        errno: i32,
+        calls: usize,
+        sent: usize,
+    }
+
+    impl DataLinkSender for MockSender {
+        fn build_and_send(
+            &mut self,
+            _num_packets: usize,
+            _packet_size: usize,
+            _func: &mut dyn FnMut(&mut [u8]),
+        ) -> Option<io::Result<()>> {
+            None
+        }
+
+        fn send_to(
+            &mut self,
+            _packet: &[u8],
+            _dst: Option<datalink::NetworkInterface>,
+        ) -> Option<io::Result<()>> {
+            self.calls += 1;
+            if self.calls <= self.fail_first {
+                Some(Err(io::Error::from_raw_os_error(self.errno)))
+            } else {
+                self.sent += 1;
+                Some(Ok(()))
+            }
+        }
+    }
+
+    #[test]
+    fn enobufs_is_backpressure_not_failure() {
+        let cancel = CancellationToken::new();
+        let mut pacer = Pacer::new(10_000);
+        let base = pacer.interval;
+        let mut s = MockSender {
+            fail_first: 5,
+            errno: libc::ENOBUFS,
+            calls: 0,
+            sent: 0,
+        };
+        assert_eq!(
+            send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap(),
+            SendOutcome::Sent
+        );
+        assert_eq!((s.calls, s.sent), (6, 1));
+        assert!(pacer.interval > base, "rate lowered under back-pressure");
+        for _ in 0..(PACE_RECOVERY_SENDS * 16) {
+            send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap();
+        }
+        assert_eq!(pacer.interval, base, "rate recovers");
+
+        // EAGAIN behaves the same.
+        let mut s = MockSender {
+            fail_first: 2,
+            errno: libc::EAGAIN,
+            calls: 0,
+            sent: 0,
+        };
+        assert_eq!(
+            send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap(),
+            SendOutcome::Sent
+        );
+
+        // A queue that never drains: the frame is dropped, not an error.
+        let mut s = MockSender {
+            fail_first: usize::MAX,
+            errno: libc::ENOBUFS,
+            calls: 0,
+            sent: 0,
+        };
+        let started = Instant::now();
+        assert_eq!(
+            send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap(),
+            SendOutcome::Dropped
+        );
+        assert!(started.elapsed() < BACKOFF_BUDGET * 3);
+        assert_eq!(pacer.interval, MAX_PACE_INTERVAL);
+
+        // Cancellation ends the back-off immediately.
+        cancel.cancel();
+        let started = Instant::now();
+        assert_eq!(
+            send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap(),
+            SendOutcome::Dropped
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        // Real errors still fail.
+        let mut s = MockSender {
+            fail_first: 1,
+            errno: libc::ENETDOWN,
+            calls: 0,
+            sent: 0,
+        };
+        let cancel = CancellationToken::new();
+        assert!(send_frame(&mut s, &[0; 60], &mut pacer, &cancel).is_err());
+    }
+
+    // --- IPv6 discovery ---------------------------------------------------------------------
+
+    fn v6_iface() -> InterfaceInfo {
+        InterfaceInfo {
+            name: "en0".into(),
+            index: 4,
+            description: None,
+            mac: Some("00:11:22:33:44:55".into()),
+            addrs: vec![
+                IfAddr {
+                    ip: "10.0.0.5".parse().unwrap(),
+                    prefix: 24,
+                },
+                IfAddr {
+                    ip: "fe80::211:22ff:fe33:4455".parse().unwrap(),
+                    prefix: 64,
+                },
+                IfAddr {
+                    ip: "2001:db8:1::5".parse().unwrap(),
+                    prefix: 64,
+                },
+                IfAddr {
+                    ip: "fd12:3456::5".parse().unwrap(),
+                    prefix: 64,
+                },
+            ],
+            is_up: true,
+            kind: InterfaceKind::Ethernet,
+            vlan_id: None,
+            parent: None,
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn ipv6_echo_is_sent_from_every_address_on_the_native_network() {
+        let plan = Ipv6Plan::for_iface(&v6_iface()).unwrap();
+        let ll: Ipv6Addr = "fe80::211:22ff:fe33:4455".parse().unwrap();
+        assert_eq!(
+            plan.echo_sources(None),
+            vec![
+                ll,
+                "2001:db8:1::5".parse().unwrap(),
+                "fd12:3456::5".parse().unwrap()
+            ]
+        );
+        // Our routable prefixes do not exist on foreign VLANs.
+        assert_eq!(plan.echo_sources(Some(VlanTag::new(20))), vec![ll]);
+        assert_eq!(plan.ns_source(), Some(ll));
+        for src in plan.echo_sources(None) {
+            let f = build_icmpv6_echo_multicast(MAC_A, src, None);
+            assert_eq!(ipv6_at(&f, 22).unwrap(), src);
+            assert!(checksum_ok(&f, 14));
+        }
+        // Global-only interface still gets an echo.
+        let mut iface = v6_iface();
+        iface
+            .addrs
+            .retain(|a| !matches!(a.ip, IpAddr::V6(v) if is_link_local_v6(v)));
+        let plan = Ipv6Plan::for_iface(&iface).unwrap();
+        assert_eq!(plan.echo_sources(None).len(), 2);
+        assert!(plan.echo_sources(Some(VlanTag::new(5))).is_empty());
+        iface.addrs.truncate(1);
+        assert!(Ipv6Plan::for_iface(&iface).is_none());
+    }
+
+    #[test]
+    fn eui64_solicitation_targets() {
+        let mac = [0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e];
+        assert_eq!(
+            eui64_address("2001:db8:1::5".parse().unwrap(), mac),
+            "2001:db8:1:0:21a:2bff:fe3c:4d5e"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+        );
+        let plan = Ipv6Plan::for_iface(&v6_iface()).unwrap();
+        let targets = plan.eui64_candidates(mac);
+        assert_eq!(targets.len(), 2);
+        let ns = build_neighbor_solicitation(MAC_A, plan.ns_source().unwrap(), targets[0], None);
+        assert_eq!(ipv6_at(&ns, 62).unwrap(), targets[0]);
+        assert!(checksum_ok(&ns, 14));
+    }
+
+    #[test]
+    fn icmpv6_echo_replies_need_our_ident_and_an_on_link_source() {
+        let iface = v6_iface();
+        let reply_from = |src: Ipv6Addr, ident: u16, tag: Option<VlanTag>| {
+            let mut f = build_icmpv6_echo_multicast(MAC_B, src, tag);
+            let off = if tag.is_some() { 58 } else { 54 };
+            f[off] = ICMPV6_ECHO_REPLY;
+            f[off + 4..off + 6].copy_from_slice(&ident.to_be_bytes());
+            f
+        };
+        let on_link: Ipv6Addr = "2001:db8:1::77".parse().unwrap();
+        let o = parse_icmpv6_discovery(&reply_from(on_link, ECHO_IDENT, None)).unwrap();
+        assert!(accept_ipv6_observation(&o, &iface));
+        // Someone else's echo reply (wrong identifier) is not a discovery.
+        assert!(parse_icmpv6_discovery(&reply_from(on_link, 0x1234, None)).is_none());
+        // Off-link / spoofed sources are rejected.
+        let o = parse_icmpv6_discovery(&reply_from("2600::1".parse().unwrap(), ECHO_IDENT, None))
+            .unwrap();
+        assert!(!accept_ipv6_observation(&o, &iface));
+        // On a probed foreign VLAN only link-local replies count.
+        let tag = Some(VlanTag::new(20));
+        let o = parse_icmpv6_discovery(&reply_from("fe80::9".parse().unwrap(), ECHO_IDENT, tag))
+            .unwrap();
+        assert!(accept_ipv6_observation(&o, &iface));
+        let o = parse_icmpv6_discovery(&reply_from(on_link, ECHO_IDENT, tag)).unwrap();
+        assert!(!accept_ipv6_observation(&o, &iface));
     }
 
     // --- interface helpers --------------------------------------------------------------------

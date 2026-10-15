@@ -9,9 +9,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
+    fmt::Display,
     future::Future,
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -23,25 +24,70 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, ContentArrangement, Table};
+use serde::Serialize;
 use sweepr_core::{
     arp_vlan::{self, L2Error, PassiveResults},
     engine,
     export::{self, ExportFormat},
     models::{
-        parse_ports, CdpLldpNeighbor, Device, InterfaceInfo, LogLevel, ScanConfig, ScanEvent,
-        ScanPhase, ScanSummary, SnmpConfig, VlanInfo, VlanSelection, VlanSource, DEFAULT_PORTS,
+        parse_ports, sanitize_text, CdpLldpNeighbor, Device, InterfaceInfo, LogLevel, ScanConfig,
+        ScanEvent, ScanPhase, ScanSummary, SnmpConfig, VlanInfo, VlanSelection, VlanSource,
+        DEFAULT_PORTS, MAX_LISTEN_SECS,
     },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::mpsc;
+use tauri_plugin_dialog::DialogExt;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// Tauri event name carrying every [`ScanEvent`] to the frontend.
+/// Tauri event name carrying every [`ScanEvent`] to the frontend, wrapped in a
+/// [`GuiScanEvent`] (`{ scanId, event }`).
 const SCAN_EVENT: &str = "scan-event";
 
-const ROOT_HINT: &str =
-    "hint: raw 802.1Q/ARP/CDP/LLDP access needs root. Run `sudo sweepr ...`, or on macOS \
-                         grant your user BPF access (e.g. Wireshark's ChmodBPF).";
+const ROOT_HINT: &str = "hint: active layer-2 scanning (ARP, 802.1Q, NDP) and CDP/LLDP capture \
+     need root: run `sudo sweepr ...`. On macOS, BPF device access (e.g. Wireshark's ChmodBPF) \
+     is enough for passive capture only; active probes also need the interface MAC address, \
+     which macOS hides from non-root processes.";
+
+/// Write a diagnostic line to stderr. Failures are ignored: a closed stderr (e.g.
+/// `sweepr ... 2>&1 | head -1`) must not panic like `eprintln!` would.
+macro_rules! diag {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(io::stderr().lock(), $($arg)*);
+    }};
+}
+
+/// Write `text` (plus a newline) to stdout. Unlike `println!` this returns an error instead
+/// of panicking when stdout is closed (`sweepr ... | head -1`).
+fn write_stdout(text: impl Display) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{text}")?;
+    out.flush()
+}
+
+/// stdout was closed by the reader; the CLI stops quietly.
+#[derive(Debug, thiserror::Error)]
+#[error("stdout closed")]
+struct StdoutClosed;
+
+/// `true` when `err` comes from writing to a closed pipe.
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if cause.downcast_ref::<StdoutClosed>().is_some() {
+            return true;
+        }
+        if let Some(e) = cause.downcast_ref::<io::Error>() {
+            return e.kind() == io::ErrorKind::BrokenPipe;
+        }
+        if let Some(e) = cause.downcast_ref::<serde_json::Error>() {
+            return e.io_error_kind() == Some(io::ErrorKind::BrokenPipe);
+        }
+        if let Some(e) = cause.downcast_ref::<csv::Error>() {
+            return matches!(e.kind(), csv::ErrorKind::Io(io) if io.kind() == io::ErrorKind::BrokenPipe);
+        }
+        false
+    })
+}
 
 // ---------------------------------------------------------------------------------------------
 // CLI definition
@@ -97,7 +143,7 @@ struct ScanArgs {
     #[arg(short, long, value_name = "RANGE")]
     range: Option<String>,
 
-    /// 802.1Q VLAN IDs to probe with tagged frames: 10,20,30 | 1-100 | auto
+    /// 802.1Q VLAN IDs to probe with tagged frames: 10,20,30 | 1-100 | untagged,10,20 | auto
     #[arg(long, value_name = "IDS", value_parser = parse_vlan_arg)]
     vlan: Option<VlanSelection>,
 
@@ -175,6 +221,24 @@ fn parse_ports_arg(s: &str) -> Result<PortList, String> {
 }
 
 impl ScanArgs {
+    /// Warnings for options that are accepted but not acted on yet.
+    fn deferred_feature_warnings(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.ports.is_some() {
+            out.push(
+                "-p/--ports is accepted, but TCP port probing arrives in a later release; no \
+                 ports will be scanned",
+            );
+        }
+        if self.snmp_community.is_some() {
+            out.push(
+                "--snmp-community is accepted, but SNMP polling arrives in a later release; no \
+                 SNMP queries will be sent",
+            );
+        }
+        out
+    }
+
     fn to_config(&self) -> ScanConfig {
         ScanConfig {
             interface: self.interface.clone(),
@@ -224,7 +288,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("error: cannot start the async runtime: {e}");
+            diag!("error: cannot start the async runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -239,7 +303,7 @@ async fn run_cli(command: Command) -> ExitCode {
         let cancel = cancel.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("\nstopping... (Ctrl-C again to abort immediately)");
+                diag!("\nstopping... (Ctrl-C again to abort immediately)");
                 cancel.cancel();
             }
             if tokio::signal::ctrl_c().await.is_ok() {
@@ -254,12 +318,14 @@ async fn run_cli(command: Command) -> ExitCode {
         Command::Interfaces => cmd_interfaces().await,
     };
     match result {
+        // The reader went away (`| head`): stop quietly, like other Unix filters.
+        Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Ok(()) if cancel.is_cancelled() => ExitCode::from(130),
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            diag!("error: {e:#}");
             if L2Error::is_permission(&e) {
-                eprintln!("{ROOT_HINT}");
+                diag!("{ROOT_HINT}");
             }
             ExitCode::FAILURE
         }
@@ -271,6 +337,7 @@ async fn run_cli(command: Command) -> ExitCode {
 // ---------------------------------------------------------------------------------------------
 
 /// Renders streamed events: device rows on stdout (table mode), everything else on stderr.
+/// Every network-derived string is sanitized before it reaches the terminal.
 struct LiveRenderer {
     stream_rows: bool,
     progress_tty: bool,
@@ -280,10 +347,13 @@ struct LiveRenderer {
     vlans: BTreeMap<u16, VlanInfo>,
     neighbors: HashMap<String, CdpLldpNeighbor>,
     l2_permission_warned: bool,
+    /// Cancelled when stdout is closed so the scan stops early.
+    cancel: CancellationToken,
+    stdout_closed: bool,
 }
 
 impl LiveRenderer {
-    fn new(stream_rows: bool) -> Self {
+    fn new(stream_rows: bool, cancel: CancellationToken) -> Self {
         Self {
             stream_rows,
             progress_tty: io::stderr().is_terminal(),
@@ -293,14 +363,31 @@ impl LiveRenderer {
             vlans: BTreeMap::new(),
             neighbors: HashMap::new(),
             l2_permission_warned: false,
+            cancel,
+            stdout_closed: false,
         }
     }
 
     fn clear_progress(&mut self) {
         if self.progress_visible {
-            eprint!("\r\x1b[2K");
-            let _ = io::stderr().flush();
+            let mut err = io::stderr().lock();
+            let _ = write!(err, "\r\x1b[2K");
+            let _ = err.flush();
             self.progress_visible = false;
+        }
+    }
+
+    /// Print a live device row; a closed stdout stops the scan.
+    fn print_row(&mut self, text: &str) {
+        if self.stdout_closed {
+            return;
+        }
+        if let Err(e) = write_stdout(text) {
+            self.stdout_closed = true;
+            self.cancel.cancel();
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                diag!("error: cannot write to stdout: {e}");
+            }
         }
     }
 
@@ -313,24 +400,24 @@ impl LiveRenderer {
                     self.clear_progress();
                     if !self.header_printed {
                         self.header_printed = true;
-                        println!(
+                        self.print_row(&format!(
                             "{:<39} {:<17} {:>5} {:<12} SOURCE",
                             "IP", "MAC", "VLAN", "ROLE"
-                        );
+                        ));
                     }
-                    println!("{}", live_row(&d));
+                    self.print_row(&live_row(&d));
                 }
                 self.devices.insert(key, *d);
             }
             ScanEvent::Vlan(v) => {
                 if !self.vlans.contains_key(&v.id) {
                     self.clear_progress();
-                    eprintln!(
+                    diag!(
                         "vlan: {} {}({})",
                         v.id,
                         v.name
                             .as_deref()
-                            .map(|n| format!("'{n}' "))
+                            .map(|n| format!("'{}' ", sanitize_text(n)))
                             .unwrap_or_default(),
                         sources_label(&v.sources)
                     );
@@ -338,18 +425,20 @@ impl LiveRenderer {
                 self.vlans.insert(v.id, v);
             }
             ScanEvent::Neighbor(n) => {
-                self.clear_progress();
-                eprintln!(
-                    "neighbor: {:?} {} {} port {}{}",
-                    n.protocol,
-                    n.display_name(),
-                    n.platform.as_deref().unwrap_or(""),
-                    n.port_id.as_deref().unwrap_or("?"),
-                    n.management_addrs
-                        .first()
-                        .map(|ip| format!(" mgmt {ip}"))
-                        .unwrap_or_default()
-                );
+                if !self.neighbors.contains_key(&n.key()) {
+                    self.clear_progress();
+                    diag!(
+                        "neighbor: {:?} {} {} port {}{}",
+                        n.protocol,
+                        sanitize_text(n.display_name()),
+                        sanitize_text(n.platform.as_deref().unwrap_or("")),
+                        sanitize_text(n.port_id.as_deref().unwrap_or("?")),
+                        n.management_addrs
+                            .first()
+                            .map(|ip| format!(" mgmt {ip}"))
+                            .unwrap_or_default()
+                    );
+                }
                 self.neighbors.insert(n.key(), n);
             }
             ScanEvent::Progress(p) => {
@@ -359,12 +448,14 @@ impl LiveRenderer {
                     } else {
                         String::new()
                     };
-                    eprint!(
+                    let mut err = io::stderr().lock();
+                    let _ = write!(
+                        err,
                         "\r\x1b[2K[{:?}] {detail}{} device(s)",
                         p.phase,
                         self.devices.len()
                     );
-                    let _ = io::stderr().flush();
+                    let _ = err.flush();
                     self.progress_visible = true;
                 }
             }
@@ -375,13 +466,13 @@ impl LiveRenderer {
                     LogLevel::Warn => "warning",
                     LogLevel::Error => "error",
                 };
-                eprintln!("{tag}: {message}");
+                diag!("{tag}: {}", sanitize_log(&message));
                 if level == LogLevel::Warn
                     && message.contains("requires root")
                     && !self.l2_permission_warned
                 {
                     self.l2_permission_warned = true;
-                    eprintln!("{ROOT_HINT}");
+                    diag!("{ROOT_HINT}");
                 }
             }
             ScanEvent::PortMapping(_) | ScanEvent::Finished(_) => {}
@@ -395,11 +486,21 @@ impl LiveRenderer {
     }
 }
 
+/// Log messages may embed network-derived text: strip control characters, keep newlines
+/// out, but do not apply the per-field length cap.
+fn sanitize_log(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 fn live_row(d: &Device) -> String {
     format!(
         "{:<39} {:<17} {:>5} {:<12} {}",
         d.ip,
-        d.mac.as_deref().unwrap_or("-"),
+        sanitize_text(d.mac.as_deref().unwrap_or("-")),
         d.vlan_id
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".into()),
@@ -439,13 +540,14 @@ fn new_table<I: IntoIterator<Item = &'static str>>(header: I) -> Table {
 fn render_vlan_table(vlans: &[VlanInfo]) -> String {
     let mut t = new_table(["VLAN", "Name", "Sources", "Frames", "Switch", "Interface"]);
     for v in vlans {
+        let text = |s: &Option<String>| s.as_deref().map(sanitize_text).unwrap_or_default();
         t.add_row([
             v.id.to_string(),
-            v.name.clone().unwrap_or_default(),
+            text(&v.name),
             sources_label(&v.sources),
             v.frames_seen.to_string(),
-            v.switch_name.clone().unwrap_or_default(),
-            v.interface.clone().unwrap_or_default(),
+            text(&v.switch_name),
+            text(&v.interface),
         ]);
     }
     t.to_string()
@@ -465,12 +567,13 @@ fn render_neighbor_table(neighbors: &[CdpLldpNeighbor]) -> String {
         "Local If",
     ]);
     for n in neighbors {
+        let text = |s: &Option<String>| s.as_deref().map(sanitize_text).unwrap_or_default();
         t.add_row([
             format!("{:?}", n.protocol).to_ascii_uppercase(),
-            n.display_name().to_string(),
+            sanitize_text(n.display_name()),
             n.infer_role().label().to_string(),
-            n.platform.clone().unwrap_or_default(),
-            n.port_id.clone().unwrap_or_default(),
+            text(&n.platform),
+            text(&n.port_id),
             n.management_addrs
                 .iter()
                 .map(ToString::to_string)
@@ -483,7 +586,7 @@ fn render_neighbor_table(neighbors: &[CdpLldpNeighbor]) -> String {
                 .map(|c| c.label())
                 .collect::<Vec<_>>()
                 .join(", "),
-            n.local_interface.clone(),
+            sanitize_text(&n.local_interface),
         ]);
     }
     t.to_string()
@@ -495,15 +598,21 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
     }
     let cfg = args.to_config();
     cfg.validate()?;
+    for w in args.deferred_feature_warnings() {
+        diag!("warning: {w}");
+    }
 
     let (tx, mut rx) = mpsc::channel(1024);
     let scan = tokio::spawn(engine::run_scan(cfg, tx, cancel.clone()));
-    let mut ui = LiveRenderer::new(args.output == OutputFormat::Table);
+    let mut ui = LiveRenderer::new(args.output == OutputFormat::Table, cancel.clone());
     while let Some(ev) = rx.recv().await {
         ui.handle(ev);
     }
     ui.clear_progress();
     let summary = scan.await.context("scan task crashed")??;
+    if ui.stdout_closed {
+        return Err(StdoutClosed.into());
+    }
     let devices = ui.sorted_devices();
 
     match (args.output, &args.file) {
@@ -524,7 +633,11 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
             match file {
                 Some(path) => std::fs::write(path, text.trim_start())
                     .with_context(|| format!("cannot write {}", path.display()))?,
-                None => print!("{text}"),
+                None => {
+                    let mut out = io::stdout().lock();
+                    out.write_all(text.as_bytes())?;
+                    out.flush()?;
+                }
             }
         }
         (OutputFormat::Json, None) => export::write_json(&devices, io::stdout().lock())?,
@@ -536,7 +649,7 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
                 _ => ExportFormat::Json,
             };
             export::export_to_path(&devices, format, path)?;
-            eprintln!("wrote {} device(s) to {}", devices.len(), path.display());
+            diag!("wrote {} device(s) to {}", devices.len(), path.display());
         }
         (OutputFormat::Xlsx, None) => bail!("xlsx output requires --file <PATH>"),
     }
@@ -545,7 +658,7 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
 }
 
 fn print_summary(s: &ScanSummary) {
-    eprintln!(
+    diag!(
         "{} device(s), {} VLAN(s), {} neighbor(s) in {:.1} s{}",
         s.devices,
         s.vlans,
@@ -556,13 +669,19 @@ fn print_summary(s: &ScanSummary) {
 }
 
 async fn cmd_vlans(args: VlansArgs, cancel: CancellationToken) -> Result<()> {
+    if args.timeout > MAX_LISTEN_SECS {
+        bail!("--timeout must be at most {MAX_LISTEN_SECS} seconds");
+    }
     let (tx, mut rx) = mpsc::channel(1024);
     let iface = args.interface.clone();
     let timeout = Duration::from_secs(args.timeout.max(1));
-    let job = tokio::spawn(async move {
-        engine::run_vlan_discovery(iface.as_deref(), timeout, tx, cancel).await
-    });
-    let mut ui = LiveRenderer::new(false);
+    let job = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            engine::run_vlan_discovery(iface.as_deref(), timeout, tx, cancel).await
+        })
+    };
+    let mut ui = LiveRenderer::new(false, cancel);
     let mut summary = None;
     while let Some(ev) = rx.recv().await {
         if let ScanEvent::Finished(s) = &ev {
@@ -574,22 +693,28 @@ async fn cmd_vlans(args: VlansArgs, cancel: CancellationToken) -> Result<()> {
     let res: PassiveResults = job.await.context("VLAN discovery task crashed")??;
 
     if args.json {
-        serde_json::to_writer_pretty(io::stdout().lock(), &res)?;
-        println!();
+        let mut out = io::stdout().lock();
+        serde_json::to_writer_pretty(&mut out, &res)?;
+        writeln!(out)?;
+        out.flush()?;
     } else {
+        let mut text = String::new();
         if res.vlans.is_empty() {
-            println!("No VLANs observed (the port may be an access port, or nothing was tagged during the window).");
+            text.push_str("No VLANs observed (the port may be an access port, or nothing was tagged during the window).\n");
         } else {
-            println!("VLANs\n{}", render_vlan_table(&res.vlans));
+            text.push_str(&format!("VLANs\n{}\n", render_vlan_table(&res.vlans)));
         }
         if res.neighbors.is_empty() {
-            println!("No CDP/LLDP neighbors heard (CDP advertises every 60 s, LLDP every 30 s).");
+            text.push_str(
+                "No CDP/LLDP neighbors heard (CDP advertises every 60 s, LLDP every 30 s).",
+            );
         } else {
-            println!(
+            text.push_str(&format!(
                 "\nCDP/LLDP neighbors\n{}",
                 render_neighbor_table(&res.neighbors)
-            );
+            ));
         }
+        write_stdout(text)?;
     }
     if let Some(s) = summary {
         print_summary(&s);
@@ -616,7 +741,7 @@ async fn cmd_interfaces() -> Result<()> {
             } else {
                 String::new()
             },
-            i.name.clone(),
+            sanitize_text(&i.name),
             format!("{:?}", i.kind),
             if i.is_up { "up" } else { "down" }.to_string(),
             i.mac.clone().unwrap_or_default(),
@@ -630,11 +755,21 @@ async fn cmd_interfaces() -> Result<()> {
                 .map(|a| format!("{}/{}", a.ip, a.prefix))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            i.description.clone().unwrap_or_default(),
+            i.description
+                .as_deref()
+                .map(sanitize_text)
+                .unwrap_or_default(),
         ]);
     }
-    println!("{t}");
-    println!("* = default-route interface");
+    write_stdout(&t)?;
+    write_stdout("* = default-route interface")?;
+    if arp_vlan::macs_hidden(&ifaces) {
+        diag!(
+            "note: this OS hides interface MAC addresses from unprivileged processes (MAC \
+             column left blank). Run `sudo sweepr interfaces` to see them; active layer-2 \
+             scans (ARP, 802.1Q, NDP) need root anyway."
+        );
+    }
     Ok(())
 }
 
@@ -650,9 +785,9 @@ struct ScanManager {
 }
 
 impl ScanManager {
-    /// Cancel any running job and register a new one.
+    /// Cancel any running job and register a new one. Ids start at 1.
     fn begin(&self) -> (u64, CancellationToken) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let token = CancellationToken::new();
         if let Ok(mut cur) = self.current.lock() {
             if let Some((_, old)) = cur.replace((id, token.clone())) {
@@ -670,17 +805,40 @@ impl ScanManager {
         }
     }
 
-    fn stop(&self) -> bool {
+    /// `true` while `id` is the registered job (not superseded and not ended).
+    fn is_current(&self, id: u64) -> bool {
         self.current
             .lock()
-            .ok()
-            .and_then(|cur| cur.as_ref().map(|(_, t)| t.cancel()))
-            .is_some()
+            .map(|cur| cur.as_ref().is_some_and(|(cur_id, _)| *cur_id == id))
+            .unwrap_or(false)
+    }
+
+    /// Cancel the running job (only if it is `id`, when given).
+    fn stop(&self, id: Option<u64>) -> bool {
+        let Ok(cur) = self.current.lock() else {
+            return false;
+        };
+        match cur.as_ref() {
+            Some((cur_id, token)) if id.is_none_or(|i| i == *cur_id) => {
+                token.cancel();
+                true
+            }
+            _ => false,
+        }
     }
 }
 
-/// Run `job` in the background, forwarding its events to the frontend. Failures are reported
-/// as an error log followed by a `finished` event so the UI always leaves its busy state.
+/// Payload of the `scan-event` Tauri event: `{ "scanId": 7, "event": { "type", "data" } }`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GuiScanEvent<'a> {
+    scan_id: u64,
+    event: &'a ScanEvent,
+}
+
+/// Run `job` in the background, forwarding its events to the frontend tagged with `id`.
+/// Events stop as soon as the job is superseded by a newer one. Failures are reported as an
+/// error log followed by a `finished` event so the UI always leaves its busy state.
 fn spawn_job<F, Fut>(app: AppHandle, id: u64, cancel: CancellationToken, job: F)
 where
     F: FnOnce(mpsc::Sender<ScanEvent>, CancellationToken) -> Fut + Send + 'static,
@@ -692,7 +850,17 @@ where
         let emitter = app.clone();
         let forwarder = tauri::async_runtime::spawn(async move {
             while let Some(ev) = rx.recv().await {
-                let _ = emitter.emit(SCAN_EVENT, &ev);
+                // A superseded job keeps draining its channel but no longer talks to the UI.
+                if !emitter.state::<ScanManager>().is_current(id) {
+                    continue;
+                }
+                let _ = emitter.emit(
+                    SCAN_EVENT,
+                    GuiScanEvent {
+                        scan_id: id,
+                        event: &ev,
+                    },
+                );
             }
         });
         if let Err(e) = job(tx.clone(), cancel.clone()).await {
@@ -725,32 +893,36 @@ async fn list_interfaces() -> Result<Vec<InterfaceInfo>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Start a scan; returns its `scanId` (every `scan-event` of this job carries it).
 #[tauri::command]
 async fn start_scan(
     app: AppHandle,
     state: State<'_, ScanManager>,
     config: ScanConfig,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     config.validate().map_err(|e| e.to_string())?;
     let (id, cancel) = state.begin();
     spawn_job(app, id, cancel, move |tx, cancel| async move {
         engine::run_scan(config, tx, cancel).await.map(|_| ())
     });
-    Ok(())
+    Ok(id)
 }
 
+/// Stop the running job (only if it is `scan_id`, when given). Returns `true` if one was
+/// signalled; its `finished` event follows.
 #[tauri::command]
-fn stop_scan(state: State<'_, ScanManager>) -> bool {
-    state.stop()
+fn stop_scan(state: State<'_, ScanManager>, scan_id: Option<u64>) -> bool {
+    state.stop(scan_id)
 }
 
+/// Start passive VLAN / CDP / LLDP discovery; returns its `scanId`.
 #[tauri::command]
 async fn start_vlan_discovery(
     app: AppHandle,
     state: State<'_, ScanManager>,
     interface: Option<String>,
     timeout_secs: Option<u64>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let (id, cancel) = state.begin();
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 3600));
     spawn_job(app, id, cancel, move |tx, cancel| async move {
@@ -758,18 +930,70 @@ async fn start_vlan_discovery(
             .await
             .map(|_| ())
     });
-    Ok(())
+    Ok(id)
 }
 
+/// Final export path for a dialog choice: a missing extension is added (refusing to
+/// silently replace an existing file the dialog never asked about); any other extension
+/// must match `format`.
+fn resolve_export_path(chosen: PathBuf, format: ExportFormat) -> Result<PathBuf, String> {
+    if chosen.extension().is_some() {
+        return match ExportFormat::from_path(&chosen) {
+            Some(f) if f == format => Ok(chosen),
+            _ => Err(format!(
+                "the file name must end in .{format} for a {format} export"
+            )),
+        };
+    }
+    let mut path = chosen.into_os_string();
+    path.push(format!(".{format}"));
+    let path = PathBuf::from(path);
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(format!(
+            "{} already exists; choose it explicitly to replace it",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Export `devices` as `format` ("csv", "json" or "xlsx") to a file the user picks in a
+/// native save dialog opened by the backend. The webview never supplies a path. Returns the
+/// written path, or `null` when the dialog was cancelled.
 #[tauri::command]
-async fn export_devices(devices: Vec<Device>, format: String, path: String) -> Result<(), String> {
+async fn export_devices(
+    app: AppHandle,
+    devices: Vec<Device>,
+    format: String,
+) -> Result<Option<String>, String> {
     let format: ExportFormat = format.parse().map_err(|e: anyhow::Error| e.to_string())?;
+    let (label, ext) = match format {
+        ExportFormat::Csv => ("CSV", "csv"),
+        ExportFormat::Json => ("JSON", "json"),
+        ExportFormat::Xlsx => ("Excel workbook", "xlsx"),
+    };
+    let (done, chosen) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Export devices")
+        .add_filter(label, &[ext])
+        .set_file_name(format!("sweepr-devices.{ext}"))
+        .save_file(move |path| {
+            let _ = done.send(path);
+        });
+    let Some(chosen) = chosen.await.map_err(|_| "save dialog closed".to_string())? else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    let path = resolve_export_path(path, format)?;
+    let written = path.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        export::export_to_path(&devices, format, &PathBuf::from(path))
+        export::export_to_chosen_path(&devices, format, Path::new(&path))
     })
     .await
     .map_err(|e| e.to_string())?
-    .map_err(|e| format!("{e:#}"))
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(Some(written.display().to_string()))
 }
 
 fn run_gui() -> ExitCode {
@@ -789,7 +1013,7 @@ fn run_gui() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: failed to start the SweepR GUI: {e}");
+            diag!("error: failed to start the SweepR GUI: {e}");
             ExitCode::FAILURE
         }
     }
@@ -856,11 +1080,108 @@ mod tests {
         let m = ScanManager::default();
         let (a, ta) = m.begin();
         let (b, tb) = m.begin();
+        assert!(a >= 1 && b > a);
         assert!(ta.is_cancelled() && !tb.is_cancelled());
+        // The superseded job is no longer current, so its events are not forwarded.
+        assert!(!m.is_current(a) && m.is_current(b));
         m.end(a); // stale id: no effect
-        assert!(m.stop());
+        assert!(!m.stop(Some(a)), "stopping a superseded id does nothing");
+        assert!(!tb.is_cancelled());
+        assert!(m.stop(Some(b)));
         assert!(tb.is_cancelled());
+        // Stopped but not yet ended: its final events (finished) still reach the UI.
+        assert!(m.is_current(b));
         m.end(b);
-        assert!(!m.stop());
+        assert!(!m.is_current(b));
+        assert!(!m.stop(None));
+    }
+
+    #[test]
+    fn gui_events_carry_the_scan_id() {
+        let ev = ScanEvent::info("hello");
+        let v = serde_json::to_value(GuiScanEvent {
+            scan_id: 7,
+            event: &ev,
+        })
+        .unwrap();
+        assert_eq!(v["scanId"], 7);
+        assert_eq!(v["event"]["type"], "log");
+        assert_eq!(v["event"]["data"]["message"], "hello");
+        // The CLI / core JSON event shape is unchanged.
+        let plain = serde_json::to_value(&ev).unwrap();
+        assert_eq!(plain["type"], "log");
+        assert!(plain.get("scanId").is_none());
+    }
+
+    #[test]
+    fn export_path_resolution() {
+        let dir = std::env::temp_dir().join(format!("sweepr-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("a.csv");
+        assert_eq!(
+            resolve_export_path(ok.clone(), ExportFormat::Csv).unwrap(),
+            ok
+        );
+        assert!(resolve_export_path(dir.join("a.txt"), ExportFormat::Csv).is_err());
+        assert!(resolve_export_path(dir.join("a.json"), ExportFormat::Xlsx).is_err());
+        assert_eq!(
+            resolve_export_path(dir.join("devices"), ExportFormat::Xlsx).unwrap(),
+            dir.join("devices.xlsx")
+        );
+        // Adding the extension must not silently clobber a file the dialog never confirmed.
+        std::fs::write(dir.join("taken.json"), b"[]").unwrap();
+        assert!(resolve_export_path(dir.join("taken"), ExportFormat::Json).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn deferred_features_warn() {
+        let cli = Cli::try_parse_from(["sweepr", "scan", "-p", "22", "--snmp-community", "public"])
+            .unwrap();
+        let Some(Command::Scan(args)) = cli.command else {
+            panic!("expected scan")
+        };
+        let w = args.deferred_feature_warnings();
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("--ports") && w[1].contains("--snmp-community"));
+        let cli = Cli::try_parse_from(["sweepr", "scan"]).unwrap();
+        let Some(Command::Scan(args)) = cli.command else {
+            panic!("expected scan")
+        };
+        assert!(args.deferred_feature_warnings().is_empty());
+    }
+
+    #[test]
+    fn untagged_in_vlan_list() {
+        let cli = Cli::try_parse_from(["sweepr", "scan", "--vlan", "untagged,10,20"]).unwrap();
+        let Some(Command::Scan(args)) = cli.command else {
+            panic!("expected scan")
+        };
+        assert_eq!(
+            args.to_config().vlans,
+            VlanSelection::UntaggedAndList(vec![10, 20])
+        );
+    }
+
+    #[test]
+    fn broken_pipe_detection() {
+        let pipe = || io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(is_broken_pipe(&anyhow::Error::from(pipe())));
+        assert!(is_broken_pipe(&anyhow::Error::from(StdoutClosed)));
+        assert!(is_broken_pipe(
+            &anyhow::Error::from(serde_json::Error::io(pipe())).context("writing json")
+        ));
+        assert!(is_broken_pipe(&anyhow::Error::from(csv::Error::from(
+            pipe()
+        ))));
+        assert!(!is_broken_pipe(&anyhow::anyhow!("something else")));
+        assert!(!is_broken_pipe(&anyhow::Error::from(io::Error::from(
+            io::ErrorKind::PermissionDenied
+        ))));
+    }
+
+    #[test]
+    fn log_sanitizing() {
+        assert_eq!(sanitize_log("a\x1b]0;x\x07b\nc"), "a]0;xb c");
     }
 }

@@ -11,7 +11,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -22,9 +22,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::models::{
-    format_mac, now_ms, parse_mac, Device, DiscoverySource, Ipv4Range, ScanConfig, ScanEvent,
-    ScanPhase, ScanProgress,
+use crate::{
+    models::{
+        format_mac, now_ms, parse_mac, Device, DiscoverySource, Ipv4Range, ScanConfig, ScanEvent,
+        MAX_CONCURRENCY,
+    },
+    progress::ProgressScope,
 };
 
 const PING_PAYLOAD: &[u8; 16] = b"SweepR-ICMP-v4\0\0";
@@ -49,13 +52,20 @@ pub struct NeighborEntry {
 
 /// ICMPv4 echo sweep over `targets` with at most `cfg.concurrency` probes in flight, each
 /// waiting `cfg.timeout_ms` and retried `cfg.retries` times. Responsive hosts are streamed as
-/// [`ScanEvent::Device`] (source [`DiscoverySource::Icmp`], with RTT). Afterwards the OS
-/// neighbor cache is read to attach MAC addresses and to surface hosts that answered ARP but
-/// filter ICMP ([`DiscoverySource::NeighborCache`]).
+/// [`ScanEvent::Device`] (source [`DiscoverySource::Icmp`], with RTT) tagged with `vlan_id`
+/// (set when sweeping through an OS VLAN sub-interface). Each dispatched probe is counted in
+/// `progress`.
+///
+/// Afterwards the OS neighbor cache is read to attach MAC addresses. Entries are trusted
+/// only when the IP answered the sweep or the entry did not exist before it (the sweep's
+/// ARP resolution created it, so the host answered ARP but filters ICMP); stale entries
+/// that were already cached are ignored. See [`select_cache_entries`].
 pub async fn run_icmp_sweep(
     targets: Vec<Ipv4Range>,
     cfg: &ScanConfig,
     iface_name: Option<&str>,
+    vlan_id: Option<u16>,
+    progress: ProgressScope,
     tx: Sender<ScanEvent>,
     cancel: CancellationToken,
 ) -> Result<SweepReport> {
@@ -64,13 +74,21 @@ pub async fn run_icmp_sweep(
          net.ipv4.ping_group_range, or run with sudo)",
     )?;
     let total: u64 = targets.iter().map(Ipv4Range::count).sum();
-    let semaphore = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
+    let semaphore = Arc::new(Semaphore::new(cfg.concurrency.clamp(1, MAX_CONCURRENCY)));
     let alive: Arc<Mutex<HashSet<Ipv4Addr>>> = Arc::default();
     let timeout = Duration::from_millis(cfg.timeout_ms.max(1));
     let retries = u16::from(cfg.retries);
     let iface: Option<String> = iface_name.map(str::to_string);
     // The identifier only needs to distinguish us from other pingers on this host.
     let ident = PingIdentifier((std::process::id() as u16) ^ (now_ms() as u16));
+    // What the cache held before we probed: those entries may be stale.
+    let cache_before: HashSet<(Ipv4Addr, String)> =
+        tokio::task::spawn_blocking(read_neighbor_cache)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.ip, e.mac))
+            .collect();
 
     let _ = tx
         .send(ScanEvent::info(format!(
@@ -81,7 +99,6 @@ pub async fn run_icmp_sweep(
 
     let mut tasks = JoinSet::new();
     let mut sent = 0u64;
-    let mut last_progress = Instant::now();
     'dispatch: for range in &targets {
         for ip in range.iter() {
             let permit = tokio::select! {
@@ -99,17 +116,15 @@ pub async fn run_icmp_sweep(
                     let mut dev = Device::new(IpAddr::V4(ip));
                     dev.rtt_ms = Some(rtt.as_secs_f32() * 1000.0);
                     dev.interface = task_iface;
+                    dev.vlan_id = vlan_id;
                     dev.add_source(DiscoverySource::Icmp);
                     let _ = task_tx.send(ScanEvent::device(dev)).await;
                 }
             });
             sent += 1;
+            progress.add(1);
             // Reap finished probes so the JoinSet stays bounded on huge ranges.
             while tasks.try_join_next().is_some() {}
-            if last_progress.elapsed() >= Duration::from_millis(250) {
-                last_progress = Instant::now();
-                let _ = tx.try_send(progress(sent, total, count(&alive)));
-            }
         }
     }
 
@@ -122,7 +137,6 @@ pub async fn run_icmp_sweep(
             next = tasks.join_next() => if next.is_none() { break },
         }
     }
-    let _ = tx.try_send(progress(sent, total, count(&alive)));
 
     // Pull MACs (and ICMP-silent hosts) from the neighbor cache the sweep just populated.
     let mut cache_only = 0;
@@ -131,16 +145,14 @@ pub async fn run_icmp_sweep(
             .await
             .unwrap_or_default();
         let responders = alive.lock().map(|s| s.clone()).unwrap_or_default();
-        for entry in cache
-            .into_iter()
-            .filter(|e| targets.iter().any(|r| r.contains(e.ip)))
-        {
-            if !responders.contains(&entry.ip) {
+        for (entry, replied) in select_cache_entries(cache, &cache_before, &responders, &targets) {
+            if !replied {
                 cache_only += 1;
             }
             let mut dev = Device::new(IpAddr::V4(entry.ip));
             dev.mac = Some(entry.mac);
             dev.interface = entry.interface.or_else(|| iface.clone());
+            dev.vlan_id = vlan_id;
             dev.add_source(DiscoverySource::NeighborCache);
             let _ = tx.send(ScanEvent::device(dev)).await;
         }
@@ -152,17 +164,30 @@ pub async fn run_icmp_sweep(
     })
 }
 
-fn count(set: &Mutex<HashSet<Ipv4Addr>>) -> u64 {
-    set.lock().map(|s| s.len() as u64).unwrap_or(0)
+/// Neighbor-cache entries worth reporting after a sweep, with `true` when the IP also
+/// answered ICMP. An entry inside `targets` qualifies when its IP replied to the sweep, or
+/// when the `(ip, mac)` pair was not cached before the sweep (resolving it is evidence the
+/// host answered ARP just now). Pre-existing entries for silent IPs may be stale and are
+/// dropped. Incomplete / failed entries never reach this point (see the parsers).
+pub fn select_cache_entries(
+    after: Vec<NeighborEntry>,
+    before: &HashSet<(Ipv4Addr, String)>,
+    responders: &HashSet<Ipv4Addr>,
+    targets: &[Ipv4Range],
+) -> Vec<(NeighborEntry, bool)> {
+    after
+        .into_iter()
+        .filter(|e| targets.iter().any(|r| r.contains(e.ip)))
+        .filter_map(|e| {
+            let replied = responders.contains(&e.ip);
+            let fresh = !before.contains(&(e.ip, e.mac.clone()));
+            (replied || fresh).then_some((e, replied))
+        })
+        .collect()
 }
 
-fn progress(sent: u64, total: u64, found: u64) -> ScanEvent {
-    ScanEvent::Progress(ScanProgress {
-        phase: ScanPhase::Discovering,
-        probes_sent: sent,
-        probes_total: total,
-        devices_found: found,
-    })
+fn count(set: &Mutex<HashSet<Ipv4Addr>>) -> u64 {
+    set.lock().map(|s| s.len() as u64).unwrap_or(0)
 }
 
 /// Ping `ip` up to `retries + 1` times; returns the first round-trip time.
@@ -296,5 +321,43 @@ mod tests {
         assert_eq!(e.len(), 2);
         assert_eq!(e[0].mac, "00:1a:2b:03:04:05");
         assert_eq!(e[1].interface.as_deref(), Some("eth0.10"));
+    }
+
+    #[test]
+    fn stale_cache_entries_are_ignored() {
+        let entry = |ip: &str, mac: &str| NeighborEntry {
+            ip: ip.parse().unwrap(),
+            mac: mac.into(),
+            interface: Some("en0".into()),
+        };
+        let before: HashSet<(Ipv4Addr, String)> = [
+            ("10.0.0.2", "00:00:00:00:00:02"), // stale: cached before, silent now
+            ("10.0.0.3", "00:00:00:00:00:03"), // cached before, answered ICMP
+            ("10.0.0.4", "00:00:00:00:00:04"), // MAC changed since
+        ]
+        .into_iter()
+        .map(|(ip, mac)| (ip.parse().unwrap(), mac.to_string()))
+        .collect();
+        let after = vec![
+            entry("10.0.0.2", "00:00:00:00:00:02"),
+            entry("10.0.0.3", "00:00:00:00:00:03"),
+            entry("10.0.0.4", "00:00:00:00:00:44"),
+            entry("10.0.0.5", "00:00:00:00:00:05"), // new: answered ARP, filters ICMP
+            entry("192.168.9.9", "00:00:00:00:00:99"), // outside the targets
+        ];
+        let responders: HashSet<Ipv4Addr> = ["10.0.0.3".parse().unwrap()].into();
+        let targets = vec!["10.0.0.0/24".parse().unwrap()];
+        let got: Vec<(String, bool)> = select_cache_entries(after, &before, &responders, &targets)
+            .into_iter()
+            .map(|(e, replied)| (e.ip.to_string(), replied))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("10.0.0.3".to_string(), true),
+                ("10.0.0.4".to_string(), false),
+                ("10.0.0.5".to_string(), false)
+            ]
+        );
     }
 }
