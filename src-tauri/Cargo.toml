@@ -5,7 +5,7 @@ description = "SweepR - IPv4/IPv6 enterprise network scanner with 802.1Q VLAN an
 authors = ["Bashir Awbashir"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.90"
 default-run = "sweepr"
 
 # `sweepr-core`: the shared scan engine. Both the clap CLI and the Tauri GUI drive this library
@@ -63,5 +63,6 @@ directories = "6"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# panic = "abort" is deliberately not set: with unwinding, a panic inside one scan task is
+# caught by tokio and reported, instead of killing the whole GUI process.
 strip = true

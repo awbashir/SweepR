@@ -8,5 +8,15 @@ fn main() {
     if !dist.exists() {
         let _ = fs::create_dir_all(&dist);
     }
-    tauri_build::build();
+    // Declare the app's own IPC commands so they go through Tauri's ACL: only commands
+    // granted in `capabilities/` (as `allow-<command>`) are callable from the webview.
+    let attributes =
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
+            "list_interfaces",
+            "start_scan",
+            "stop_scan",
+            "start_vlan_discovery",
+            "export_devices",
+        ]));
+    tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }

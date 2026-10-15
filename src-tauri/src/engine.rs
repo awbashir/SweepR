@@ -6,7 +6,8 @@
 //! aggregator that de-duplicates devices, applies CDP/LLDP roles and streams [`ScanEvent`]s.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    net::IpAddr,
     time::{Duration, Instant},
 };
 
@@ -17,11 +18,16 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     arp_vlan::{self, L2Error, PassiveResults},
     models::{
-        CdpLldpNeighbor, Device, DiscoverySource, InterfaceInfo, Ipv4Range, NeighborProtocol,
-        ScanConfig, ScanEvent, ScanPhase, ScanProgress, ScanSummary, VlanInfo, VlanSource,
+        CdpLldpNeighbor, Device, DiscoverySource, InterfaceInfo, InterfaceKind, Ipv4Range,
+        NeighborProtocol, ScanConfig, ScanEvent, ScanPhase, ScanProgress, ScanSummary, VlanInfo,
+        VlanSource, MAX_LISTEN_SECS,
     },
+    progress::{ProgressCounter, ProgressScope},
     sweep,
 };
+
+/// Interval of combined progress events while probing.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Capacity of the internal event channel.
 const EVENT_BUFFER: usize = 4096;
@@ -136,6 +142,28 @@ pub fn plan_scan(
     plan
 }
 
+/// Warning for tagged probing over Wi-Fi, where 802.1Q tags are generally not carried.
+pub fn wifi_tagging_warning(iface: &InterfaceInfo, plan: &ScanPlan) -> Option<String> {
+    if iface.kind != InterfaceKind::Wifi {
+        return None;
+    }
+    let tagged: Vec<String> = plan
+        .l2_jobs
+        .iter()
+        .filter(|j| j.iface.name == iface.name)
+        .flat_map(|j| j.vlans.iter().flatten().map(u16::to_string))
+        .collect();
+    (!tagged.is_empty()).then(|| {
+        format!(
+            "{} is a Wi-Fi interface: access points generally do not carry 802.1Q-tagged frames \
+             from clients, so tagged probing of VLAN(s) {} will most likely find nothing (use a \
+             wired port on a trunk)",
+            iface.name,
+            tagged.join(",")
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Aggregation
 // ---------------------------------------------------------------------------------------------
@@ -146,6 +174,12 @@ pub struct Aggregate {
     pub devices: HashMap<String, Device>,
     pub neighbors: HashMap<String, CdpLldpNeighbor>,
     pub vlans: BTreeMap<u16, VlanInfo>,
+    /// Lookup indexes so matching devices with neighbors stays cheap for large scans.
+    neighbors_by_mac: HashMap<String, BTreeSet<String>>,
+    neighbors_by_ip: HashMap<IpAddr, BTreeSet<String>>,
+    devices_by_mac: HashMap<String, BTreeSet<String>>,
+    devices_by_ip: HashMap<IpAddr, BTreeSet<String>>,
+    neighbor_limit_warned: bool,
 }
 
 impl Aggregate {
@@ -155,6 +189,140 @@ impl Aggregate {
         v.sort_by_key(|d| (d.vlan_id, d.ip));
         v
     }
+
+    fn index_device(&mut self, key: &str) {
+        let Some(d) = self.devices.get(key) else {
+            return;
+        };
+        if let Some(mac) = &d.mac {
+            self.devices_by_mac
+                .entry(mac.clone())
+                .or_default()
+                .insert(key.to_string());
+        }
+        for ip in std::iter::once(d.ip).chain(d.extra_ips.iter().copied()) {
+            self.devices_by_ip
+                .entry(ip)
+                .or_default()
+                .insert(key.to_string());
+        }
+    }
+
+    fn index_neighbor(&mut self, n: &CdpLldpNeighbor, add: bool) {
+        let key = n.key();
+        let update = |set: &mut BTreeSet<String>| {
+            if add {
+                set.insert(key.clone());
+            } else {
+                set.remove(&key);
+            }
+        };
+        update(
+            self.neighbors_by_mac
+                .entry(n.source_mac.clone())
+                .or_default(),
+        );
+        for ip in &n.management_addrs {
+            update(self.neighbors_by_ip.entry(*ip).or_default());
+        }
+    }
+
+    /// Keys of neighbors that may match `dev` (sorted, so application order is stable).
+    fn neighbor_keys_for(&self, dev: &Device) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        if let Some(set) = dev.mac.as_ref().and_then(|m| self.neighbors_by_mac.get(m)) {
+            keys.extend(set.iter().cloned());
+        }
+        for ip in std::iter::once(&dev.ip).chain(&dev.extra_ips) {
+            if let Some(set) = self.neighbors_by_ip.get(ip) {
+                keys.extend(set.iter().cloned());
+            }
+        }
+        keys
+    }
+
+    /// Keys of devices that may match `n`.
+    fn device_keys_for(&self, n: &CdpLldpNeighbor) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        if let Some(set) = self.devices_by_mac.get(&n.source_mac) {
+            keys.extend(set.iter().cloned());
+        }
+        for ip in &n.management_addrs {
+            if let Some(set) = self.devices_by_ip.get(ip) {
+                keys.extend(set.iter().cloned());
+            }
+        }
+        keys
+    }
+
+    /// Apply every known neighbor that matches `dev`.
+    fn apply_neighbors(&self, dev: &mut Device) {
+        for key in self.neighbor_keys_for(dev) {
+            if let Some(n) = self.neighbors.get(&key) {
+                apply_neighbor(dev, n);
+            }
+        }
+    }
+
+    /// Merge a device observation; returns its key.
+    fn upsert_device(&mut self, d: Device) -> String {
+        let key = d.key();
+        self.devices
+            .entry(key.clone())
+            .and_modify(|e| e.merge(&d))
+            .or_insert(d);
+        self.refresh_device(&key);
+        key
+    }
+
+    /// Re-index a device after it changed and apply the neighbors that now match it.
+    fn refresh_device(&mut self, key: &str) {
+        self.index_device(key);
+        if let Some(mut dev) = self.devices.remove(key) {
+            self.apply_neighbors(&mut dev);
+            self.devices.insert(key.to_string(), dev);
+        }
+    }
+
+    /// Store a neighbor advertisement.
+    fn upsert_neighbor(&mut self, n: &CdpLldpNeighbor) -> NeighborUpdate {
+        let key = n.key();
+        match self.neighbors.get(&key) {
+            Some(old) if same_advert(old, n) => return NeighborUpdate::Unchanged,
+            Some(old) => {
+                let old = old.clone();
+                self.index_neighbor(&old, false);
+            }
+            None if self.neighbors.len() >= arp_vlan::MAX_NEIGHBORS => {
+                let first = !self.neighbor_limit_warned;
+                self.neighbor_limit_warned = true;
+                return NeighborUpdate::OverLimit { first };
+            }
+            None => {}
+        }
+        self.neighbors.insert(key, n.clone());
+        self.index_neighbor(n, true);
+        NeighborUpdate::Stored
+    }
+}
+
+/// Result of [`Aggregate::upsert_neighbor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NeighborUpdate {
+    /// New or changed: forward it and re-match devices.
+    Stored,
+    /// Identical to what is known: nothing to do.
+    Unchanged,
+    /// Dropped because the neighbor table is full (`first` = warn now).
+    OverLimit { first: bool },
+}
+
+/// `true` when two advertisements carry the same information (timestamps aside).
+fn same_advert(a: &CdpLldpNeighbor, b: &CdpLldpNeighbor) -> bool {
+    CdpLldpNeighbor {
+        last_seen_ms: a.last_seen_ms,
+        ..b.clone()
+    } == *a
 }
 
 fn neighbor_matches(dev: &Device, n: &CdpLldpNeighbor) -> bool {
@@ -171,6 +339,7 @@ fn apply_neighbor(dev: &mut Device, n: &CdpLldpNeighbor) -> bool {
     if !neighbor_matches(dev, n) {
         return false;
     }
+    let before = (dev.role, dev.neighbor.clone(), dev.sources.len());
     let role = n.infer_role();
     if role.priority() > dev.role.priority() {
         dev.role = role;
@@ -180,13 +349,20 @@ fn apply_neighbor(dev: &mut Device, n: &CdpLldpNeighbor) -> bool {
         NeighborProtocol::Cdp => DiscoverySource::Cdp,
         NeighborProtocol::Lldp => DiscoverySource::Lldp,
     });
-    true
+    before != (dev.role, dev.neighbor.clone(), dev.sources.len())
 }
 
 /// Consume engine-internal events, merge them and forward the merged view to `out`.
 ///
-/// IPv6 observations are held back until the end and folded into the IPv4 row with the same
-/// MAC and VLAN (as `extraIps`), so the stream never shows a row that later disappears.
+/// * IPv6 observations are held back until the end and folded into the IPv4 row with the
+///   same MAC and VLAN (as `extraIps`), so the stream never shows a row that later
+///   disappears. When several IPv4 rows share that MAC (multi-homed hosts, proxy ARP), the
+///   lowest IPv4 address wins, so the result does not depend on hash order.
+/// * Neighbor events are forwarded only when new or changed, and at most
+///   [`arp_vlan::MAX_NEIGHBORS`] are kept.
+/// * VLAN events are cumulative snapshots ([`VlanInfo::merge_snapshot`]); unchanged ones
+///   are not forwarded.
+/// * Progress events get the current device count.
 async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggregate {
     let mut state = Aggregate::default();
     let mut pending_v6: HashMap<String, Device> = HashMap::new();
@@ -202,29 +378,50 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
                         .or_insert(d);
                     continue;
                 }
-                let entry = state
-                    .devices
-                    .entry(d.key())
-                    .and_modify(|e| e.merge(&d))
-                    .or_insert(d);
-                for n in state.neighbors.values() {
-                    apply_neighbor(entry, n);
-                }
-                let _ = out.send(ScanEvent::device(entry.clone())).await;
+                let key = state.upsert_device(d);
+                let _ = out
+                    .send(ScanEvent::device(state.devices[&key].clone()))
+                    .await;
             }
             ScanEvent::Neighbor(n) => {
+                match state.upsert_neighbor(&n) {
+                    NeighborUpdate::Stored => {}
+                    NeighborUpdate::Unchanged | NeighborUpdate::OverLimit { first: false } => {
+                        continue
+                    }
+                    NeighborUpdate::OverLimit { first: true } => {
+                        let _ = out
+                            .send(ScanEvent::warn(format!(
+                                "more than {} CDP/LLDP neighbors; ignoring further neighbors",
+                                arp_vlan::MAX_NEIGHBORS
+                            )))
+                            .await;
+                        continue;
+                    }
+                }
                 let _ = out.send(ScanEvent::Neighbor(n.clone())).await;
-                for dev in state.devices.values_mut() {
+                for key in state.device_keys_for(&n) {
+                    let Some(dev) = state.devices.get_mut(&key) else {
+                        continue;
+                    };
                     if apply_neighbor(dev, &n) {
                         let _ = out.send(ScanEvent::device(dev.clone())).await;
                     }
                 }
-                state.neighbors.insert(n.key(), n);
             }
             ScanEvent::Vlan(v) => {
                 let merged = match state.vlans.get_mut(&v.id) {
                     Some(existing) => {
-                        existing.merge(&v);
+                        let before = existing.clone();
+                        existing.merge_snapshot(&v);
+                        let unchanged = existing.frames_seen == before.frames_seen
+                            && existing.sources == before.sources
+                            && existing.name == before.name
+                            && existing.switch_name == before.switch_name
+                            && existing.interface == before.interface;
+                        if unchanged {
+                            continue;
+                        }
                         existing.clone()
                     }
                     None => {
@@ -233,6 +430,10 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
                     }
                 };
                 let _ = out.send(ScanEvent::Vlan(merged)).await;
+            }
+            ScanEvent::Progress(mut p) => {
+                p.devices_found = state.devices.len() as u64;
+                let _ = out.send(ScanEvent::Progress(p)).await;
             }
             other => {
                 let _ = out.send(other).await;
@@ -243,24 +444,30 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
     let mut v6: Vec<Device> = pending_v6.into_values().collect();
     v6.sort_by_key(|d| (d.vlan_id, d.ip));
     for d6 in v6 {
-        let owner = state.devices.values_mut().find(|d| {
-            d.ip.is_ipv4() && d.mac.is_some() && d.mac == d6.mac && d.vlan_id == d6.vlan_id
-        });
-        let merged = match owner {
-            Some(d) => {
-                d.merge(&d6);
-                d.clone()
-            }
-            None => {
-                let mut d = d6;
-                for n in state.neighbors.values() {
-                    apply_neighbor(&mut d, n);
+        let owner = d6
+            .mac
+            .as_ref()
+            .and_then(|mac| state.devices_by_mac.get(mac))
+            .into_iter()
+            .flatten()
+            .filter_map(|k| state.devices.get(k).map(|d| (k, d)))
+            .filter(|(_, d)| d.ip.is_ipv4() && d.vlan_id == d6.vlan_id)
+            .min_by_key(|(_, d)| d.ip)
+            .map(|(k, _)| k.clone());
+        let key = match owner {
+            Some(k) => {
+                if let Some(d) = state.devices.get_mut(&k) {
+                    d.merge(&d6);
                 }
-                state.devices.insert(d.key(), d.clone());
-                d
+                // Its new IPv6 addresses may match a neighbor's management address.
+                state.refresh_device(&k);
+                k
             }
+            None => state.upsert_device(d6),
         };
-        let _ = out.send(ScanEvent::device(merged)).await;
+        let _ = out
+            .send(ScanEvent::device(state.devices[&key].clone()))
+            .await;
     }
     state
 }
@@ -269,12 +476,15 @@ async fn aggregate(mut rx: Receiver<ScanEvent>, out: Sender<ScanEvent>) -> Aggre
 // Scan
 // ---------------------------------------------------------------------------------------------
 
-fn progress(phase: ScanPhase, found: u64) -> ScanEvent {
+/// A progress event with the scan-wide probe counters (`devices_found` is filled in by the
+/// aggregator).
+fn progress(phase: ScanPhase, counter: Option<&ProgressCounter>) -> ScanEvent {
+    let (sent, total) = counter.map(ProgressCounter::snapshot).unwrap_or_default();
     ScanEvent::Progress(ScanProgress {
         phase,
-        probes_sent: 0,
-        probes_total: 0,
-        devices_found: found,
+        probes_sent: sent,
+        probes_total: total,
+        devices_found: 0,
     })
 }
 
@@ -290,8 +500,15 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn range_count(r: &[Ipv4Range]) -> u64 {
+    r.iter().map(Ipv4Range::count).sum()
+}
+
 /// Run a full scan described by `cfg`, streaming events to `tx`. Always ends with a
 /// [`ScanEvent::Finished`] on success; returns the summary.
+///
+/// Progress events report one combined, monotonic `probesSent / probesTotal` for all
+/// probing subsystems (L2 jobs, routed ICMP sweep, ICMP fallback).
 ///
 /// SNMP polling, name resolution and port scanning settings are accepted but not acted on
 /// by this engine version.
@@ -317,7 +534,7 @@ pub async fn run_scan(
 
     let (itx, irx) = mpsc::channel(EVENT_BUFFER);
     let aggregator = tokio::spawn(aggregate(irx, tx.clone()));
-    let _ = itx.send(progress(ScanPhase::Preparing, 0)).await;
+    let _ = itx.send(progress(ScanPhase::Preparing, None)).await;
     let _ = itx
         .send(ScanEvent::info(format!(
             "scanning {} on {} ({:?}{})",
@@ -338,16 +555,20 @@ pub async fn run_scan(
     // Passive CDP/LLDP/VLAN listener runs for the whole scan (bounded by listen_secs).
     let listener = (cfg.cdp_lldp || cfg.discover_vlans).then(|| {
         let (itx, cancel, name) = (itx.clone(), cancel.child_token(), iface.name.clone());
+        let own = arp_vlan::local_macs(&all);
         let duration = Duration::from_secs(cfg.listen_secs.max(1));
-        tokio::spawn(
-            async move { arp_vlan::run_passive_sniffer(&name, duration, itx, cancel).await },
-        )
+        tokio::spawn(async move {
+            arp_vlan::run_passive_sniffer(&name, own, duration, itx, cancel).await
+        })
     });
 
     let vlans = arp_vlan::resolve_vlans(&cfg, &iface, &all, &itx, &cancel).await;
     let plan = plan_scan(&iface, &all, &targets, &vlans, explicit_range);
     for note in &plan.notes {
         let _ = itx.send(ScanEvent::info(note.clone())).await;
+    }
+    if let Some(w) = wifi_tagging_warning(&iface, &plan) {
+        let _ = itx.send(ScanEvent::warn(w)).await;
     }
     if cfg.ipv6 && plan.l2_jobs.is_empty() {
         let _ = itx
@@ -357,31 +578,83 @@ pub async fn run_scan(
             ))
             .await;
     }
-    let _ = itx.send(progress(ScanPhase::Discovering, 0)).await;
+
+    // One progress budget per subsystem, all reserved up front so the total never moves.
+    let counter = ProgressCounter::new();
+    let routed_scope = counter.scope(range_count(&plan.routed));
+    let job_scopes: Vec<ProgressScope> = plan
+        .l2_jobs
+        .iter()
+        .map(|j| counter.scope(range_count(&j.targets) * j.vlans.len() as u64))
+        .collect();
+    let _ = itx
+        .send(progress(ScanPhase::Discovering, Some(&counter)))
+        .await;
+    let ticker_stop = CancellationToken::new();
+    let ticker = {
+        let (itx, counter, stop) = (itx.clone(), counter.clone(), ticker_stop.clone());
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(PROGRESS_INTERVAL);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = every.tick() => {
+                        let _ = itx.try_send(progress(ScanPhase::Discovering, Some(&counter)));
+                    }
+                }
+            }
+        })
+    };
 
     let routed = async {
         if plan.routed.is_empty() || cancel.is_cancelled() {
             return;
         }
         // Routed probes follow the routing table, so no interface is attributed to them.
-        if let Err(e) =
-            sweep::run_icmp_sweep(plan.routed.clone(), &cfg, None, itx.clone(), cancel.clone())
-                .await
+        if let Err(e) = sweep::run_icmp_sweep(
+            plan.routed.clone(),
+            &cfg,
+            None,
+            None,
+            routed_scope.clone(),
+            itx.clone(),
+            cancel.clone(),
+        )
+        .await
         {
             let _ = itx
                 .send(ScanEvent::error(format!("ICMP sweep failed: {e:#}")))
                 .await;
         }
+        if !cancel.is_cancelled() {
+            routed_scope.finish();
+        }
     };
-    let local = run_l2_jobs(&plan, &cfg, &itx, &cancel);
+    let local = run_l2_jobs(&plan, &job_scopes, &cfg, &itx, &cancel);
     tokio::join!(routed, local);
+    ticker_stop.cancel();
+    let _ = ticker.await;
+    let _ = itx
+        .send(progress(ScanPhase::Discovering, Some(&counter)))
+        .await;
 
     if let Some(handle) = listener {
         if !cancel.is_cancelled() {
-            let _ = itx.send(progress(ScanPhase::Listening, 0)).await;
+            let _ = itx
+                .send(progress(ScanPhase::Listening, Some(&counter)))
+                .await;
         }
         match handle.await {
             Ok(Ok(res)) => {
+                // Final cumulative VLAN counts and the latest neighbor data (the aggregator
+                // drops whatever it already has).
+                for v in &res.vlans {
+                    let _ = itx.send(ScanEvent::Vlan(v.clone())).await;
+                }
+                for n in &res.neighbors {
+                    let _ = itx.send(ScanEvent::Neighbor(n.clone())).await;
+                }
                 let _ = itx
                     .send(ScanEvent::info(format!(
                         "passive listener: {} VLAN(s), {} CDP/LLDP neighbor(s), {} frame(s)",
@@ -415,36 +688,62 @@ pub async fn run_scan(
         elapsed_ms: elapsed_ms(started),
         cancelled: cancel.is_cancelled(),
     };
-    let _ = tx.send(progress(ScanPhase::Done, summary.devices)).await;
+    let (sent, total) = counter.snapshot();
+    let _ = tx
+        .send(ScanEvent::Progress(ScanProgress {
+            phase: ScanPhase::Done,
+            probes_sent: sent,
+            probes_total: total,
+            devices_found: summary.devices,
+        }))
+        .await;
     let _ = tx.send(ScanEvent::Finished(summary.clone())).await;
     Ok(summary)
 }
 
+/// An L2 job whose targets are swept with ICMP instead (raw access unavailable).
+struct Fallback {
+    iface: String,
+    vlan_id: Option<u16>,
+    targets: Vec<Ipv4Range>,
+    progress: ProgressScope,
+}
+
 /// Run the plan's L2 jobs in order. When raw access is unavailable, untagged targets fall back
-/// to an ICMP sweep and tagged VLANs are reported as skipped.
+/// to an ICMP sweep and tagged VLANs are reported as skipped. `scopes[i]` is job `i`'s share
+/// of the scan progress; it is completed when the job ends (or is skipped).
 async fn run_l2_jobs(
     plan: &ScanPlan,
+    scopes: &[ProgressScope],
     cfg: &ScanConfig,
     tx: &Sender<ScanEvent>,
     cancel: &CancellationToken,
 ) {
-    let mut fallback: Vec<(String, Vec<Ipv4Range>)> = Vec::new();
+    let mut fallback: Vec<Fallback> = Vec::new();
     let mut l2_unavailable: Option<String> = None;
 
-    for job in &plan.l2_jobs {
+    for (job, scope) in plan.l2_jobs.iter().zip(scopes) {
         if cancel.is_cancelled() {
             return;
         }
         let tagged: Vec<u16> = job.vlans.iter().flatten().copied().collect();
+        let to_fallback = || Fallback {
+            iface: job.iface.name.clone(),
+            // Untagged jobs on an OS VLAN sub-interface still belong to that VLAN.
+            vlan_id: job.iface.vlan_id,
+            targets: job.targets.clone(),
+            progress: scope.clone(),
+        };
         if let Some(reason) = &l2_unavailable {
             if tagged.is_empty() {
-                fallback.push((job.iface.name.clone(), job.targets.clone()));
+                fallback.push(to_fallback());
             } else {
                 let _ = tx
                     .send(ScanEvent::warn(format!(
                         "tagged VLAN probing skipped ({reason})"
                     )))
                     .await;
+                scope.finish();
             }
             continue;
         }
@@ -453,12 +752,13 @@ async fn run_l2_jobs(
             job.targets.clone(),
             job.vlans.clone(),
             cfg,
+            scope.clone(),
             tx.clone(),
             cancel.clone(),
         )
         .await;
         match res {
-            Ok(_) => {}
+            Ok(_) => scope.finish(),
             Err(e) if L2Error::is_l2_unavailable(&e) => {
                 let reason = format!("{e:#}");
                 if tagged.is_empty() {
@@ -470,13 +770,14 @@ async fn run_l2_jobs(
                             if cfg.ipv6 { ", IPv6 NDP needs raw access" } else { "" }
                         )))
                         .await;
-                    fallback.push((job.iface.name.clone(), job.targets.clone()));
+                    fallback.push(to_fallback());
                 } else {
                     let _ = tx
                         .send(ScanEvent::warn(format!(
                             "tagged VLAN probing skipped ({reason})"
                         )))
                         .await;
+                    scope.finish();
                 }
                 if L2Error::is_permission(&e) {
                     l2_unavailable = Some(reason);
@@ -489,22 +790,34 @@ async fn run_l2_jobs(
                         job.iface.name
                     )))
                     .await;
+                scope.finish();
             }
         }
     }
 
-    for (iface, targets) in fallback {
+    for fb in fallback {
         if cancel.is_cancelled() {
             return;
         }
-        if let Err(e) =
-            sweep::run_icmp_sweep(targets, cfg, Some(&iface), tx.clone(), cancel.clone()).await
+        if let Err(e) = sweep::run_icmp_sweep(
+            fb.targets,
+            cfg,
+            Some(&fb.iface),
+            fb.vlan_id,
+            fb.progress.clone(),
+            tx.clone(),
+            cancel.clone(),
+        )
+        .await
         {
             let _ = tx
                 .send(ScanEvent::error(format!(
                     "ICMP fallback sweep failed: {e:#}"
                 )))
                 .await;
+        }
+        if !cancel.is_cancelled() {
+            fb.progress.finish();
         }
     }
 }
@@ -519,6 +832,11 @@ pub async fn run_vlan_discovery(
     cancel: CancellationToken,
 ) -> Result<PassiveResults> {
     let started = Instant::now();
+    if timeout > Duration::from_secs(MAX_LISTEN_SECS) {
+        return Err(anyhow!(
+            "listen timeout must be at most {MAX_LISTEN_SECS} s"
+        ));
+    }
     let all = interfaces().await?;
     let iface = arp_vlan::select_interface(&all, interface)?;
 
@@ -538,10 +856,16 @@ pub async fn run_vlan_discovery(
             timeout.as_secs()
         )))
         .await;
-    let _ = tx.send(progress(ScanPhase::Listening, 0)).await;
+    let _ = tx.send(progress(ScanPhase::Listening, None)).await;
 
-    let mut res =
-        arp_vlan::run_passive_sniffer(&iface.name, timeout, tx.clone(), cancel.clone()).await?;
+    let mut res = arp_vlan::run_passive_sniffer(
+        &iface.name,
+        arp_vlan::local_macs(&all),
+        timeout,
+        tx.clone(),
+        cancel.clone(),
+    )
+    .await?;
     for os in os_vlans {
         match res.vlans.iter_mut().find(|v| v.id == os.id) {
             Some(v) => v.merge(&os),
@@ -557,7 +881,7 @@ pub async fn run_vlan_discovery(
         elapsed_ms: elapsed_ms(started),
         cancelled: cancel.is_cancelled(),
     };
-    let _ = tx.send(progress(ScanPhase::Done, 0)).await;
+    let _ = tx.send(progress(ScanPhase::Done, None)).await;
     let _ = tx.send(ScanEvent::Finished(summary)).await;
     Ok(res)
 }
@@ -742,5 +1066,168 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ScanEvent::Device(_))));
         assert!(events.iter().any(|e| matches!(e, ScanEvent::Neighbor(_))));
+    }
+
+    fn drain(orx: &mut Receiver<ScanEvent>) -> Vec<ScanEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = orx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn vlan_snapshots_are_not_double_counted() {
+        let (itx, irx) = mpsc::channel(64);
+        let (otx, mut orx) = mpsc::channel(256);
+        let agg = tokio::spawn(aggregate(irx, otx));
+        let snap = |frames: u64| {
+            let mut v = VlanInfo::new(30, VlanSource::Tagged8021q);
+            v.frames_seen = frames;
+            ScanEvent::Vlan(v)
+        };
+        // Listener and auto-detect sniff the same 6 frames concurrently: each streams an
+        // early snapshot and a final cumulative one.
+        for ev in [snap(1), snap(1), snap(4), snap(6), snap(6)] {
+            itx.send(ev).await.unwrap();
+        }
+        drop(itx);
+        let state = agg.await.unwrap();
+        assert_eq!(state.vlans[&30].frames_seen, 6);
+        let forwarded = drain(&mut orx)
+            .into_iter()
+            .filter(|e| matches!(e, ScanEvent::Vlan(_)))
+            .count();
+        assert_eq!(forwarded, 3, "unchanged snapshots are not re-sent");
+    }
+
+    #[tokio::test]
+    async fn ipv6_folding_is_deterministic() {
+        for _ in 0..20 {
+            let (itx, irx) = mpsc::channel(64);
+            let (otx, _orx) = mpsc::channel(256);
+            let agg = tokio::spawn(aggregate(irx, otx));
+            // Proxy-ARP style: several IPv4 rows share one MAC.
+            for ip in ["10.0.0.30", "10.0.0.4", "10.0.0.200", "10.0.0.17"] {
+                let mut d = Device::new(ip.parse().unwrap());
+                d.mac = Some("aa:aa:aa:aa:aa:01".into());
+                itx.send(ScanEvent::device(d)).await.unwrap();
+            }
+            // Same MAC on another VLAN must not attract the IPv6 address.
+            let mut other_vlan = Device::new("10.0.0.1".parse().unwrap());
+            other_vlan.mac = Some("aa:aa:aa:aa:aa:01".into());
+            other_vlan.vlan_id = Some(20);
+            itx.send(ScanEvent::device(other_vlan)).await.unwrap();
+            let mut v6 = Device::new("fe80::1".parse().unwrap());
+            v6.mac = Some("aa:aa:aa:aa:aa:01".into());
+            itx.send(ScanEvent::device(v6)).await.unwrap();
+            drop(itx);
+            let state = agg.await.unwrap();
+            let owners: Vec<&str> = state
+                .devices
+                .iter()
+                .filter(|(_, d)| !d.extra_ips.is_empty())
+                .map(|(k, _)| k.as_str())
+                .collect();
+            assert_eq!(owners, vec!["10.0.0.4"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn neighbors_are_deduplicated_and_indexed() {
+        let (itx, irx) = mpsc::channel(64);
+        let (otx, mut orx) = mpsc::channel(256);
+        let agg = tokio::spawn(aggregate(irx, otx));
+        let n = switch_neighbor("cc:cc:cc:cc:cc:cc", "10.0.0.9");
+        itx.send(ScanEvent::Neighbor(n.clone())).await.unwrap();
+        let mut again = n.clone();
+        again.last_seen_ms += 30_000;
+        itx.send(ScanEvent::Neighbor(again)).await.unwrap(); // same advert, later
+                                                             // Device learned after the neighbor matches by MAC.
+        let mut d = Device::new("10.0.0.50".parse().unwrap());
+        d.mac = Some("cc:cc:cc:cc:cc:cc".into());
+        itx.send(ScanEvent::device(d)).await.unwrap();
+        // A changed advert is forwarded and re-applied.
+        let mut changed = n.clone();
+        changed.capabilities = vec![Capability::WlanAccessPoint];
+        itx.send(ScanEvent::Neighbor(changed)).await.unwrap();
+        itx.send(progress(ScanPhase::Discovering, None))
+            .await
+            .unwrap();
+        drop(itx);
+        let state = agg.await.unwrap();
+        assert_eq!(state.neighbors.len(), 1);
+        let dev = &state.devices["10.0.0.50"];
+        assert_eq!(dev.role, DeviceRole::Switch);
+        assert_eq!(
+            dev.neighbor.as_ref().unwrap().capabilities,
+            vec![Capability::WlanAccessPoint]
+        );
+        let events = drain(&mut orx);
+        let neighbors = events
+            .iter()
+            .filter(|e| matches!(e, ScanEvent::Neighbor(_)))
+            .count();
+        assert_eq!(neighbors, 2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Progress(p) if p.devices_found == 1)));
+    }
+
+    #[tokio::test]
+    async fn neighbor_table_is_capped() {
+        let (itx, irx) = mpsc::channel(64);
+        let (otx, mut orx) = mpsc::channel(64);
+        let agg = tokio::spawn(aggregate(irx, otx));
+        let drain_task = tokio::spawn(async move {
+            let mut warns = 0;
+            while let Some(ev) = orx.recv().await {
+                if matches!(ev, ScanEvent::Log { .. }) {
+                    warns += 1;
+                }
+            }
+            warns
+        });
+        for i in 0..(arp_vlan::MAX_NEIGHBORS + 10) {
+            let mut n = switch_neighbor("cc:cc:cc:cc:cc:cc", "10.0.0.9");
+            n.device_id = format!("spoof-{i}");
+            itx.send(ScanEvent::Neighbor(n)).await.unwrap();
+        }
+        drop(itx);
+        let state = agg.await.unwrap();
+        assert_eq!(state.neighbors.len(), arp_vlan::MAX_NEIGHBORS);
+        assert_eq!(drain_task.await.unwrap(), 1);
+    }
+
+    #[test]
+    fn wifi_tagged_probing_warns() {
+        let mut wifi = iface("en0", "10.0.0.5", 24);
+        wifi.kind = InterfaceKind::Wifi;
+        let plan = plan_scan(
+            &wifi,
+            std::slice::from_ref(&wifi),
+            &[r("10.0.0.0/24")],
+            &[None, Some(10)],
+            true,
+        );
+        let w = wifi_tagging_warning(&wifi, &plan).unwrap();
+        assert!(w.contains("Wi-Fi") && w.contains("10"));
+        let untagged = plan_scan(
+            &wifi,
+            std::slice::from_ref(&wifi),
+            &[r("10.0.0.0/24")],
+            &[None],
+            true,
+        );
+        assert!(wifi_tagging_warning(&wifi, &untagged).is_none());
+        let eth = iface("en1", "10.0.0.5", 24);
+        let tagged = plan_scan(
+            &eth,
+            std::slice::from_ref(&eth),
+            &[r("10.0.0.0/24")],
+            &[Some(10)],
+            true,
+        );
+        assert!(wifi_tagging_warning(&eth, &tagged).is_none());
     }
 }

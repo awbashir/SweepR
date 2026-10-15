@@ -6,6 +6,10 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "dialog:default"
+    "allow-list-interfaces",
+    "allow-start-scan",
+    "allow-stop-scan",
+    "allow-start-vlan-discovery",
+    "allow-export-devices"
   ]
 }

@@ -35,6 +35,47 @@ pub enum ModelError {
     InvalidConfig(String),
 }
 
+/// Longest string kept from any network-supplied text field (CDP/LLDP/VTP, names).
+pub const MAX_TEXT_LEN: usize = 256;
+
+/// `true` for Unicode bidirectional / zero-width format characters that can make text
+/// display differently from its content ("Trojan Source" style spoofing).
+fn is_bidi_or_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+    )
+}
+
+/// Make untrusted text safe to print on a terminal or show in a UI.
+///
+/// Whitespace control characters (tab, newline, CR, VT, FF) become a single space; every
+/// other control character (C0 including ESC and BEL, DEL, C1 such as CSI `\u{9b}`) and
+/// bidi/zero-width format characters are removed. Leading/trailing whitespace and NULs are
+/// trimmed and the result is capped at [`MAX_TEXT_LEN`] characters.
+pub fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MAX_TEXT_LEN));
+    let mut chars = 0usize;
+    for c in s.chars() {
+        let c = match c {
+            '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}' => ' ',
+            c if c.is_control() || is_bidi_or_invisible(c) => continue,
+            c => c,
+        };
+        if chars == MAX_TEXT_LEN {
+            break;
+        }
+        out.push(c);
+        chars += 1;
+    }
+    let trimmed = out.trim();
+    if trimmed.len() == out.len() {
+        out
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -223,9 +264,24 @@ impl VlanInfo {
         self.first_seen_ms = self.first_seen_ms.min(other.first_seen_ms);
         self.last_seen_ms = self.last_seen_ms.max(other.last_seen_ms);
     }
+
+    /// Fold a *cumulative snapshot* of the same VLAN into this one.
+    ///
+    /// [`ScanEvent::Vlan`] events carry the running totals of the observer that emitted them
+    /// (a passive listener re-announces a VLAN with its total frame count so far), so
+    /// summing them would double count. Concurrent listeners on one interface see the same
+    /// frames, so the largest count is the true one.
+    pub fn merge_snapshot(&mut self, other: &VlanInfo) {
+        let frames = self.frames_seen.max(other.frames_seen);
+        self.merge(other);
+        self.frames_seen = frames;
+    }
 }
 
 /// Which VLANs a scan should tag its probes with.
+///
+/// Serialized as `{"mode": "...", "ids": [...]}`; the `untagged_and_list` mode was added
+/// later, so older `untagged` / `list` / `auto_detect` documents keep their meaning.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "mode", content = "ids", rename_all = "snake_case")]
 pub enum VlanSelection {
@@ -236,18 +292,42 @@ pub enum VlanSelection {
     List(Vec<u16>),
     /// OS VLAN interfaces + a short passive sniff for tags/CDP/LLDP/VTP.
     AutoDetect,
+    /// The native (untagged) network plus explicit VLAN IDs, e.g. `untagged,10,20`.
+    UntaggedAndList(Vec<u16>),
 }
 
 impl VlanSelection {
     pub fn is_untagged(&self) -> bool {
         matches!(self, VlanSelection::Untagged)
     }
+
+    /// Explicit VLAN IDs of a list selection (empty for `Untagged` / `AutoDetect`).
+    pub fn ids(&self) -> &[u16] {
+        match self {
+            VlanSelection::List(ids) | VlanSelection::UntaggedAndList(ids) => ids,
+            VlanSelection::Untagged | VlanSelection::AutoDetect => &[],
+        }
+    }
+
+    /// `true` when the native (untagged) network is probed.
+    pub fn includes_untagged(&self) -> bool {
+        !matches!(self, VlanSelection::List(_))
+    }
+}
+
+fn is_untagged_keyword(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "untagged" | "none" | "native"
+    )
 }
 
 impl FromStr for VlanSelection {
     type Err = ModelError;
 
-    /// Accepts `untagged`/`none`/empty, `auto`, or a list such as `10,20,30` / `1-100` / `10,20-25`.
+    /// Accepts `untagged`/`none`/empty, `auto`, or a list such as `10,20,30` / `1-100` /
+    /// `10,20-25`. A list may include `untagged` (`untagged,10,20`) to also probe the native
+    /// network.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         match s.to_ascii_lowercase().as_str() {
@@ -257,10 +337,20 @@ impl FromStr for VlanSelection {
         }
 
         let mut ids: Vec<u16> = Vec::new();
+        let mut untagged = false;
         for part in s
             .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|p| !p.is_empty())
         {
+            if is_untagged_keyword(part) {
+                untagged = true;
+                continue;
+            }
+            if part.eq_ignore_ascii_case("auto") {
+                return Err(ModelError::InvalidVlan(
+                    "'auto' cannot be combined with other VLAN IDs".into(),
+                ));
+            }
             // Tolerate a leading "VLAN"/"vlan" label ("VLAN 10, 20").
             let part = part.trim_start_matches(|c: char| c.is_ascii_alphabetic());
             if part.is_empty() {
@@ -292,22 +382,23 @@ impl FromStr for VlanSelection {
         }
         ids.sort_unstable();
         ids.dedup();
-        if ids.is_empty() {
-            return Err(ModelError::InvalidVlan(format!("no VLAN IDs in '{s}'")));
+        match (ids.is_empty(), untagged) {
+            (true, true) => Ok(VlanSelection::Untagged),
+            (true, false) => Err(ModelError::InvalidVlan(format!("no VLAN IDs in '{s}'"))),
+            (false, true) => Ok(VlanSelection::UntaggedAndList(ids)),
+            (false, false) => Ok(VlanSelection::List(ids)),
         }
-        Ok(VlanSelection::List(ids))
     }
 }
 
 impl fmt::Display for VlanSelection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let list = |ids: &[u16]| ids.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
         match self {
             VlanSelection::Untagged => f.write_str("untagged"),
             VlanSelection::AutoDetect => f.write_str("auto"),
-            VlanSelection::List(ids) => {
-                let s: Vec<String> = ids.iter().map(u16::to_string).collect();
-                f.write_str(&s.join(","))
-            }
+            VlanSelection::List(ids) => f.write_str(&list(ids)),
+            VlanSelection::UntaggedAndList(ids) => write!(f, "untagged,{}", list(ids)),
         }
     }
 }
@@ -443,22 +534,45 @@ impl CdpLldpNeighbor {
         {
             return DeviceRole::Firewall;
         }
-        if has(Capability::WlanAccessPoint)
-            || any(&[
-                "access point",
-                "aironet",
-                "air-ap",
-                "air-cap",
-                "unifi ap",
-                "uap-",
-                "u6-",
-                "meraki mr",
-                "aruba ap",
-                "instant ap",
-                "ruckus zoneflex",
-                "mikrotik cap",
-            ])
-        {
+        // Access points are checked before switches: many APs (e.g. Cisco Catalyst 91xx,
+        // Aironet) advertise only the CDP "transparent bridge" capability, which maps to
+        // Switch, so an AP model/software string must win over that capability.
+        let ap_keyword = any(&[
+            "access point",
+            "aironet",
+            "air-",
+            "cisco ap software",
+            "ap3g",
+            "ap1g",
+            "c9105",
+            "c9115",
+            "c9117",
+            "c9120",
+            "c9124",
+            "c9130",
+            "c9136",
+            "cw91",
+            "unifi",
+            "uap-",
+            "u6-",
+            "u7-",
+            "meraki mr",
+            "aruba ap",
+            "instant ap",
+            "ruckus zoneflex",
+            "mikrotik cap",
+        ]);
+        // Controllers and non-AP gear whose strings overlap the AP keywords above.
+        let not_ap = any(&[
+            "air-ct",
+            "wireless lan controller",
+            "unifi switch",
+            "usw-",
+            "udm",
+            "usg",
+            "uxg",
+        ]);
+        if has(Capability::WlanAccessPoint) || (ap_keyword && !not_ap) {
             return DeviceRole::AccessPoint;
         }
         // L3 switches advertise Router + Switch: treat them as switches.
@@ -712,11 +826,48 @@ impl InterfaceInfo {
         })
     }
 
+    /// Global unicast and ULA (fc00::/7) addresses of the interface with their prefix length.
+    pub fn routable_v6(&self) -> impl Iterator<Item = (Ipv6Addr, u8)> + '_ {
+        self.addrs.iter().filter_map(|a| match a.ip {
+            IpAddr::V6(v6) if is_routable_v6(v6) => Some((v6, a.prefix)),
+            _ => None,
+        })
+    }
+
+    /// `true` when `ip` is link-local or inside one of this interface's IPv6 prefixes.
+    pub fn is_on_link_v6(&self, ip: Ipv6Addr) -> bool {
+        is_link_local_v6(ip)
+            || self
+                .routable_v6()
+                .any(|(net, prefix)| same_v6_prefix(ip, net, prefix))
+    }
+
     /// The directly connected IPv4 subnet (host range), e.g. `10.177.134.1-10.177.134.254`.
     pub fn local_subnet(&self) -> Option<Ipv4Range> {
         let (ip, prefix) = self.primary_ipv4()?;
         Ipv4Range::from_cidr(ip, prefix).ok()
     }
+}
+
+/// `true` for fe80::/10.
+pub fn is_link_local_v6(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// `true` for global unicast (2000::/3) and unique-local (fc00::/7) addresses.
+pub fn is_routable_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    (first & 0xe000) == 0x2000 || (first & 0xfe00) == 0xfc00
+}
+
+/// `true` when `a` and `b` share their first `prefix` bits.
+pub fn same_v6_prefix(a: Ipv6Addr, b: Ipv6Addr, prefix: u8) -> bool {
+    let prefix = u32::from(prefix.min(128));
+    if prefix == 0 {
+        return true;
+    }
+    let mask = u128::MAX << (128 - prefix);
+    (u128::from(a) & mask) == (u128::from(b) & mask)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -961,6 +1112,17 @@ impl SnmpConfig {
     }
 }
 
+/// Upper bounds enforced by [`ScanConfig::validate`]. They keep arithmetic (deadlines,
+/// pacing intervals, semaphore permits) far from overflow and reject nonsense input early.
+pub const MAX_RATE_PPS: u64 = 1_000_000;
+/// Maximum in-flight async probes (well below `tokio::sync::Semaphore::MAX_PERMITS`).
+pub const MAX_CONCURRENCY: usize = 65_535;
+/// Reply timeout / grace period ceiling (10 minutes).
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
+pub const MAX_RETRIES: u64 = 10;
+/// Passive listening ceiling (one day).
+pub const MAX_LISTEN_SECS: u64 = 86_400;
+
 /// Everything a scan needs. Missing fields in JSON (from the GUI) fall back to [`Default`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1021,27 +1183,45 @@ impl ScanConfig {
 
     pub fn validate(&self) -> Result<(), ModelError> {
         self.parse_ranges()?;
-        if let VlanSelection::List(ids) = &self.vlans {
+        if let VlanSelection::List(ids) | VlanSelection::UntaggedAndList(ids) = &self.vlans {
             if ids.is_empty() || ids.iter().any(|v| !(1..=MAX_VLAN_ID).contains(v)) {
                 return Err(ModelError::InvalidVlan(format!(
                     "VLAN IDs must be 1-{MAX_VLAN_ID}"
                 )));
             }
         }
-        if self.rate_pps == 0 {
-            return Err(ModelError::InvalidConfig("rate_pps must be > 0".into()));
-        }
-        if self.concurrency == 0 {
-            return Err(ModelError::InvalidConfig("concurrency must be > 0".into()));
+        let bound = |name: &str, value: u64, min: u64, max: u64| {
+            if (min..=max).contains(&value) {
+                Ok(())
+            } else {
+                Err(ModelError::InvalidConfig(format!(
+                    "{name} must be between {min} and {max} (got {value})"
+                )))
+            }
+        };
+        bound("rate_pps", u64::from(self.rate_pps), 1, MAX_RATE_PPS)?;
+        bound(
+            "concurrency",
+            u64::try_from(self.concurrency).unwrap_or(u64::MAX),
+            1,
+            MAX_CONCURRENCY as u64,
+        )?;
+        bound("timeout_ms", self.timeout_ms, 0, MAX_TIMEOUT_MS)?;
+        bound("retries", u64::from(self.retries), 0, MAX_RETRIES)?;
+        bound("listen_secs", self.listen_secs, 0, MAX_LISTEN_SECS)?;
+        if self.ports.contains(&0) {
+            return Err(ModelError::InvalidPort("port 0".into()));
         }
         if let Some(snmp) = &self.snmp {
             if snmp.version == SnmpVersion::V3
-                && snmp.v3.as_ref().map_or(true, |c| c.username.is_empty())
+                && snmp.v3.as_ref().is_none_or(|c| c.username.is_empty())
             {
                 return Err(ModelError::InvalidConfig(
                     "SNMPv3 requires a username".into(),
                 ));
             }
+            bound("snmp.timeout_ms", snmp.timeout_ms, 1, MAX_TIMEOUT_MS)?;
+            bound("snmp.retries", u64::from(snmp.retries), 0, MAX_RETRIES)?;
         }
         Ok(())
     }
@@ -1218,6 +1398,197 @@ mod tests {
     }
 
     #[test]
+    fn vlan_selection_with_untagged() {
+        assert_eq!(
+            "untagged,10,20".parse::<VlanSelection>().unwrap(),
+            VlanSelection::UntaggedAndList(vec![10, 20])
+        );
+        assert_eq!(
+            "20, native, 10-11".parse::<VlanSelection>().unwrap(),
+            VlanSelection::UntaggedAndList(vec![10, 11, 20])
+        );
+        assert_eq!(
+            "untagged, none".parse::<VlanSelection>().unwrap(),
+            VlanSelection::Untagged
+        );
+        assert!("auto,10".parse::<VlanSelection>().is_err());
+        let sel = VlanSelection::UntaggedAndList(vec![10, 20]);
+        assert_eq!(sel.to_string(), "untagged,10,20");
+        assert_eq!(sel.to_string().parse::<VlanSelection>().unwrap(), sel);
+        assert!(sel.includes_untagged() && !VlanSelection::List(vec![1]).includes_untagged());
+        assert_eq!(sel.ids(), &[10, 20]);
+
+        // Serde: new variant round-trips, old documents keep their meaning.
+        let v = serde_json::to_value(&sel).unwrap();
+        assert_eq!(v["mode"], "untagged_and_list");
+        assert_eq!(v["ids"], serde_json::json!([10, 20]));
+        assert_eq!(serde_json::from_value::<VlanSelection>(v).unwrap(), sel);
+        for (json, want) in [
+            (r#"{"mode":"untagged"}"#, VlanSelection::Untagged),
+            (r#"{"mode":"auto_detect"}"#, VlanSelection::AutoDetect),
+            (r#"{"mode":"list","ids":[5]}"#, VlanSelection::List(vec![5])),
+        ] {
+            assert_eq!(serde_json::from_str::<VlanSelection>(json).unwrap(), want);
+        }
+        let mut cfg = ScanConfig {
+            vlans: VlanSelection::UntaggedAndList(vec![4095]),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+        cfg.vlans = VlanSelection::UntaggedAndList(vec![10]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn sanitize_strips_control_and_escape_sequences() {
+        assert_eq!(
+            sanitize_text("\u{1b}]0;pwned\u{7}\u{1b}[2Jsw01"),
+            "]0;pwned[2Jsw01"
+        );
+        assert_eq!(sanitize_text("a\u{9b}31mb\u{7f}c"), "a31mbc"); // C1 CSI and DEL
+        assert_eq!(sanitize_text("  IOS\nVersion 17\r\n\0\0"), "IOS Version 17");
+        assert_eq!(sanitize_text("evil\u{202e}txt.exe"), "eviltxt.exe");
+        assert_eq!(sanitize_text("Zürich-SW"), "Zürich-SW");
+        let long = "x".repeat(MAX_TEXT_LEN * 4);
+        assert_eq!(sanitize_text(&long).chars().count(), MAX_TEXT_LEN);
+        assert!(sanitize_text(&"é".repeat(1000)).chars().count() == MAX_TEXT_LEN);
+    }
+
+    #[test]
+    fn numeric_config_is_bounded() {
+        let ok = ScanConfig::default();
+        ok.validate().unwrap();
+        let bad = [
+            ScanConfig {
+                concurrency: usize::MAX,
+                ..Default::default()
+            },
+            ScanConfig {
+                concurrency: MAX_CONCURRENCY + 1,
+                ..Default::default()
+            },
+            ScanConfig {
+                concurrency: 0,
+                ..Default::default()
+            },
+            ScanConfig {
+                listen_secs: u64::MAX,
+                ..Default::default()
+            },
+            ScanConfig {
+                timeout_ms: u64::MAX,
+                ..Default::default()
+            },
+            ScanConfig {
+                retries: 200,
+                ..Default::default()
+            },
+            ScanConfig {
+                rate_pps: 0,
+                ..Default::default()
+            },
+            ScanConfig {
+                rate_pps: u32::MAX,
+                ..Default::default()
+            },
+            ScanConfig {
+                ports: vec![0],
+                ..Default::default()
+            },
+            ScanConfig {
+                snmp: Some(SnmpConfig {
+                    timeout_ms: u64::MAX,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        for cfg in bad {
+            assert!(cfg.validate().is_err(), "{cfg:?}");
+        }
+        ScanConfig {
+            concurrency: MAX_CONCURRENCY,
+            listen_secs: MAX_LISTEN_SECS,
+            timeout_ms: MAX_TIMEOUT_MS,
+            retries: MAX_RETRIES as u8,
+            rate_pps: MAX_RATE_PPS as u32,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn vlan_snapshot_merge_does_not_double_count() {
+        let mut a = VlanInfo::new(30, VlanSource::Tagged8021q);
+        a.frames_seen = 2;
+        let mut later = a.clone();
+        later.frames_seen = 6;
+        a.merge_snapshot(&later);
+        a.merge_snapshot(&later);
+        assert_eq!(a.frames_seen, 6);
+        let mut cdp = VlanInfo::new(30, VlanSource::Cdp);
+        cdp.name = Some("USERS".into());
+        a.merge_snapshot(&cdp);
+        assert_eq!(a.frames_seen, 6);
+        assert_eq!(a.name.as_deref(), Some("USERS"));
+        assert_eq!(a.sources, vec![VlanSource::Tagged8021q, VlanSource::Cdp]);
+    }
+
+    #[test]
+    fn ipv6_on_link_helpers() {
+        let iface = InterfaceInfo {
+            name: "en0".into(),
+            index: 4,
+            description: None,
+            mac: None,
+            addrs: vec![
+                IfAddr {
+                    ip: "fe80::1".parse().unwrap(),
+                    prefix: 64,
+                },
+                IfAddr {
+                    ip: "2001:db8:1::5".parse().unwrap(),
+                    prefix: 64,
+                },
+                IfAddr {
+                    ip: "fd00:1::5".parse().unwrap(),
+                    prefix: 48,
+                },
+            ],
+            is_up: true,
+            kind: InterfaceKind::Ethernet,
+            vlan_id: None,
+            parent: None,
+            is_default: true,
+        };
+        let routable: Vec<Ipv6Addr> = iface.routable_v6().map(|(ip, _)| ip).collect();
+        assert_eq!(
+            routable,
+            vec![
+                "2001:db8:1::5".parse::<Ipv6Addr>().unwrap(),
+                "fd00:1::5".parse().unwrap()
+            ]
+        );
+        for on in ["fe80::abcd", "2001:db8:1::99", "fd00:1:0:ffff::1"] {
+            assert!(iface.is_on_link_v6(on.parse().unwrap()), "{on}");
+        }
+        for off in ["2001:db8:2::1", "fd00:2::1", "2600::1"] {
+            assert!(!iface.is_on_link_v6(off.parse().unwrap()), "{off}");
+        }
+        assert!(same_v6_prefix(
+            "::1".parse().unwrap(),
+            "ffff::".parse().unwrap(),
+            0
+        ));
+        assert!(!same_v6_prefix(
+            "::1".parse().unwrap(),
+            "::2".parse().unwrap(),
+            128
+        ));
+    }
+
+    #[test]
     fn port_parsing() {
         assert_eq!(parse_ports("443, 22,80,22").unwrap(), vec![22, 80, 443]);
         assert_eq!(parse_ports("1-3,8443").unwrap(), vec![1, 2, 3, 8443]);
@@ -1348,6 +1719,45 @@ mod tests {
         assert_eq!(
             neighbor("Cisco IP Phone 8845", &[Telephone]).infer_role(),
             DeviceRole::Host
+        );
+    }
+
+    #[test]
+    fn modern_access_points_beat_bridge_capability() {
+        use Capability::*;
+        // Catalyst 91xx / CW91xx APs advertise CDP "transparent bridge" (→ Switch).
+        for platform in [
+            "cisco C9120AXI-B",
+            "cisco C9130AXE-B",
+            "cisco C9105AXW-B",
+            "cisco CW9164I-ROW",
+            "cisco AIR-AP2802I-B-K9",
+            "cisco AIR-CAP3702I-A-K9",
+            "Aruba AP-515",
+            "UniFi U6-Pro",
+            "Meraki MR46",
+        ] {
+            assert_eq!(
+                neighbor(platform, &[Switch]).infer_role(),
+                DeviceRole::AccessPoint,
+                "{platform}"
+            );
+        }
+        let mut sw = neighbor("cisco WS-C2960X", &[Switch]);
+        sw.software_version = Some("Cisco AP Software, ap3g3-k9w8 Version: 17.9".into());
+        assert_eq!(sw.infer_role(), DeviceRole::AccessPoint);
+        // Gear that shares keywords but is not an AP.
+        assert_eq!(
+            neighbor("cisco AIR-CT5520-K9", &[Router, Switch]).infer_role(),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            neighbor("UniFi Switch USW-24-POE", &[Switch]).infer_role(),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            neighbor("cisco C9300-48P", &[Router, Switch]).infer_role(),
+            DeviceRole::Switch
         );
     }
 
