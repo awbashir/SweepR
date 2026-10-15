@@ -181,7 +181,14 @@ cargo clippy --all-targets -- -D warnings
 npm install
 npm run tauri:dev      # development
 npm run tauri:build    # .app/.dmg (macOS), .deb/.AppImage (Linux)
+
+# Run the GUI straight from cargo with the embedded frontend (no dev server):
+npm run build
+cd src-tauri && cargo run --features custom-protocol -- --gui
 ```
+
+Without `--features custom-protocol`, a debug binary loads `devUrl` (http://localhost:1420) and
+shows a blank window unless `npm run dev` is running. `tauri build` enables the feature for you.
 
 ## Layout
 
