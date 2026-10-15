@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { Suspense, lazy, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   Copy,
   ExternalLink,
@@ -35,8 +35,11 @@ import { NeighborView, VlanView } from "./components/InfraViews.tsx";
 import { ContextMenu, type MenuState } from "./components/Menu.tsx";
 import { LogPanel, StatusBar } from "./components/StatusBar.tsx";
 import { ToastProvider, useToasts } from "./components/Toasts.tsx";
-import { FilterBar, Toolbar, type RoleFilter, type View } from "./components/Toolbar.tsx";
+import { FilterBar, Toolbar, type DevicesMode, type RoleFilter, type View } from "./components/Toolbar.tsx";
 import { Button, Kbd } from "./components/ui.tsx";
+
+// React Flow + dagre load only when the topology map is first shown.
+const TopologyView = lazy(() => import("./components/TopologyView.tsx"));
 
 /** One store for the app's lifetime; React reads throttled snapshots of it. */
 const store = new ScanStore();
@@ -49,6 +52,8 @@ interface UiPrefs {
   customPorts: string;
   discoveryTimeout: number;
   view: View;
+  /** Devices drawn as the table or the topology map. */
+  devicesMode: DevicesMode;
   urlTemplate: string;
 }
 
@@ -59,6 +64,7 @@ const DEFAULT_UI: UiPrefs = {
   customPorts: "22,80,443,8080,8443",
   discoveryTimeout: 30,
   view: "devices",
+  devicesMode: "table",
   urlTemplate: "http://{ip}:8080/",
 };
 
@@ -254,10 +260,11 @@ function Main() {
   const startEdit = useCallback(
     (key: string, field: EditField) => {
       setSelectedKey(key);
-      if (ui.view !== "devices") patchUi({ view: "devices" });
+      // Inline editing lives in the table.
+      if (ui.view !== "devices" || ui.devicesMode !== "table") patchUi({ view: "devices", devicesMode: "table" });
       setEditing({ key, field });
     },
-    [ui.view, patchUi],
+    [ui.view, ui.devicesMode, patchUi],
   );
 
   const copy = useCallback(
@@ -451,6 +458,22 @@ function Main() {
     [openScheme, openDetails, runPortScan, querySnmp, startEdit, copy, removeRow],
   );
 
+  // Topology map callbacks (stable identities keep the map from re-rendering needlessly).
+  const openDeviceMenu = useCallback(
+    (key: string, x: number, y: number) => {
+      const row = snap.rows.find((r) => r.key === key);
+      if (row) openRowMenu(row, x, y);
+    },
+    [snap.rows, openRowMenu],
+  );
+  const copyText = useCallback((text: string, what: string) => void copy(text, what), [copy]);
+  const scanWithCdp = useCallback(() => {
+    patchSettings({ cdpLldp: true });
+    void startWith({ ...settings, cdpLldp: true });
+  }, [settings, patchSettings, startWith]);
+  const openSnmp = useCallback(() => setSnmpOpen(true), []);
+  const passiveListen = useCallback(() => void passiveDiscovery(), [passiveDiscovery]);
+
   // --- global shortcuts --------------------------------------------------------------------------
 
   useEffect(() => {
@@ -475,11 +498,15 @@ function Main() {
       } else if (k === "l") {
         e.preventDefault();
         patchUi({ logOpen: !ui.logOpen });
+      } else if (k === "t" && !e.shiftKey) {
+        // Table <-> topology map.
+        e.preventDefault();
+        patchUi({ view: "devices", devicesMode: ui.view === "devices" && ui.devicesMode === "topology" ? "table" : "topology" });
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [ui.view, ui.drawerOpen, ui.logOpen, snap.running, start, stop, patchUi]);
+  }, [ui.view, ui.devicesMode, ui.drawerOpen, ui.logOpen, snap.running, start, stop, patchUi]);
 
   // Mock mode convenience: `?autoscan=10.0.0.0/16` starts a scan on load (stress testing).
   const autoscanDone = useRef(false);
@@ -540,6 +567,8 @@ function Main() {
         ref={searchRef}
         view={ui.view}
         onView={(view) => patchUi({ view })}
+        devicesMode={ui.devicesMode}
+        onDevicesMode={(devicesMode) => patchUi({ devicesMode })}
         counts={{ devices: snap.rows.length, vlans: snap.vlans.length, neighbors: snap.neighbors.length }}
         roleFilter={roleFilter}
         onRoleFilter={setRoleFilter}
@@ -558,7 +587,30 @@ function Main() {
       />
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          {ui.view === "devices" && (
+          {ui.view === "devices" && ui.devicesMode === "topology" && (
+            <Suspense fallback={<div className="flex flex-1 items-center justify-center text-muted">Loading the topology map…</div>}>
+              <TopologyView
+                rows={snap.rows}
+                neighbors={snap.neighbors}
+                vlans={snap.vlans}
+                portMappings={snap.portMappings}
+                snmp={snap.snmp}
+                running={snap.running}
+                roleFilter={roleFilter}
+                search={deferredSearch}
+                selectedKey={selectedKey}
+                onOpenDetails={openDetails}
+                onDeviceMenu={openDeviceMenu}
+                onCopy={copyText}
+                onScanCdp={scanWithCdp}
+                onOpenSnmp={openSnmp}
+                onPassiveListen={passiveListen}
+                cdpLldp={settings.cdpLldp}
+                snmpEnabled={settings.snmpEnabled}
+              />
+            </Suspense>
+          )}
+          {ui.view === "devices" && ui.devicesMode === "table" && (
             <DeviceTable
               rows={filtered}
               selectedKey={selectedKey}
@@ -690,7 +742,7 @@ function Welcome({
         </p>
       </div>
       <p className="text-[11px] text-muted">
-        <Kbd>⌘R</Kbd> start · <Kbd>⌘.</Kbd> stop · <Kbd>⌘F</Kbd> search · <Kbd>↑↓</Kbd> select · <Kbd>↩</Kbd> details · <Kbd>F2</Kbd> edit
+        <Kbd>⌘R</Kbd> start · <Kbd>⌘.</Kbd> stop · <Kbd>⌘F</Kbd> search · <Kbd>⌘T</Kbd> topology map · <Kbd>↑↓</Kbd> select · <Kbd>↩</Kbd> details · <Kbd>F2</Kbd> edit
         hostname · right-click for actions
       </p>
       {isMock && (
