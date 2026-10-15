@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::{sanitize_text, Device};
 
 /// Number of columns in every tabular export.
-pub const NUM_COLUMNS: usize = 14;
+pub const NUM_COLUMNS: usize = 19;
 
 /// Column headers shared by every tabular export.
 pub const COLUMNS: [&str; NUM_COLUMNS] = [
@@ -33,18 +33,76 @@ pub const COLUMNS: [&str; NUM_COLUMNS] = [
     "SMB Name",
     "SMB Domain",
     "TCP Ports",
+    "Device Kind",
+    "Model/Firmware",
+    "PoE (W)",
+    "Voice VLAN",
+    "OS (DHCP)",
     "Comments",
 ];
 
 const COL_VLAN: usize = 3;
+const COL_POE: usize = 15;
+const COL_VOICE_VLAN: usize = 16;
 
 /// Columns always shown by [`render_table`], even when empty (IP, MAC, VLAN, Role).
 const ALWAYS_SHOWN: [usize; 4] = [0, 2, COL_VLAN, 4];
 
 /// Excel column widths (characters), aligned with [`COLUMNS`].
 const XLSX_WIDTHS: [f64; NUM_COLUMNS] = [
-    16.0, 30.0, 19.0, 7.0, 13.0, 22.0, 24.0, 28.0, 30.0, 26.0, 18.0, 16.0, 20.0, 36.0,
+    16.0, 30.0, 19.0, 7.0, 13.0, 22.0, 24.0, 28.0, 30.0, 26.0, 18.0, 16.0, 20.0, 14.0, 30.0, 9.0,
+    11.0, 22.0, 36.0,
 ];
+
+/// `MODEL / FIRMWARE` from the most specific service source (SIP, ONVIF, then SSDP/UPnP).
+pub fn model_firmware(d: &Device) -> String {
+    let pair = |model: Option<&str>, fw: Option<&str>| -> Option<String> {
+        match (model, fw) {
+            (Some(m), Some(f)) => Some(format!("{m} / {f}")),
+            (Some(m), None) => Some(m.to_string()),
+            (None, Some(f)) => Some(format!("fw {f}")),
+            (None, None) => None,
+        }
+    };
+    let sip = d
+        .sip
+        .as_ref()
+        .and_then(|s| pair(s.model.as_deref(), s.firmware.as_deref()));
+    let onvif = || {
+        d.onvif
+            .as_ref()
+            .and_then(|o| pair(o.model.as_deref(), o.firmware_version.as_deref()))
+    };
+    let ssdp = || {
+        d.ssdp.as_ref().and_then(|s| {
+            let model = match (s.model_name.as_deref(), s.model_number.as_deref()) {
+                (Some(n), Some(num)) if !n.contains(num) => Some(format!("{n} {num}")),
+                (Some(n), _) => Some(n.to_string()),
+                (None, num) => num.map(str::to_string),
+            };
+            pair(model.as_deref(), None)
+        })
+    };
+    sip.or_else(onvif)
+        .or_else(ssdp)
+        .map(|s| sanitize_text(&s))
+        .unwrap_or_default()
+}
+
+/// The DHCP OS guess with its confidence, e.g. `Windows (high)`.
+pub fn dhcp_os(d: &Device) -> String {
+    d.dhcp_fingerprint
+        .as_ref()
+        .and_then(|f| {
+            let os = f.os.as_deref()?;
+            Some(match f.confidence.as_deref() {
+                Some(c) => format!("{os} ({c})"),
+                None => os.to_string(),
+            })
+        })
+        .map(|s| sanitize_text(&s))
+        .unwrap_or_default()
+}
 
 /// File formats supported by [`export_to_path`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +180,15 @@ pub fn device_row(d: &Device) -> [String; NUM_COLUMNS] {
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(", "),
+        opt(&d.device_kind),
+        model_firmware(d),
+        d.poe
+            .as_ref()
+            .and_then(|p| p.watts.or(p.max_watts))
+            .map(|w| format!("{w:.1}"))
+            .unwrap_or_default(),
+        d.voice_vlan.map(|v| v.to_string()).unwrap_or_default(),
+        dhcp_os(d),
         opt(&d.comments),
     ]
 }
@@ -176,12 +243,22 @@ fn build_xlsx(devices: &[Device]) -> Result<Workbook> {
     for (i, d) in rows.iter().enumerate() {
         let row = u32::try_from(i + 1).context("too many rows for a worksheet")?;
         for (col, value) in device_row(d).iter().enumerate() {
-            let is_vlan = col == COL_VLAN;
+            // Numeric cells for VLAN, PoE watts and voice VLAN (sortable / summable in Excel).
+            let number = match col {
+                COL_VLAN => d.vlan_id.map(f64::from),
+                COL_POE => d
+                    .poe
+                    .as_ref()
+                    .and_then(|p| p.watts.or(p.max_watts))
+                    .map(|w| (f64::from(w) * 10.0).round() / 10.0),
+                COL_VOICE_VLAN => d.voice_vlan.map(f64::from),
+                _ => None,
+            };
             let col = u16::try_from(col)?;
-            match (is_vlan, d.vlan_id) {
-                (true, Some(v)) => ws.write_number(row, col, f64::from(v))?,
-                _ if value.is_empty() => continue,
-                _ => ws.write_string(row, col, value)?,
+            match number {
+                Some(n) => ws.write_number(row, col, n)?,
+                None if value.is_empty() => continue,
+                None => ws.write_string(row, col, value)?,
             };
         }
     }
@@ -317,15 +394,16 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "IP,Other IPs,MAC,VLAN,Role,Hostname,Vendor,Switch/Port,DNS,mDNS,SMB Name,SMB Domain,TCP Ports,Comments"
+            "IP,Other IPs,MAC,VLAN,Role,Hostname,Vendor,Switch/Port,DNS,mDNS,SMB Name,SMB Domain,\
+             TCP Ports,Device Kind,Model/Firmware,PoE (W),Voice VLAN,OS (DHCP),Comments"
         );
         assert_eq!(
             lines[1],
-            "10.0.0.3,,,,Switch,,,,,,,,\"22, 443\",\"core, \"\"stack\"\"\""
+            "10.0.0.3,,,,Switch,,,,,,,,\"22, 443\",,,,,,\"core, \"\"stack\"\"\""
         );
         assert_eq!(
             lines[2],
-            "10.0.0.20,\"fe80::1, 2001:db8::20\",00:11:22:33:44:55,,Host,,,,,,,,,"
+            "10.0.0.20,\"fe80::1, 2001:db8::20\",00:11:22:33:44:55,,Host,,,,,,,,,,,,,,"
         );
         assert!(lines[3].starts_with("10.10.0.1,,,10,Host"));
         assert_eq!(lines.len(), 4);
@@ -350,7 +428,7 @@ mod tests {
             let row = r.records().next().unwrap().unwrap();
             let hostname = &row[5];
             assert!(hostname.starts_with('\''), "{evil:?} -> {hostname:?}");
-            assert!(row[13].starts_with('\''));
+            assert!(row[NUM_COLUMNS - 1].starts_with('\''));
         }
         assert_eq!(csv_safe("plain"), "plain");
         assert_eq!(csv_safe(""), "");
@@ -433,6 +511,68 @@ mod tests {
         let mut plain = devices();
         plain[0].extra_ips.clear();
         assert!(!render_table(&plain).contains("Other IPs"));
+    }
+
+    #[test]
+    fn service_poe_and_dhcp_columns() {
+        use crate::models::{DhcpFingerprint, PoeInfo, SipInfo, SsdpInfo};
+        let mut phone = Device::new("10.0.20.5".parse().unwrap());
+        phone.device_kind = Some("voip_phone".into());
+        phone.sip = Some(SipInfo {
+            model: Some("SIP-T54W".into()),
+            firmware: Some("96.86.0.5".into()),
+            ..SipInfo::default()
+        });
+        phone.ssdp = Some(SsdpInfo {
+            model_name: Some("ignored: SIP wins".into()),
+            ..SsdpInfo::default()
+        });
+        phone.poe = Some(PoeInfo {
+            watts: Some(5.25),
+            ..PoeInfo::default()
+        });
+        phone.voice_vlan = Some(110);
+        phone.dhcp_fingerprint = Some(DhcpFingerprint {
+            os: Some("Yealink phone".into()),
+            confidence: Some("high".into()),
+            ..DhcpFingerprint::default()
+        });
+        let row = device_row(&phone);
+        let col = |name: &str| COLUMNS.iter().position(|c| *c == name).unwrap();
+        assert_eq!(row[col("Device Kind")], "voip_phone");
+        assert_eq!(row[col("Model/Firmware")], "SIP-T54W / 96.86.0.5");
+        assert_eq!(row[col("PoE (W)")], "5.2");
+        assert_eq!(row[col("Voice VLAN")], "110");
+        assert_eq!(row[col("OS (DHCP)")], "Yealink phone (high)");
+        assert_eq!(
+            (col("PoE (W)"), col("Voice VLAN")),
+            (COL_POE, COL_VOICE_VLAN)
+        );
+
+        let mut nas = Device::new("10.0.0.9".parse().unwrap());
+        nas.ssdp = Some(SsdpInfo {
+            model_name: Some("DS220+".into()),
+            model_number: Some("220+".into()),
+            ..SsdpInfo::default()
+        });
+        assert_eq!(model_firmware(&nas), "DS220+");
+
+        // Hidden-when-empty in the table, shown when any device has a value.
+        let plain = devices();
+        let t = render_table(&plain);
+        for c in [
+            "Device Kind",
+            "Model/Firmware",
+            "PoE (W)",
+            "Voice VLAN",
+            "OS (DHCP)",
+        ] {
+            assert!(!t.contains(c), "{c} should be hidden");
+        }
+        let t = render_table(&[phone.clone()]);
+        assert!(t.contains("PoE (W)") && t.contains("Voice VLAN") && t.contains("OS (DHCP)"));
+        // XLSX with numeric PoE / voice VLAN cells builds.
+        assert!(build_xlsx(&[phone]).is_ok());
     }
 
     #[test]

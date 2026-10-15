@@ -64,6 +64,24 @@ const IF_NAME: &[u64] = &[1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 1];
 /// ifDescr (IF-MIB): index = ifIndex, value = long interface description.
 const IF_DESCR: &[u64] = &[1, 3, 6, 1, 2, 1, 2, 2, 1, 2];
 
+/// POWER-ETHERNET-MIB pethPsePortDetectionStatus: index = group.port, value = status enum
+/// (1 disabled, 2 searching, 3 deliveringPower, 4 fault, 5 test, 6 otherFault).
+const PETH_PSE_PORT_DETECTION: &[u64] = &[1, 3, 6, 1, 2, 1, 105, 1, 1, 1, 1, 6];
+/// POWER-ETHERNET-MIB pethPsePortPowerClassifications: index = group.port, value = class enum
+/// (class0(1) .. class4(5)).
+const PETH_PSE_PORT_CLASS: &[u64] = &[1, 3, 6, 1, 2, 1, 105, 1, 1, 1, 1, 11];
+/// POWER-ETHERNET-MIB pethMainPsePower: index = group, value = nominal PSE power (watts).
+const PETH_MAIN_PSE_POWER: &[u64] = &[1, 3, 6, 1, 2, 1, 105, 1, 3, 1, 1, 2];
+/// POWER-ETHERNET-MIB pethMainPseConsumptionPower: index = group, value = watts in use.
+const PETH_MAIN_PSE_CONSUMPTION: &[u64] = &[1, 3, 6, 1, 2, 1, 105, 1, 3, 1, 1, 4];
+/// POWER-ETHERNET-MIB pethMainPseUsageThreshold: index = group, value = percent.
+const PETH_MAIN_PSE_THRESHOLD: &[u64] = &[1, 3, 6, 1, 2, 1, 105, 1, 3, 1, 1, 5];
+/// CISCO-POWER-ETHERNET-EXT-MIB cpeExtPsePortPwrConsumption: index = group.port, value = mW.
+const CISCO_CPE_EXT_PSE_PORT_PWR: &[u64] = &[1, 3, 6, 1, 4, 1, 9, 9, 402, 1, 2, 1, 7];
+/// CISCO-VLAN-MEMBERSHIP-MIB vmVoiceVlanId: index = ifIndex, value = voice VLAN (4096 = none,
+/// 4095 = untagged 802.1p).
+const CISCO_VM_VOICE_VLAN: &[u64] = &[1, 3, 6, 1, 4, 1, 9, 9, 68, 1, 5, 1, 1, 1];
+
 // ---------------------------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------------------------
@@ -307,6 +325,117 @@ pub fn resolve_port_name(
 pub fn enterprise_number(sys_object_id: &str) -> Option<u64> {
     let rest = sys_object_id.trim().strip_prefix("1.3.6.1.4.1.")?;
     rest.split('.').next()?.parse().ok()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Power-over-Ethernet (pure helpers)
+// ---------------------------------------------------------------------------------------------
+
+/// PoE delivery state of one PSE port, keyed by `(group, port)` from the table index.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoePortData {
+    pub status: Option<String>,
+    pub class: Option<u8>,
+    pub watts: Option<f32>,
+}
+
+/// Per-port PoE collected from the POWER-ETHERNET-MIB (and Cisco extension), keyed by the
+/// `(pethPsePortGroupIndex, pethPsePortIndex)` table index.
+pub type PoePortMap = BTreeMap<(u32, u32), PoePortData>;
+
+/// Human label for a POWER-ETHERNET-MIB pethPsePortDetectionStatus value.
+pub fn poe_detection_label(v: u32) -> Option<&'static str> {
+    Some(match v {
+        1 => "disabled",
+        2 => "searching",
+        3 => "delivering",
+        4 => "fault",
+        5 => "test",
+        6 => "fault",
+        _ => return None,
+    })
+}
+
+/// IEEE class (0-4) from a pethPsePortPowerClassifications enum (`class0(1)..class4(5)`).
+pub fn poe_class_from_enum(v: u32) -> Option<u8> {
+    (1..=5).contains(&v).then(|| (v - 1) as u8)
+}
+
+/// A usable voice VLAN from a `vmVoiceVlanId` value (4096 = none and 4095 = untagged 802.1p
+/// priority are not VLANs).
+pub fn voice_vlan_value(v: u32) -> Option<u16> {
+    u16::try_from(v)
+        .ok()
+        .filter(|id| (1..=crate::models::MAX_VLAN_ID).contains(id))
+}
+
+/// The last two sub-identifiers of a `group.port` PoE index.
+fn group_port(suffix: &[u64]) -> Option<(u32, u32)> {
+    if suffix.len() < 2 {
+        return None;
+    }
+    let group = u32::try_from(suffix[suffix.len() - 2]).ok()?;
+    let port = u32::try_from(suffix[suffix.len() - 1]).ok()?;
+    Some((group, port))
+}
+
+/// Trailing integers of an interface name, e.g. `Gi1/0/24` → `[1, 0, 24]`, `Fa0/5` → `[0, 5]`.
+/// Used to match a resolved switch-port name back to a PoE `(group, port)` index, since no MIB
+/// links PoE ports to ifIndex and vendors index PoE by module/port.
+fn port_name_numbers(port_name: &str) -> Vec<u32> {
+    let mut nums = Vec::new();
+    let mut cur = String::new();
+    for c in port_name.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            if let Ok(n) = cur.parse() {
+                nums.push(n);
+            }
+            cur.clear();
+        }
+    }
+    if let Ok(n) = cur.parse() {
+        nums.push(n);
+    }
+    nums
+}
+
+/// Best-effort match of a resolved switch port to a collected PoE `(group, port)` entry.
+/// Heuristic (documented as such): the PoE port index equals the last number of the port name,
+/// and either there is only one PSE group or the group equals the name's first number. When
+/// matched, returns a [`PoeInfo`] tagged with the switch and port names.
+pub fn lookup_port_poe(
+    poe: &PoePortMap,
+    port_name: &str,
+    _port_index: Option<u32>,
+    switch_name: &str,
+) -> Option<crate::models::PoeInfo> {
+    let nums = port_name_numbers(port_name);
+    let last = *nums.last()?;
+    let first = nums.first().copied();
+    let single_group = poe
+        .keys()
+        .map(|(g, _)| *g)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        <= 1;
+    let (_, data) = poe
+        .iter()
+        .find(|((g, p), _)| *p == last && (single_group || Some(*g) == first))?;
+    if data.status.is_none() && data.class.is_none() && data.watts.is_none() {
+        return None;
+    }
+    Some(crate::models::PoeInfo {
+        watts: data.watts,
+        max_watts: None,
+        class: data.class,
+        status: data.status.clone(),
+        source: None,
+        priority: None,
+        switch_name: Some(switch_name.to_string()),
+        port: Some(port_name.to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -915,6 +1044,105 @@ impl SnmpClient {
         Walk { rows, issue: None }
     }
 
+    /// Walk the POWER-ETHERNET-MIB (`pethPsePortTable`, `pethMainPse`) and the Cisco
+    /// `cpeExtPsePortPwrConsumption` extension. Returns per-port PoE state (keyed by the
+    /// `group.port` index) and the switch-wide budget. Both are `None` when the device does
+    /// not implement the MIB (the common case for non-PoE gear). Failed / truncated walks are
+    /// noted in `warnings` but never fail the whole poll.
+    async fn collect_poe(
+        &self,
+        session: &mut AsyncSession,
+        deadline: Instant,
+        warnings: &mut Warnings,
+    ) -> (Option<PoePortMap>, Option<crate::models::PoeBudget>) {
+        let mut ports: PoePortMap = PoePortMap::new();
+
+        let walk = self
+            .walk(session, PETH_PSE_PORT_DETECTION, deadline, MAX_WALK_ROWS)
+            .await;
+        warnings.note("PoE port status", &walk);
+        for (suffix, value) in walk.rows {
+            if let (Some(idx), Some(v)) = (group_port(&suffix), value.as_u32()) {
+                if let Some(label) = poe_detection_label(v) {
+                    ports.entry(idx).or_default().status = Some(label.to_string());
+                }
+            }
+        }
+        let walk = self
+            .walk(session, PETH_PSE_PORT_CLASS, deadline, MAX_WALK_ROWS)
+            .await;
+        warnings.note("PoE port class", &walk);
+        for (suffix, value) in walk.rows {
+            if let (Some(idx), Some(v)) = (group_port(&suffix), value.as_u32()) {
+                if let Some(class) = poe_class_from_enum(v) {
+                    ports.entry(idx).or_default().class = Some(class);
+                }
+            }
+        }
+        let walk = self
+            .walk(session, CISCO_CPE_EXT_PSE_PORT_PWR, deadline, MAX_WALK_ROWS)
+            .await;
+        // Cisco-only: absence is normal, so do not flag it as a partial result.
+        for (suffix, value) in walk.rows {
+            if let (Some(idx), Some(mw)) = (group_port(&suffix), value.as_u32()) {
+                if mw > 0 {
+                    ports.entry(idx).or_default().watts = Some(mw as f32 / 1000.0);
+                }
+            }
+        }
+
+        // Switch-wide budget (summed over PSE groups).
+        let mut nominal = 0.0f32;
+        let mut consumed = 0.0f32;
+        let mut have_nominal = false;
+        let mut have_consumed = false;
+        let mut threshold = None;
+        let walk = self
+            .walk(session, PETH_MAIN_PSE_POWER, deadline, MAX_WALK_ROWS)
+            .await;
+        for (_, value) in walk.rows {
+            if let Some(w) = value.as_u32() {
+                nominal += w as f32;
+                have_nominal = true;
+            }
+        }
+        let walk = self
+            .walk(session, PETH_MAIN_PSE_CONSUMPTION, deadline, MAX_WALK_ROWS)
+            .await;
+        for (_, value) in walk.rows {
+            if let Some(w) = value.as_u32() {
+                consumed += w as f32;
+                have_consumed = true;
+            }
+        }
+        let walk = self
+            .walk(session, PETH_MAIN_PSE_THRESHOLD, deadline, MAX_WALK_ROWS)
+            .await;
+        for (_, value) in walk.rows {
+            if let Some(pct) = value.as_u32() {
+                threshold = u8::try_from(pct).ok();
+                break;
+            }
+        }
+
+        let ports_delivering = ports
+            .values()
+            .filter(|p| p.status.as_deref() == Some("delivering"))
+            .count() as u32;
+        let budget = if have_nominal || have_consumed || threshold.is_some() {
+            Some(crate::models::PoeBudget {
+                nominal_watts: have_nominal.then_some(nominal),
+                consumed_watts: have_consumed.then_some(consumed),
+                usage_threshold_pct: threshold,
+                ports_delivering,
+            })
+        } else {
+            None
+        };
+        let ports = (!ports.is_empty()).then_some(ports);
+        (ports, budget)
+    }
+
     /// Poll one device and return its structured SNMP view. Fails (rather than returning an
     /// empty record) when the device does not answer or the system group cannot be read, so
     /// callers can treat the device as not SNMP-reachable. Table walks that fail part-way
@@ -1129,6 +1357,23 @@ impl SnmpClient {
             }
         }
 
+        // --- Power-over-Ethernet (POWER-ETHERNET-MIB + Cisco extension) ---
+        let (poe_ports, poe_budget) = self
+            .collect_poe(&mut session, deadline, &mut warnings)
+            .await;
+        // --- Per-port voice VLAN (Cisco; absence is normal and not a partial result) ---
+        let mut voice_vlans: HashMap<u32, u16> = HashMap::new();
+        let walk = self
+            .walk(&mut session, CISCO_VM_VOICE_VLAN, deadline, MAX_WALK_ROWS)
+            .await;
+        for (suffix, value) in walk.rows {
+            if let (Some(&ifindex), Some(vid)) = (suffix.last(), value.as_u32()) {
+                if let (Ok(ifindex), Some(vid)) = (u32::try_from(ifindex), voice_vlan_value(vid)) {
+                    voice_vlans.insert(ifindex, vid);
+                }
+            }
+        }
+
         // --- forwarding database → MAC-to-port ---
         // Keyed by (vlan, mac) so the same MAC on two VLANs is two mappings. At most
         // MAX_DEVICE_MAPPINGS across every table and VLAN context.
@@ -1228,6 +1473,9 @@ impl SnmpClient {
             let (port_name, port_index) =
                 resolve_port_name(bridge_port, &base_port_ifindex, &if_names);
             *counts.entry((port_name.clone(), port_index)).or_insert(0) += 1;
+            let poe = poe_ports
+                .as_ref()
+                .and_then(|p| lookup_port_poe(p, &port_name, port_index, &switch_name));
             port_mappings.push(SwitchPortMapping {
                 switch_name: switch_name.clone(),
                 switch_ip: Some(ip),
@@ -1235,6 +1483,8 @@ impl SnmpClient {
                 port_index,
                 vlan_id,
                 mac: crate::models::format_mac(&mac),
+                poe,
+                voice_vlan: port_index.and_then(|i| voice_vlans.get(&i).copied()),
             });
         }
         let mut port_mac_counts: Vec<PortMacCount> = counts
@@ -1261,6 +1511,7 @@ impl SnmpClient {
             vlans: vlans.into_values().collect(),
             port_mappings,
             port_mac_counts,
+            poe_budget,
             partial: !warnings.is_empty(),
             warnings,
         })
@@ -1700,6 +1951,64 @@ mod tests {
             classify_role(Some("1.3.6.1.4.1.12356.120.1"), "FortiAP-231F", None, false),
             DeviceRole::AccessPoint
         );
+    }
+
+    #[test]
+    fn poe_helpers_decode_and_match_ports() {
+        assert_eq!(poe_detection_label(3), Some("delivering"));
+        assert_eq!(poe_detection_label(2), Some("searching"));
+        assert_eq!(poe_detection_label(6), Some("fault"));
+        assert_eq!(poe_detection_label(0), None);
+        assert_eq!(poe_class_from_enum(1), Some(0));
+        assert_eq!(poe_class_from_enum(5), Some(4));
+        assert_eq!(poe_class_from_enum(9), None);
+        assert_eq!(voice_vlan_value(110), Some(110));
+        assert_eq!(voice_vlan_value(4096), None); // none
+        assert_eq!(voice_vlan_value(4095), None); // untagged 802.1p
+        assert_eq!(voice_vlan_value(0), None);
+        assert_eq!(group_port(&[1, 24]), Some((1, 24)));
+        assert_eq!(group_port(&[24]), None);
+        assert_eq!(port_name_numbers("Gi1/0/24"), vec![1, 0, 24]);
+        assert_eq!(port_name_numbers("port 7"), vec![7]);
+
+        let mut map = PoePortMap::new();
+        map.insert(
+            (1, 24),
+            PoePortData {
+                status: Some("delivering".into()),
+                class: Some(2),
+                watts: Some(6.1),
+            },
+        );
+        map.insert(
+            (2, 24),
+            PoePortData {
+                status: Some("searching".into()),
+                ..PoePortData::default()
+            },
+        );
+        // Stack member 1 port 24 ↔ Gi1/0/24; member 2 port 24 ↔ Gi2/0/24.
+        let poe = lookup_port_poe(&map, "Gi1/0/24", Some(10024), "sw1").unwrap();
+        assert_eq!(
+            (poe.watts, poe.class, poe.status.as_deref()),
+            (Some(6.1), Some(2), Some("delivering"))
+        );
+        assert_eq!(poe.switch_name.as_deref(), Some("sw1"));
+        assert_eq!(poe.port.as_deref(), Some("Gi1/0/24"));
+        let poe = lookup_port_poe(&map, "Gi2/0/24", None, "sw1").unwrap();
+        assert_eq!(poe.status.as_deref(), Some("searching"));
+        assert!(lookup_port_poe(&map, "Gi3/0/24", None, "sw1").is_none());
+        assert!(lookup_port_poe(&map, "Gi1/0/23", None, "sw1").is_none());
+        // Single PSE group: the port number alone matches (e.g. "port 24", "ge-0/0/24").
+        let mut single = PoePortMap::new();
+        single.insert(
+            (1, 24),
+            PoePortData {
+                watts: Some(4.0),
+                ..PoePortData::default()
+            },
+        );
+        assert!(lookup_port_poe(&single, "ge-0/0/24", None, "ex").is_some());
     }
 
     #[test]

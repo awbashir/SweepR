@@ -35,8 +35,8 @@ use crate::{
     models::{
         format_mac, is_link_local_v6, now_ms, parse_mac, sanitize_text, Capability,
         CdpLldpNeighbor, Device, DeviceRole, DiscoverySource, IfAddr, InterfaceInfo, InterfaceKind,
-        Ipv4Range, NeighborProtocol, ScanConfig, ScanEvent, VlanInfo, VlanSelection, VlanSource,
-        MAX_VLAN_ID,
+        Ipv4Range, NeighborProtocol, PoeInfo, ScanConfig, ScanEvent, VlanInfo, VlanSelection,
+        VlanSource, MAX_VLAN_ID,
     },
     progress::ProgressScope,
 };
@@ -76,6 +76,8 @@ const SNAP_PID_VTP: u16 = 0x2003;
 const SNAP_PID_DTP: u16 = 0x2004;
 
 const OUI_IEEE_8021: [u8; 3] = [0x00, 0x80, 0xc2];
+/// IEEE 802.3 organizationally-specific LLDP TLVs (MAC/PHY, power-via-MDI, ...).
+const OUI_IEEE_8023: [u8; 3] = [0x00, 0x12, 0x0f];
 const OUI_TIA: [u8; 3] = [0x00, 0x12, 0xbb];
 
 const ICMPV6_ECHO_REQUEST: u8 = 128;
@@ -1138,9 +1140,31 @@ pub fn parse_cdp(frame: &[u8], local_if: &str) -> Option<CdpLldpNeighbor> {
             0x0009 => n.vtp_domain = opt_text(v),
             0x000a => n.native_vlan = be16(v, 0).filter(|id| (1..=MAX_VLAN_ID).contains(id)),
             0x000e => n.voice_vlan = be16(v, 1).filter(|id| (1..=MAX_VLAN_ID).contains(id)),
+            0x0010 => {
+                if let Some(watts) = parse_cdp_power_consumption(v) {
+                    apply_poe(
+                        &mut n,
+                        PoeInfo {
+                            watts: Some(watts),
+                            ..PoeInfo::default()
+                        },
+                    );
+                }
+            }
             0x0016 => {
                 for ip in parse_cdp_addresses(v) {
                     push_addr(&mut n.management_addrs, ip);
+                }
+            }
+            0x001a => {
+                if let Some(watts) = parse_cdp_power_available(v) {
+                    apply_poe(
+                        &mut n,
+                        PoeInfo {
+                            max_watts: Some(watts),
+                            ..PoeInfo::default()
+                        },
+                    );
                 }
             }
             _ => {}
@@ -1170,6 +1194,8 @@ fn empty_neighbor(protocol: NeighborProtocol, local_if: &str, src: &[u8; 6]) -> 
         voice_vlan: None,
         capabilities: Vec::new(),
         vtp_domain: None,
+        poe_watts: None,
+        poe_info: None,
         ttl_secs: 0,
         last_seen_ms: now_ms(),
     }
@@ -1255,6 +1281,105 @@ pub fn parse_network_policy(v: &[u8]) -> Option<NetworkPolicy> {
     })
 }
 
+/// Power priority label from a 2-bit LLDP-MED / 802.3at priority field (1 critical, 2 high,
+/// 3 low).
+fn poe_priority_label(bits: u8) -> Option<String> {
+    Some(
+        match bits & 0x3 {
+            1 => "critical",
+            2 => "high",
+            3 => "low",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// PoE power source label from a 2-bit field (PD perspective: 1 PSE, 2 local, 3 PSE+local).
+fn poe_source_label(bits: u8) -> Option<String> {
+    Some(
+        match bits & 0x3 {
+            1 => "pse",
+            2 => "local",
+            3 => "pse+local",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Decode an IEEE 802.3 Power-via-MDI TLV body (OUI 00-12-0F, subtype 2). The base TLV carries
+/// the PoE class; the 802.3at/bt extension adds the PD-requested and PSE-allocated power in
+/// 0.1 W units, plus a type/source/priority octet. Returns `None` when nothing useful is set.
+pub fn parse_dot3_power_mdi(v: &[u8]) -> Option<PoeInfo> {
+    // v[0] MDI power support, v[1] PSE power pair, v[2] power class.
+    let mut info = PoeInfo::default();
+    if let Some(&class_byte) = v.get(2) {
+        // power class enum: class0(1) .. class4(5); 0 = unknown.
+        if (1..=5).contains(&class_byte) {
+            info.class = Some(class_byte - 1);
+        }
+    }
+    // 802.3at extension: v[3] type/source/priority, v[4..6] PD requested, v[6..8] PSE allocated.
+    if let Some(&tsp) = v.get(3) {
+        info.source = poe_source_label((tsp >> 4) & 0x3);
+        info.priority = poe_priority_label(tsp & 0x3);
+    }
+    if let Some(req) = be16(v, 4) {
+        if req != 0 {
+            info.watts = Some(f32::from(req) / 10.0);
+        }
+    }
+    if let Some(alloc) = be16(v, 6) {
+        if alloc != 0 {
+            info.max_watts = Some(f32::from(alloc) / 10.0);
+        }
+    }
+    (!info.is_empty()).then_some(info)
+}
+
+/// Decode an LLDP-MED Extended Power-via-MDI TLV body (OUI 00-12-BB, subtype 4):
+/// `type/source/priority(1) power-value(2)` where the value is in 0.1 W units.
+pub fn parse_med_ext_power(v: &[u8]) -> Option<PoeInfo> {
+    let tsp = *v.first()?;
+    let value = be16(v, 1)?;
+    let mut info = PoeInfo {
+        source: poe_source_label((tsp >> 4) & 0x3),
+        priority: poe_priority_label(tsp & 0x3),
+        ..PoeInfo::default()
+    };
+    if value != 0 {
+        info.watts = Some(f32::from(value) / 10.0);
+    }
+    (!info.is_empty()).then_some(info)
+}
+
+/// Decode the two CDP power TLVs. `0x0010` Power Consumption is a 16-bit milliwatt value the
+/// device draws; `0x001a` Power Available is request-id(2) + management-id(2) + 32-bit
+/// milliwatt values the PSE can supply.
+fn parse_cdp_power_consumption(v: &[u8]) -> Option<f32> {
+    let mw = be16(v, 0)?;
+    (mw != 0).then(|| f32::from(mw) / 1000.0)
+}
+
+fn parse_cdp_power_available(v: &[u8]) -> Option<f32> {
+    let mw = be32(v, 4)?;
+    (mw != 0).then_some(mw as f32 / 1000.0)
+}
+
+/// Merge a freshly parsed PoE observation into the neighbor (the first value of each field in
+/// an advert wins). `poe_watts`, the headline value, is the drawn power, else the budget.
+fn apply_poe(n: &mut CdpLldpNeighbor, poe: PoeInfo) {
+    let info = n.poe_info.get_or_insert_with(Box::default);
+    info.watts = info.watts.or(poe.watts);
+    info.max_watts = info.max_watts.or(poe.max_watts);
+    info.class = info.class.or(poe.class);
+    info.status = info.status.take().or(poe.status);
+    info.source = info.source.take().or(poe.source);
+    info.priority = info.priority.take().or(poe.priority);
+    n.poe_watts = info.watts.or(info.max_watts);
+}
+
 /// Decode an LLDPDU (EtherType `0x88cc`, optionally VLAN-tagged) received on `local_if`.
 pub fn parse_lldp(frame: &[u8], local_if: &str) -> Option<CdpLldpNeighbor> {
     let eth = parse_frame(frame)?;
@@ -1327,6 +1452,18 @@ fn parse_lldp_org_tlv(v: &[u8], n: &mut CdpLldpNeighbor) {
         // LLDP-MED inventory: software revision, model name.
         (o, 7) if o == OUI_TIA => n.software_version = opt_text(data),
         (o, 10) if o == OUI_TIA => n.platform = opt_text(data),
+        // IEEE 802.3 Power Via MDI (PoE class / 802.3at power negotiation).
+        (o, 2) if o == OUI_IEEE_8023 => {
+            if let Some(poe) = parse_dot3_power_mdi(data) {
+                apply_poe(n, poe);
+            }
+        }
+        // LLDP-MED Extended Power-via-MDI (power value, source, priority).
+        (o, 4) if o == OUI_TIA => {
+            if let Some(poe) = parse_med_ext_power(data) {
+                apply_poe(n, poe);
+            }
+        }
         _ => {}
     }
 }
@@ -1406,7 +1543,7 @@ pub fn is_dtp(frame: &[u8]) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// Everything the passive listener learned.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PassiveResults {
     pub vlans: Vec<VlanInfo>,
@@ -2836,6 +2973,84 @@ mod tests {
                 &snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_CDP, &body),
                 "en0",
             );
+        }
+    }
+
+    // --- PoE TLVs ---------------------------------------------------------------------------
+
+    /// A Cisco IP phone's CDP advert: Telephone capability, voice VLAN, Power Consumption
+    /// (0x0010, mW) and Power Available (0x001a: request-id, mgmt-id, mW).
+    #[test]
+    fn parses_cdp_power_tlvs() {
+        let mut body = vec![2, 180, 0, 0];
+        body.extend(cdp_tlv(0x0001, b"SEP001122334455"));
+        body.extend(cdp_tlv(0x0004, &0x90u32.to_be_bytes())); // host + phone
+        body.extend(cdp_tlv(0x0006, b"Cisco IP Phone 8841"));
+        body.extend(cdp_tlv(0x000e, &[1, 0, 110]));
+        body.extend(cdp_tlv(0x0010, &6300u16.to_be_bytes())); // 6.3 W drawn
+        let mut avail = vec![0, 1, 0, 2];
+        avail.extend_from_slice(&15_400u32.to_be_bytes()); // 15.4 W available
+        body.extend(cdp_tlv(0x001a, &avail));
+        let f = snap_frame(MAC_B, CDP_MULTICAST, None, SNAP_PID_CDP, &body);
+        let n = parse_cdp(&f, "en0").unwrap();
+        assert!(n.capabilities.contains(&Capability::Telephone));
+        assert_eq!(n.voice_vlan, Some(110));
+        assert_eq!(n.poe_watts, Some(6.3));
+        let poe = n.poe_info.unwrap();
+        assert_eq!(poe.watts, Some(6.3));
+        assert_eq!(poe.max_watts, Some(15.4));
+        // Zero / truncated power values carry no data.
+        assert_eq!(parse_cdp_power_consumption(&[0, 0]), None);
+        assert_eq!(parse_cdp_power_consumption(&[1]), None);
+        assert_eq!(parse_cdp_power_available(&[0, 1, 0, 2, 0]), None);
+    }
+
+    /// LLDP from a PoE endpoint: IEEE 802.3 Power-via-MDI (class + 802.3at requested /
+    /// allocated power) and LLDP-MED Extended Power-via-MDI (priority, 0.1 W value).
+    #[test]
+    fn parses_lldp_power_tlvs() {
+        let mut f = LLDP_MULTICAST.to_vec();
+        f.extend_from_slice(&MAC_B);
+        f.extend_from_slice(&ETHERTYPE_LLDP.to_be_bytes());
+        let mut chassis = vec![4];
+        chassis.extend_from_slice(&MAC_B);
+        f.extend(lldp_tlv(1, &chassis));
+        f.extend(lldp_tlv(2, b"\x03\xaa\xbb\xcc\xdd\xee\x01"));
+        f.extend(lldp_tlv(3, &120u16.to_be_bytes()));
+        // 802.3 PoE: support 0x0f, pair 1, power class enum 5 (= class 4), then the 802.3at
+        // type/source/priority octet 0x51 (source PSE, priority critical), PD requested 25.5 W
+        // and PSE allocated 30.0 W (0.1 W units).
+        let mut dot3 = vec![0x00, 0x12, 0x0f, 2, 0x0f, 0x01, 0x05, 0x51];
+        dot3.extend_from_slice(&255u16.to_be_bytes());
+        dot3.extend_from_slice(&300u16.to_be_bytes());
+        f.extend(lldp_tlv(127, &dot3));
+        // LLDP-MED extended power: PD(01) source PSE(01) priority high(2) → 0b0101_0010.
+        let mut med = vec![0x00, 0x12, 0xbb, 4, 0x52];
+        med.extend_from_slice(&120u16.to_be_bytes()); // 12.0 W (802.3 value wins)
+        f.extend(lldp_tlv(127, &med));
+        f.extend(lldp_tlv(0, &[]));
+        let n = parse_lldp(&f, "en0").unwrap();
+        let poe = n.poe_info.clone().unwrap();
+        assert_eq!(poe.class, Some(4));
+        assert_eq!(poe.watts, Some(25.5));
+        assert_eq!(poe.max_watts, Some(30.0));
+        assert_eq!(poe.priority.as_deref(), Some("critical"));
+        assert_eq!(poe.source.as_deref(), Some("pse"));
+        assert_eq!(n.poe_watts, Some(25.5));
+
+        // MED-only advert.
+        let med = parse_med_ext_power(&[0x53, 0x00, 0x46]).unwrap();
+        assert_eq!(med.watts, Some(7.0));
+        assert_eq!(med.priority.as_deref(), Some("low"));
+        // Base 802.3 TLV (no at-extension): class only.
+        let base = parse_dot3_power_mdi(&[0x0f, 0x01, 0x03]).unwrap();
+        assert_eq!((base.class, base.watts), (Some(2), None));
+        // Hostile / empty input.
+        assert!(parse_dot3_power_mdi(&[]).is_none());
+        assert!(parse_dot3_power_mdi(&[0x0f, 0x01, 0x00]).is_none());
+        assert!(parse_med_ext_power(&[0x50]).is_none());
+        for len in 0..f.len() {
+            let _ = parse_lldp(&f[..len], "en0");
         }
     }
 

@@ -18,15 +18,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     arp_vlan::{self, L2Error, PassiveResults},
-    enricher,
+    dhcp_fp, enricher,
     models::{
-        normalize_mac, CdpLldpNeighbor, Device, DeviceOverride, DeviceRole, DiscoverySource,
-        InterfaceInfo, InterfaceKind, Ipv4Range, NeighborProtocol, ScanConfig, ScanEvent,
-        ScanPhase, ScanProgress, ScanSummary, SwitchPortMapping, VlanInfo, VlanSource,
+        normalize_mac, Capability, CdpLldpNeighbor, Device, DeviceOverride, DeviceRole,
+        DiscoverySource, InterfaceInfo, InterfaceKind, Ipv4Range, NeighborProtocol, ScanConfig,
+        ScanEvent, ScanPhase, ScanProgress, ScanSummary, SwitchPortMapping, VlanInfo, VlanSource,
         MAX_LISTEN_SECS,
     },
     progress::{ProgressCounter, ProgressScope},
-    snmp_infra, sweep,
+    services, snmp_infra, sweep,
 };
 
 /// Shared, read-only map of user device overrides applied to every emitted [`Device`].
@@ -57,6 +57,9 @@ pub const MAX_ACCESS_PORT_MACS: usize = 48;
 
 /// Upper bound of SNMP MAC-to-port entries the aggregator keeps per scan (all switches).
 pub const MAX_AGGREGATE_MAPPINGS: usize = 200_000;
+
+/// MAC-only observations (DHCP clients without an address) held for late matching.
+const MAX_PENDING_MAC_ONLY: usize = 8192;
 
 /// `(switch name, switch IP, port name)`: one physical switch port.
 type PortKey = (String, Option<IpAddr>, String);
@@ -439,8 +442,16 @@ impl Aggregate {
         if best == dev.switch_port {
             return false;
         }
-        if best.is_some() {
+        if let Some(pm) = &best {
             dev.add_source(DiscoverySource::Snmp);
+            // The access port's measured PoE and configured voice VLAN describe the endpoint
+            // on it (SNMP data wins over an endpoint's own CDP/LLDP claim).
+            if pm.poe.is_some() {
+                dev.poe = pm.poe.clone();
+            }
+            if pm.voice_vlan.is_some() {
+                dev.voice_vlan = pm.voice_vlan;
+            }
         }
         dev.switch_port = best;
         true
@@ -481,6 +492,36 @@ impl Aggregate {
                 }
                 self.devices.insert(key, dev);
             }
+        }
+        changed
+    }
+
+    /// Fold a MAC-only observation (unspecified IP, e.g. a DHCP client without an address yet)
+    /// into every device with that MAC (on the same VLAN, when the observation has one).
+    /// Returns the keys that were updated.
+    fn apply_by_mac(&mut self, obs: &Device) -> Vec<String> {
+        let Some(mac) = obs.mac.as_ref().and_then(|m| normalize_mac(m)) else {
+            return Vec::new();
+        };
+        let keys: Vec<String> = self
+            .devices_by_mac
+            .get(&mac)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut changed = Vec::new();
+        for key in keys {
+            let Some(dev) = self.devices.get_mut(&key) else {
+                continue;
+            };
+            if obs.vlan_id.is_some() && obs.vlan_id != dev.vlan_id {
+                continue;
+            }
+            let mut update = obs.clone();
+            update.ip = dev.ip;
+            update.vlan_id = dev.vlan_id;
+            update.extra_ips.clear();
+            dev.merge(&update);
+            changed.push(key);
         }
         changed
     }
@@ -569,17 +610,45 @@ fn apply_neighbor(dev: &mut Device, n: &CdpLldpNeighbor) -> bool {
     if !neighbor_matches(dev, n) {
         return false;
     }
-    let before = (dev.role, dev.neighbor.clone(), dev.sources.len());
+    let before = (
+        dev.role,
+        dev.neighbor.clone(),
+        dev.sources.len(),
+        dev.voice_vlan,
+        dev.poe.clone(),
+    );
     let role = n.infer_role();
     if role.priority() > dev.role.priority() {
         dev.role = role;
+    }
+    // An endpoint advertising itself (IP phone, AP, camera): its own LLDP-MED / CDP voice VLAN
+    // and the PoE it draws describe it. A switch / router's advertisement describes *our* port,
+    // so it is not copied onto the switch's row.
+    let infra = matches!(
+        role,
+        DeviceRole::Switch | DeviceRole::Router | DeviceRole::Firewall
+    );
+    if !infra {
+        if dev.voice_vlan.is_none() && n.capabilities.contains(&Capability::Telephone) {
+            dev.voice_vlan = n.voice_vlan;
+        }
+        if dev.poe.is_none() {
+            dev.poe = n.poe_info.as_deref().cloned();
+        }
     }
     dev.neighbor = Some(n.clone());
     dev.add_source(match n.protocol {
         NeighborProtocol::Cdp => DiscoverySource::Cdp,
         NeighborProtocol::Lldp => DiscoverySource::Lldp,
     });
-    before != (dev.role, dev.neighbor.clone(), dev.sources.len())
+    before
+        != (
+            dev.role,
+            dev.neighbor.clone(),
+            dev.sources.len(),
+            dev.voice_vlan,
+            dev.poe.clone(),
+        )
 }
 
 /// Clone `dev`, apply the user override (when overrides are applied at all), and forward it
@@ -622,11 +691,33 @@ async fn aggregate(
     let overrides = overrides.as_ref();
     state.reindex();
     let mut pending_v6: HashMap<String, Device> = HashMap::new();
+    // MAC-only observations (DHCP clients without an address) not yet matched to a row.
+    let mut pending_mac: HashMap<String, Device> = HashMap::new();
 
     while let Some(ev) = rx.recv().await {
         match ev {
             ScanEvent::Device(d) => {
                 let d = *d;
+                if d.ip.is_unspecified() {
+                    let changed = state.apply_by_mac(&d);
+                    if changed.is_empty() {
+                        if let Some(mac) = d.mac.as_ref().and_then(|m| normalize_mac(m)) {
+                            if pending_mac.len() < MAX_PENDING_MAC_ONLY
+                                || pending_mac.contains_key(&mac)
+                            {
+                                pending_mac
+                                    .entry(mac)
+                                    .and_modify(|e| e.merge(&d))
+                                    .or_insert(d);
+                            }
+                        }
+                    }
+                    for key in changed {
+                        let dev = state.devices[&key].clone();
+                        send_device(&out, overrides, &dev).await;
+                    }
+                    continue;
+                }
                 if fold_ipv6 && d.ip.is_ipv6() {
                     pending_v6
                         .entry(d.key())
@@ -726,6 +817,37 @@ async fn aggregate(
     for key in state.reassign_all() {
         let dev = state.devices[&key].clone();
         send_device(&out, overrides, &dev).await;
+    }
+
+    // MAC-only observations whose device appeared after them.
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut pending: Vec<(String, Device)> = pending_mac.into_iter().collect();
+    pending.sort_by(|a, b| a.0.cmp(&b.0));
+    for (mac, obs) in pending {
+        let changed = state.apply_by_mac(&obs);
+        if changed.is_empty() {
+            let os = obs
+                .dhcp_fingerprint
+                .as_ref()
+                .and_then(|f| f.os.clone())
+                .unwrap_or_else(|| "unknown OS".into());
+            unmatched.push(format!("{mac} ({os})"));
+        }
+        for key in changed {
+            let dev = state.devices[&key].clone();
+            send_device(&out, overrides, &dev).await;
+        }
+    }
+    if !unmatched.is_empty() {
+        let shown = unmatched.len().min(10);
+        let _ = out
+            .send(ScanEvent::info(format!(
+                "DHCP: {} client(s) fingerprinted with no address and no discovered row: {}{}",
+                unmatched.len(),
+                unmatched[..shown].join(", "),
+                if unmatched.len() > shown { ", ..." } else { "" }
+            )))
+            .await;
     }
 
     let mut v6: Vec<Device> = pending_v6.into_values().collect();
@@ -869,6 +991,15 @@ pub async fn run_scan_with(
             arp_vlan::run_passive_sniffer(&name, own, duration, itx, cancel).await
         })
     });
+    // Passive DHCP fingerprinting over the same window (opt-in: needs raw capture).
+    let dhcp_sniffer = cfg.dhcp_fingerprint.then(|| {
+        let (itx, cancel, name) = (itx.clone(), cancel.child_token(), iface.name.clone());
+        let own = arp_vlan::local_macs(&all);
+        let duration = Duration::from_secs(cfg.listen_secs.max(1));
+        tokio::spawn(async move {
+            dhcp_fp::run_dhcp_fingerprint(&name, own, duration, itx, cancel).await
+        })
+    });
 
     let vlans = arp_vlan::resolve_vlans(&cfg, &iface, &all, &itx, &cancel).await;
     let plan = plan_scan(&iface, &all, &targets, &vlans, explicit_range);
@@ -986,6 +1117,14 @@ pub async fn run_scan_with(
             }
         }
     }
+    if let Some(handle) = dhcp_sniffer {
+        if !cancel.is_cancelled() {
+            let _ = itx
+                .send(progress(ScanPhase::Listening, Some(&counter)))
+                .await;
+        }
+        report_dhcp_result(handle.await, &itx).await;
+    }
 
     drop(itx);
     let state = aggregator.await.context("event aggregator crashed")?;
@@ -993,7 +1132,7 @@ pub async fn run_scan_with(
     // Enrichment phase: DNS/mDNS/NetBIOS names, TCP ports, OUI vendors and SNMP infrastructure
     // polling with endpoint-to-switch-port mapping. Seeds a second aggregator with the
     // discovery result so updates upsert onto the existing rows.
-    let state = run_enrichment(state, &cfg, &counter, overrides, &tx, &cancel).await?;
+    let state = run_enrichment(state, &cfg, &iface, &counter, overrides, &tx, &cancel).await?;
 
     let summary = ScanSummary {
         devices: state.devices.len() as u64,
@@ -1013,6 +1152,43 @@ pub async fn run_scan_with(
         .await;
     let _ = tx.send(ScanEvent::Finished(summary.clone())).await;
     Ok(summary)
+}
+
+/// Log how the DHCP fingerprint capture ended (count, or why it could not run).
+async fn report_dhcp_result(
+    res: std::result::Result<Result<u64>, tokio::task::JoinError>,
+    tx: &Sender<ScanEvent>,
+) {
+    let ev = match res {
+        Ok(Ok(n)) => ScanEvent::info(format!(
+            "DHCP fingerprinting: {n} client fingerprint(s) observed (best-effort heuristics)"
+        )),
+        Ok(Err(e)) => ScanEvent::warn(format!("DHCP fingerprinting unavailable: {e:#}")),
+        Err(e) => ScanEvent::error(format!("DHCP fingerprinting crashed: {e}")),
+    };
+    let _ = tx.send(ev).await;
+}
+
+/// One log line for a DHCP fingerprint that has no IP to key a device row on.
+fn dhcp_log_line(d: &Device) -> String {
+    let fp = d.dhcp_fingerprint.clone().unwrap_or_default();
+    format!(
+        "DHCP client {}{}: {} ({} confidence){}{}",
+        d.mac.as_deref().unwrap_or("?"),
+        d.vlan_id
+            .map(|v| format!(" on VLAN {v}"))
+            .unwrap_or_default(),
+        fp.os.as_deref().unwrap_or("unknown OS"),
+        fp.confidence.as_deref().unwrap_or("no"),
+        fp.vendor_class
+            .as_deref()
+            .map(|v| format!(", vendor class '{v}'"))
+            .unwrap_or_default(),
+        fp.hostname
+            .as_deref()
+            .map(|h| format!(", hostname '{h}'"))
+            .unwrap_or_default(),
+    )
 }
 
 /// TCP ports whose presence marks a likely managed network device (SSH, Telnet, HTTP(S),
@@ -1077,6 +1253,7 @@ pub fn snmp_candidates(
 async fn run_enrichment(
     state: Aggregate,
     cfg: &ScanConfig,
+    iface: &InterfaceInfo,
     counter: &ProgressCounter,
     overrides: Option<Overrides>,
     tx: &Sender<ScanEvent>,
@@ -1084,8 +1261,12 @@ async fn run_enrichment(
 ) -> Result<Aggregate> {
     let wants_snmp = cfg.snmp.is_some();
     let wants_enrich = cfg.resolve_names || !cfg.ports.is_empty();
+    let wants_services = cfg.discover_services;
     let devices = state.sorted_devices();
-    if cancel.is_cancelled() || devices.is_empty() || !(wants_snmp || wants_enrich) {
+    if cancel.is_cancelled()
+        || devices.is_empty()
+        || !(wants_snmp || wants_enrich || wants_services)
+    {
         return Ok(state);
     }
 
@@ -1103,6 +1284,11 @@ async fn run_enrichment(
         0
     };
     let enrich_scope = counter.scope(if wants_enrich {
+        devices.len() as u64
+    } else {
+        0
+    });
+    let services_scope = counter.scope(if wants_services {
         devices.len() as u64
     } else {
         0
@@ -1155,6 +1341,29 @@ async fn run_enrichment(
         state = aggregator.await.context("enrichment aggregator crashed")?;
     }
     enrich_scope.finish();
+
+    // Step 1b: service discovery (SSDP/UPnP, WS-Discovery/ONVIF, SIP OPTIONS). Runs on the
+    // enriched devices so open ports (5060) and vendors pick the SIP candidates.
+    if wants_services && !cancel.is_cancelled() {
+        let enriched = state.sorted_devices();
+        let (stx, srx) = mpsc::channel(EVENT_BUFFER);
+        let aggregator = tokio::spawn(aggregate(state, overrides.clone(), false, srx, tx.clone()));
+        let local_v4 = iface.primary_ipv4().map(|(ip, _)| ip);
+        let v6_index = (cfg.ipv6 && iface.link_local_v6().is_some()).then_some(iface.index);
+        services::enrich_services(
+            enriched,
+            cfg,
+            local_v4,
+            v6_index,
+            stx.clone(),
+            cancel.clone(),
+            services_scope.clone(),
+        )
+        .await;
+        drop(stx);
+        state = aggregator.await.context("service aggregator crashed")?;
+    }
+    services_scope.finish();
 
     // Step 2: SNMP infrastructure polling.
     if let (Some(snmp), false) = (&cfg.snmp, cancel.is_cancelled()) {
@@ -1349,6 +1558,19 @@ pub async fn run_vlan_discovery(
     tx: Sender<ScanEvent>,
     cancel: CancellationToken,
 ) -> Result<PassiveResults> {
+    run_vlan_discovery_with(interface, timeout, false, tx, cancel).await
+}
+
+/// [`run_vlan_discovery`], optionally also fingerprinting DHCP clients (`dhcp`) for the same
+/// window. Fingerprinted clients with an address stream as `device` events; clients without
+/// one (a bare DISCOVER) are reported as log lines, since there is no row to key them on.
+pub async fn run_vlan_discovery_with(
+    interface: Option<&str>,
+    timeout: Duration,
+    dhcp: bool,
+    tx: Sender<ScanEvent>,
+    cancel: CancellationToken,
+) -> Result<PassiveResults> {
     let started = Instant::now();
     if timeout > Duration::from_secs(MAX_LISTEN_SECS) {
         return Err(anyhow!(
@@ -1369,21 +1591,62 @@ pub async fn run_vlan_discovery(
     }
     let _ = tx
         .send(ScanEvent::info(format!(
-            "listening on {} for {} s (802.1Q tags, CDP, LLDP, VTP, DTP)",
+            "listening on {} for {} s (802.1Q tags, CDP, LLDP, VTP, DTP{})",
             iface.name,
-            timeout.as_secs()
+            timeout.as_secs(),
+            if dhcp { ", DHCP fingerprints" } else { "" }
         )))
         .await;
     let _ = tx.send(progress(ScanPhase::Listening, None)).await;
 
-    let mut res = arp_vlan::run_passive_sniffer(
+    // DHCP fingerprints go through a small relay: rows keyed by IP are forwarded, address-less
+    // clients become log lines.
+    let dhcp_job = dhcp.then(|| {
+        let (dtx, mut drx) = mpsc::channel::<ScanEvent>(EVENT_BUFFER);
+        let out = tx.clone();
+        let relay = tokio::spawn(async move {
+            let mut rows = 0u64;
+            while let Some(ev) = drx.recv().await {
+                let ev = match ev {
+                    ScanEvent::Device(d) if d.ip.is_unspecified() => {
+                        ScanEvent::info(dhcp_log_line(&d))
+                    }
+                    ScanEvent::Device(d) => {
+                        rows += 1;
+                        ScanEvent::Device(d)
+                    }
+                    other => other,
+                };
+                let _ = out.send(ev).await;
+            }
+            rows
+        });
+        let (name, own, cancel) = (
+            iface.name.clone(),
+            arp_vlan::local_macs(&all),
+            cancel.clone(),
+        );
+        let sniffer = tokio::spawn(async move {
+            dhcp_fp::run_dhcp_fingerprint(&name, own, timeout, dtx, cancel).await
+        });
+        (sniffer, relay)
+    });
+
+    let passive = arp_vlan::run_passive_sniffer(
         &iface.name,
         arp_vlan::local_macs(&all),
         timeout,
         tx.clone(),
         cancel.clone(),
     )
-    .await?;
+    .await;
+    let mut dhcp_rows = 0;
+    if let Some((sniffer, relay)) = dhcp_job {
+        let res = sniffer.await;
+        dhcp_rows = relay.await.unwrap_or(0);
+        report_dhcp_result(res, &tx).await;
+    }
+    let mut res = passive?;
     for os in os_vlans {
         match res.vlans.iter_mut().find(|v| v.id == os.id) {
             Some(v) => v.merge(&os),
@@ -1393,7 +1656,7 @@ pub async fn run_vlan_discovery(
     res.vlans.sort_by_key(|v| v.id);
 
     let summary = ScanSummary {
-        devices: 0,
+        devices: dhcp_rows,
         vlans: res.vlans.len() as u64,
         neighbors: res.neighbors.len() as u64,
         elapsed_ms: elapsed_ms(started),
@@ -1521,6 +1784,8 @@ mod tests {
             voice_vlan: None,
             capabilities: vec![Capability::Switch],
             vtp_domain: None,
+            poe_watts: None,
+            poe_info: None,
             ttl_secs: 120,
             last_seen_ms: 0,
         }
@@ -1741,6 +2006,8 @@ mod tests {
             port_index: Some(10024),
             vlan_id: Some(20),
             mac: "AA:BB:CC:00:11:22".into(), // different case: must still match
+            poe: None,
+            voice_vlan: None,
         };
         itx.send(ScanEvent::PortMapping(pm)).await.unwrap();
         drop(itx);
@@ -1819,6 +2086,8 @@ mod tests {
             port_index: None,
             vlan_id: vlan,
             mac: mac.into(),
+            poe: None,
+            voice_vlan: None,
         }
     }
 
@@ -2105,5 +2374,96 @@ mod tests {
             true,
         );
         assert!(wifi_tagging_warning(&eth, &tagged).is_none());
+    }
+
+    fn dhcp_obs(mac: &str, os: &str) -> Device {
+        let mut d = Device::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        d.mac = Some(mac.into());
+        d.dhcp_fingerprint = Some(crate::models::DhcpFingerprint {
+            os: Some(os.into()),
+            confidence: Some("high".into()),
+            ..Default::default()
+        });
+        d.add_source(DiscoverySource::Dhcp);
+        d
+    }
+
+    /// A DHCP client fingerprinted before it had an address is attributed to its row by MAC,
+    /// whether the row appears before or after the observation; no `0.0.0.0` row is created.
+    #[tokio::test]
+    async fn mac_only_dhcp_observations_attach_by_mac() {
+        let mac = "aa:00:00:00:00:21";
+        for obs_first in [true, false] {
+            let row = ScanEvent::device(dev_with_mac("10.0.0.21", mac, None));
+            let obs = ScanEvent::device(dhcp_obs("AA:00:00:00:00:21", "Windows"));
+            let events = if obs_first {
+                vec![obs, row]
+            } else {
+                vec![row, obs]
+            };
+            let state = aggregate_all(events).await;
+            assert_eq!(state.devices.len(), 1, "no 0.0.0.0 row");
+            let d = &state.devices["10.0.0.21"];
+            assert_eq!(
+                d.dhcp_fingerprint.as_ref().unwrap().os.as_deref(),
+                Some("Windows")
+            );
+            assert!(d.extra_ips.is_empty(), "the unspecified IP is not kept");
+            assert!(d.sources.contains(&DiscoverySource::Dhcp));
+        }
+        // No matching row at all: nothing is created (only a log line).
+        let state = aggregate_all(vec![ScanEvent::device(dhcp_obs(mac, "iOS"))]).await;
+        assert!(state.devices.is_empty());
+    }
+
+    /// The chosen access port's SNMP PoE and voice VLAN describe the endpoint on it.
+    #[tokio::test]
+    async fn switch_port_poe_and_voice_vlan_reach_the_endpoint() {
+        let mac = "aa:00:00:00:00:31";
+        let mut access = pm("access-1", "Gi1/0/5", Some(20), mac);
+        access.poe = Some(crate::models::PoeInfo {
+            watts: Some(6.5),
+            class: Some(2),
+            status: Some("delivering".into()),
+            switch_name: Some("access-1".into()),
+            port: Some("Gi1/0/5".into()),
+            ..Default::default()
+        });
+        access.voice_vlan = Some(120);
+        let state = aggregate_all(vec![
+            ScanEvent::device(dev_with_mac("10.0.20.31", mac, Some(20))),
+            ScanEvent::PortMapping(access),
+        ])
+        .await;
+        let d = &state.devices["10.0.20.31@20"];
+        assert_eq!(d.poe.as_ref().unwrap().watts, Some(6.5));
+        assert_eq!(d.poe.as_ref().unwrap().port.as_deref(), Some("Gi1/0/5"));
+        assert_eq!(d.voice_vlan, Some(120));
+    }
+
+    /// An IP phone's own LLDP-MED advert gives it a voice VLAN and PoE draw; a switch's advert
+    /// (which describes our port) is not copied onto the switch row.
+    #[test]
+    fn neighbor_voice_vlan_and_poe_only_for_endpoints() {
+        let mut phone_adv = switch_neighbor("aa:00:00:00:00:41", "10.0.0.41");
+        phone_adv.capabilities = vec![Capability::Telephone];
+        phone_adv.voice_vlan = Some(110);
+        phone_adv.poe_watts = Some(5.1);
+        phone_adv.poe_info = Some(Box::new(crate::models::PoeInfo {
+            watts: Some(5.1),
+            ..Default::default()
+        }));
+        let mut phone = dev_with_mac("10.0.0.41", "aa:00:00:00:00:41", None);
+        assert!(apply_neighbor(&mut phone, &phone_adv));
+        assert_eq!(phone.voice_vlan, Some(110));
+        assert_eq!(phone.poe.as_ref().unwrap().watts, Some(5.1));
+
+        let mut sw_adv = switch_neighbor("aa:00:00:00:00:42", "10.0.0.42");
+        sw_adv.voice_vlan = Some(110);
+        sw_adv.poe_info = phone_adv.poe_info.clone();
+        let mut sw = dev_with_mac("10.0.0.42", "aa:00:00:00:00:42", None);
+        assert!(apply_neighbor(&mut sw, &sw_adv));
+        assert_eq!(sw.role, DeviceRole::Switch);
+        assert!(sw.voice_vlan.is_none() && sw.poe.is_none());
     }
 }

@@ -34,10 +34,12 @@ use sweepr_core::{
     limits::{self, SocketBudget},
     models::{
         parse_ports, sanitize_text, CdpLldpNeighbor, Device, DeviceOverride, InterfaceInfo,
-        LogLevel, ScanConfig, ScanEvent, ScanPhase, ScanSummary, SnmpAuthProtocol, SnmpConfig,
-        SnmpDeviceInfo, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, VlanInfo, VlanSelection,
-        VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS, MAX_TIMEOUT_MS,
+        LogLevel, ScanConfig, ScanEvent, ScanPhase, ScanSummary, ServiceDiscovery,
+        SnmpAuthProtocol, SnmpConfig, SnmpDeviceInfo, SnmpPrivProtocol, SnmpV3Credentials,
+        SnmpVersion, VlanInfo, VlanSelection, VlanSource, DEFAULT_PORTS, MAX_LISTEN_SECS,
+        MAX_TIMEOUT_MS,
     },
+    services,
     snmp_infra::SnmpClient,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -182,6 +184,20 @@ struct ScanArgs {
     #[arg(long)]
     no_resolve: bool,
 
+    /// Skip service discovery (SSDP/UPnP, WS-Discovery/ONVIF, SIP OPTIONS)
+    #[arg(long)]
+    no_services: bool,
+
+    /// Send SIP OPTIONS to every discovered host, not only hosts with 5060 open or a VoIP
+    /// vendor MAC
+    #[arg(long, conflicts_with = "no_services")]
+    sip_all: bool,
+
+    /// Passively fingerprint DHCP clients (option 55 / vendor class) during the listen window
+    /// (needs root / BPF, like the other sniffers)
+    #[arg(long)]
+    dhcp_fingerprint: bool,
+
     /// Output format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Table)]
     output: OutputFormat,
@@ -220,6 +236,10 @@ struct VlansArgs {
     /// How long to listen, in seconds (CDP is sent every 60 s, LLDP every 30 s)
     #[arg(short, long, value_name = "SECS", default_value_t = 30)]
     timeout: u64,
+
+    /// Also passively fingerprint DHCP clients (option 55 / vendor class) while listening
+    #[arg(long)]
+    dhcp_fingerprint: bool,
 
     /// Print the results as JSON instead of tables
     #[arg(long)]
@@ -420,6 +440,9 @@ impl ScanArgs {
                 .clone()
                 .map_or_else(|| DEFAULT_PORTS.to_vec(), |p| p.0),
             resolve_names: !self.no_resolve,
+            discover_services: !self.no_services,
+            sip_all: self.sip_all,
+            dhcp_fingerprint: self.dhcp_fingerprint,
             timeout_ms: self.timeout_ms,
             retries: self.retries,
             rate_pps: self.rate_pps,
@@ -763,6 +786,38 @@ fn render_neighbor_table(neighbors: &[CdpLldpNeighbor]) -> String {
     t.to_string()
 }
 
+fn render_dhcp_table(devices: &[Device]) -> String {
+    let mut t = new_table([
+        "IP",
+        "MAC",
+        "VLAN",
+        "OS (DHCP)",
+        "Confidence",
+        "Vendor class",
+        "Hostname",
+        "Option 55",
+    ]);
+    for d in devices {
+        let fp = d.dhcp_fingerprint.clone().unwrap_or_default();
+        let text = |s: &Option<String>| s.as_deref().map(sanitize_text).unwrap_or_default();
+        t.add_row([
+            d.ip.to_string(),
+            text(&d.mac),
+            d.vlan_id.map(|v| v.to_string()).unwrap_or_default(),
+            text(&fp.os),
+            text(&fp.confidence),
+            text(&fp.vendor_class),
+            text(&fp.hostname),
+            fp.param_list
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ]);
+    }
+    t.to_string()
+}
+
 async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
     if args.output == OutputFormat::Xlsx && args.file.is_none() {
         bail!("xlsx output requires --file <PATH>");
@@ -843,10 +898,11 @@ async fn cmd_vlans(args: VlansArgs, cancel: CancellationToken) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(1024);
     let iface = args.interface.clone();
     let timeout = Duration::from_secs(args.timeout.max(1));
+    let dhcp = args.dhcp_fingerprint;
     let job = {
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            engine::run_vlan_discovery(iface.as_deref(), timeout, tx, cancel).await
+            engine::run_vlan_discovery_with(iface.as_deref(), timeout, dhcp, tx, cancel).await
         })
     };
     let mut ui = LiveRenderer::new(false, cancel);
@@ -880,6 +936,17 @@ async fn cmd_vlans(args: VlansArgs, cancel: CancellationToken) -> Result<()> {
             text.push_str(&format!(
                 "\nCDP/LLDP neighbors\n{}",
                 render_neighbor_table(&res.neighbors)
+            ));
+        }
+        let fingerprinted: Vec<Device> = ui
+            .sorted_devices()
+            .into_iter()
+            .filter(|d| d.dhcp_fingerprint.is_some())
+            .collect();
+        if !fingerprinted.is_empty() {
+            text.push_str(&format!(
+                "\n\nDHCP fingerprints (best-effort heuristics)\n{}",
+                render_dhcp_table(&fingerprinted)
             ));
         }
         write_stdout(text)?;
@@ -1192,9 +1259,11 @@ async fn start_scan(
 fn stop_scan(
     state: State<'_, ScanManager>,
     port_scans: State<'_, PortScans>,
+    service_probes: State<'_, ServiceProbes>,
     scan_id: Option<u64>,
 ) -> bool {
     port_scans.cancel_all();
+    service_probes.0.cancel_all();
     state.stop(scan_id)
 }
 
@@ -1205,11 +1274,13 @@ async fn start_vlan_discovery(
     state: State<'_, ScanManager>,
     interface: Option<String>,
     timeout_secs: Option<u64>,
+    dhcp_fingerprint: Option<bool>,
 ) -> Result<u64, String> {
     let (id, cancel) = state.begin();
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(30).clamp(1, 3600));
+    let dhcp = dhcp_fingerprint.unwrap_or(false);
     spawn_job(app, id, cancel, move |tx, cancel| async move {
-        engine::run_vlan_discovery(interface.as_deref(), timeout, tx, cancel)
+        engine::run_vlan_discovery_with(interface.as_deref(), timeout, dhcp, tx, cancel)
             .await
             .map(|_| ())
     });
@@ -1410,6 +1481,52 @@ async fn scan_ports(
     Ok(res.open)
 }
 
+/// Drawer service probes (`discover_services`): their own slot pool and cancellation token
+/// (cancelled by `stop_scan`), separate from the port scans.
+#[derive(Default)]
+struct ServiceProbes(PortScans);
+
+/// Probe one host for services for the GUI details drawer: unicast SSDP `M-SEARCH` (+ the
+/// description from the host itself), unicast WS-Discovery `Probe` (+ ONVIF / WSD metadata)
+/// and SIP OPTIONS. `timeout_ms` (default 2500, 500-5000) bounds each exchange. Rejects on a
+/// bad IP or when 4 probes are already running; `stop_scan` stops it.
+#[tauri::command]
+async fn discover_services(
+    probes: State<'_, ServiceProbes>,
+    ip: String,
+    timeout_ms: Option<u64>,
+) -> Result<ServiceDiscovery, String> {
+    let ip: IpAddr = ip
+        .parse()
+        .map_err(|_| format!("'{ip}' is not an IP address"))?;
+    let _slot = probes.0.try_enter().ok_or_else(|| {
+        format!("{MAX_PORT_SCAN_JOBS} service probes are already running; wait for one to finish")
+    })?;
+    let cancel = probes.0.token();
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(2_500).clamp(500, 5_000));
+    // The local address (same family as the target) goes into the SIP Via / Contact headers.
+    let ifaces = tauri::async_runtime::spawn_blocking(arp_vlan::list_interfaces)
+        .await
+        .map_err(|e| e.to_string())?;
+    let local_ip = arp_vlan::select_interface(&ifaces, None)
+        .ok()
+        .and_then(|i| {
+            i.addrs
+                .iter()
+                .map(|a| a.ip)
+                .find(|a| a.is_ipv4() == ip.is_ipv4())
+        })
+        .unwrap_or(match ip {
+            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        });
+    let res = services::probe_host(ip, local_ip, timeout, &cancel).await;
+    if cancel.is_cancelled() {
+        return Err("service probe stopped".into());
+    }
+    Ok(res)
+}
+
 /// Poll one device over SNMP for the GUI details drawer. `snmp` defaults to the v2c `public`
 /// community when omitted.
 #[tauri::command]
@@ -1432,6 +1549,7 @@ fn run_gui() -> ExitCode {
         .plugin(tauri_plugin_dialog::init())
         .manage(ScanManager::default())
         .manage(PortScans::default())
+        .manage(ServiceProbes::default())
         .invoke_handler(tauri::generate_handler![
             list_interfaces,
             start_scan,
@@ -1441,7 +1559,8 @@ fn run_gui() -> ExitCode {
             load_overrides,
             save_override,
             scan_ports,
-            query_snmp
+            query_snmp,
+            discover_services
         ])
         .run(tauri::generate_context!());
     match result {
@@ -1497,6 +1616,31 @@ mod tests {
         assert_eq!(snmp.version, SnmpVersion::V2c);
         assert_eq!(cfg.ports, vec![22, 443]);
         assert_eq!(args.output, OutputFormat::Csv);
+    }
+
+    #[test]
+    fn service_and_dhcp_flags_map_to_config() {
+        let scan = |args: &[&str]| -> Result<ScanConfig> {
+            let cli = Cli::try_parse_from([&["sweepr", "scan"], args].concat())?;
+            let Some(Command::Scan(a)) = cli.command else {
+                bail!("expected scan")
+            };
+            a.to_config()
+        };
+        let cfg = scan(&[]).unwrap();
+        assert!(cfg.discover_services && !cfg.sip_all && !cfg.dhcp_fingerprint);
+        let cfg = scan(&["--no-services", "--dhcp-fingerprint"]).unwrap();
+        assert!(!cfg.discover_services && cfg.dhcp_fingerprint);
+        assert!(scan(&["--sip-all"]).unwrap().sip_all);
+        assert!(scan(&["--no-services", "--sip-all"]).is_err());
+        let v = Cli::try_parse_from(["sweepr", "vlans", "--dhcp-fingerprint"]).unwrap();
+        assert!(matches!(
+            v.command,
+            Some(Command::Vlans(VlansArgs {
+                dhcp_fingerprint: true,
+                ..
+            }))
+        ));
     }
 
     #[test]
