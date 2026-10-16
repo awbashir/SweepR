@@ -1097,8 +1097,14 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
                 ));
             }
             match file {
-                Some(path) => std::fs::write(path, text.trim_start())
-                    .with_context(|| format!("cannot write {}", path.display()))?,
+                Some(path) => {
+                    let is_new = std::fs::symlink_metadata(path).is_err();
+                    std::fs::write(path, text.trim_start())
+                        .with_context(|| format!("cannot write {}", path.display()))?;
+                    if is_new {
+                        sweepr_core::owner::give_back_path(path);
+                    }
+                }
                 None => {
                     let mut out = io::stdout().lock();
                     out.write_all(text.as_bytes())?;
