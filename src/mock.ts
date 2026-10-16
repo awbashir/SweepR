@@ -309,7 +309,7 @@ function communityClass(c: SnmpConfig): SnmpAgentStatus["communityClass"] {
   return t === "" ? "none" : t === "public" || t === "private" ? t : "custom";
 }
 
-function download(name: string, mime: string, text: string): void {
+function download(name: string, mime: string, text: string | Uint8Array<ArrayBuffer>): void {
   const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -342,7 +342,11 @@ export function createMockBackend(): Backend {
   const later = (j: Job, ms: number, fn: () => void): void => {
     j.timers.push(window.setTimeout(fn, ms));
   };
+  // `?stuckScan` simulates a backend job that dies without `finished` (it keeps "running";
+  // `?stuckScan=gone` also makes stop_scan report that nothing is running).
+  const stuck = new URLSearchParams(window.location.search).get("stuckScan");
   const finish = (j: Job, devices: number, vlans: number, neighbors: number): void => {
+    if (stuck !== null) return;
     if (j.finished) return;
     j.finished = true;
     j.timers.forEach((t) => clearTimeout(t));
@@ -517,6 +521,19 @@ export function createMockBackend(): Backend {
         later(j, tick, step);
         return;
       }
+      // IPv6: hosts found only through NDP (global address first, link-local as an extra).
+      if (config.ipv6) {
+        for (let i = 0; i < 6; i++) {
+          const dev = blankDevice(`2001:db8:a10:0:${(0x1a2b + i * 0x111).toString(16)}:${(0x3c4d + i).toString(16)}:fe${(i * 7).toString(16).padStart(2, "0")}:${(0x5e6f + i * 0x101).toString(16)}`, Date.now());
+          dev.mac = macFor("a4:83:e7", 0x10000 + i);
+          dev.vendor = "Apple, Inc.";
+          dev.interface = iface.name;
+          dev.sources = ["ndp"];
+          dev.extraIps = [`fe80::a683:e7ff:fe01:${i.toString(16).padStart(4, "0")}`];
+          found++;
+          emit(j, { type: "device", data: dev });
+        }
+      }
       // Enrichment pass: re-emit some snapshots with names / ports (exercise upserts).
       emit(j, { type: "progress", data: { phase: "enriching", probesSent: sent, probesTotal: total, devicesFound: found } });
       const sample = discovered.filter((_, i) => i % (big ? 50 : 4) === 0);
@@ -632,13 +649,18 @@ export function createMockBackend(): Backend {
   return {
     isMock: true,
     ...tools,
-    listInterfaces: async () => INTERFACES,
+    // `?noInterfaces`: interface listing fails (the app must still start).
+    listInterfaces: async () => {
+      if (new URLSearchParams(window.location.search).has("noInterfaces")) throw "cannot list interfaces: permission denied (mock)";
+      return INTERFACES;
+    },
     startScan: async (config) => {
       const j = newJob();
       runScan(j, config);
       return j.id;
     },
     stopScan: async (scanId) => {
+      if (stuck === "gone") return false;
       const j = job;
       if (!j || j.finished || (scanId !== undefined && scanId !== j.id)) return false;
       j.cancelled = true;
@@ -691,6 +713,10 @@ export function createMockBackend(): Backend {
       return `~/Downloads/sweepr-devices.${format}`;
     },
     loadOverrides: async () => {
+      // `?corruptStore`: like the backend with an unreadable overrides file (left untouched).
+      if (new URLSearchParams(window.location.search).has("corruptStore")) {
+        throw "the overrides store ~/Library/Application Support/SweepR/overrides.json is corrupt (expected value at line 1 column 1); it was left untouched";
+      }
       try {
         const raw = localStorage.getItem(OVERRIDES_KEY);
         return raw ? (JSON.parse(raw) as Overrides) : {};
@@ -791,6 +817,20 @@ export function createMockBackend(): Backend {
       return true;
     },
     appVersion: async () => "0.1.0",
+    saveFile: async (kind, contents, suggestedName) => {
+      // Exposed for headless checks (the exported image).
+      (window as unknown as { __sweeprLastSave?: unknown }).__sweeprLastSave = { kind, contents, suggestedName };
+      if (new URLSearchParams(window.location.search).has("cancelSave")) return null;
+      if (kind === "png") {
+        const bin = atob(contents);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        download(suggestedName, "image/png", bytes);
+      } else {
+        download(suggestedName, "image/svg+xml", contents);
+      }
+      return `~/Downloads/${suggestedName}`;
+    },
     openUrl: async (url) => {
       if (/^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener,noreferrer");
       else console.info(`[mock] would open ${url}`);

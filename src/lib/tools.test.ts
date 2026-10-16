@@ -17,6 +17,8 @@ import {
   planMonitors,
   selectViewport,
   sparkline,
+  tcpPortsFor,
+  TCP_PORTS_PER_HOST,
   type LatencyEntry,
 } from "./latency.ts";
 import { CERT_WARN_DAYS, certSortKey, classifyCert, webProbePorts, webTargets } from "./webid.ts";
@@ -24,6 +26,7 @@ import { traceTable } from "./trace.ts";
 import { formatBps, formatBytes, iperfForWire, iperfProblem, throughputChart, DEFAULT_IPERF } from "./iperf.ts";
 import { parseSecureOn, parseWolMac } from "./wol.ts";
 import { completeOrder, effectiveVisibility } from "./columns.ts";
+import { parseIdList } from "./storage.ts";
 import { buildRow, exportDevice, withWebIdentity } from "./store.ts";
 import type { Device, IperfInterval, LatencySample, TlsCertInfo, TraceHop, WebIdentity, WebService } from "../types.ts";
 
@@ -591,4 +594,28 @@ test("column prefs: new columns slot in at their default position; auto visibili
   assert.equal(v.certCn, false);
   assert.equal(effectiveVisibility({ latency: false }, auto).latency, false);
   assert.equal(effectiveVisibility({ webTitle: true }, auto).webTitle, true);
+});
+
+test("latency monitor: known open ports feed the TCP fallback, common ports first", () => {
+  const devs = [
+    { ip: "10.0.0.1", openPorts: [9100, 22, 443, 8443, 515, 631] },
+    { ip: "10.0.0.2", openPorts: [] },
+    { ip: "10.0.0.3", openPorts: [5060] },
+    { ip: "10.0.0.9", openPorts: [80] },
+    { ip: "10.0.0.1", openPorts: [21] },
+  ];
+  assert.deepEqual(tcpPortsFor(["10.0.0.1", "10.0.0.2", "10.0.0.3"], devs), { "10.0.0.1": [443, 22, 8443, 515], "10.0.0.3": [5060] });
+  assert.equal(tcpPortsFor(["10.0.0.1"], devs)?.["10.0.0.1"]?.length, TCP_PORTS_PER_HOST);
+  assert.equal(tcpPortsFor(["10.0.0.2"], devs), null, "nothing known: the backend's default ports");
+  assert.equal(tcpPortsFor([], devs), null);
+  assert.deepEqual(tcpPortsFor(["10.0.0.4"], [{ ip: "10.0.0.4", openPorts: [0, 70000, 22, 22] }]), { "10.0.0.4": [22] });
+});
+
+test("reload cleanup: job ids saved for the session are parsed defensively", () => {
+  assert.deepEqual(parseIdList(null), []);
+  assert.deepEqual(parseIdList("[3, 7]"), [3, 7]);
+  assert.deepEqual(parseIdList('[1, "2", -3, 4.5, null, 9]'), [1, 9]);
+  assert.deepEqual(parseIdList("{}"), []);
+  assert.deepEqual(parseIdList("not json"), []);
+  assert.equal(parseIdList(JSON.stringify(Array.from({ length: 999 }, (_, i) => i + 1))).length, 256);
 });

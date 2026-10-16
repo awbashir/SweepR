@@ -53,9 +53,17 @@ export function vlanSpec(sel: VlanSelection): string {
   }
 }
 
-/** SNMP settings without any secret: version plus the community classification (v1 / v2c). */
+const SNMP_VERSIONS: ReadonlySet<string> = new Set(["v1", "v2c", "v3"]);
+const COMMUNITY_KINDS: ReadonlySet<string> = new Set(["public", "private", "custom", "none"]);
+/** `communityClass` values of `snmp_agent` events (`SnmpConfig::community_class`). */
+const COMMUNITY_CLASSES: ReadonlySet<string> = new Set([...COMMUNITY_KINDS, "v3"]);
+
+/**
+ * SNMP settings without any secret, built from an allow-list: the version plus the community
+ * classification (v1 / v2c). The community itself is only ever passed to `classifyCommunity`.
+ */
 export function snmpMeta(c: SnmpConfig | null | undefined): ReportMeta["snmp"] | undefined {
-  if (!c) return undefined;
+  if (!c || !SNMP_VERSIONS.has(c.version)) return undefined;
   if (c.version === "v3") return { version: "v3" };
   return { version: c.version, communityKind: classifyCommunity(c.community) };
 }
@@ -109,22 +117,54 @@ export function buildReportMeta(ctx: ScanContext): ReportMeta {
   return meta;
 }
 
-/** Secrets of an SNMP configuration (for the leak check before sending). */
-export function snmpSecrets(c: SnmpConfig | null | undefined): string[] {
-  if (!c) return [];
-  const out: string[] = [];
-  // A default community is not a secret (and "public" appears in plenty of harmless text).
-  if (c.version !== "v3" && classifyCommunity(c.community) === "custom") out.push(c.community.trim());
-  if (c.v3?.authPassword) out.push(c.v3.authPassword);
-  if (c.v3?.privPassword) out.push(c.v3.privPassword);
-  return out.filter((s) => s.length > 0);
-}
+/** Every `ReportMeta` key `buildReportMeta` may set. */
+const META_KEYS: ReadonlySet<string> = new Set([
+  "toolVersion",
+  "interface",
+  "ranges",
+  "vlans",
+  "portSpec",
+  "startedMs",
+  "finishedMs",
+  "cancelled",
+  "ipv6",
+  "cdpLldp",
+  "discoverVlans",
+  "resolveNames",
+  "snmpAll",
+  "snmp",
+  "gateway",
+  "dhcpServers",
+  "ipv6Routers",
+  "scannerHost",
+  "snmpAgents",
+]);
+const AGENT_KEYS: ReadonlySet<string> = new Set(["ip", "version", "communityClass", "answered"]);
 
-/** `true` when the serialized value contains one of the secrets. */
-export function leaksSecret(value: unknown, secrets: readonly string[]): boolean {
-  if (secrets.length === 0) return false;
-  const json = JSON.stringify(value) ?? "";
-  return secrets.some((s) => json.includes(JSON.stringify(s).slice(1, -1)));
+/**
+ * Structural guarantee for the metadata the GUI builds (checked before anything is sent):
+ * only known keys, and the SNMP parts only carry enumerated values (version, community
+ * class), so there is no field a community or SNMPv3 password could travel in. Returns the
+ * problem, or `null`. Device and SNMP poll data are deliberately not searched: they never
+ * contain the GUI's credentials, and substring matching on them rejected every report for
+ * short or common communities ("cisco" appears in sysDescr URLs).
+ */
+export function reportMetaProblem(meta: ReportMeta): string | null {
+  for (const key of Object.keys(meta)) if (!META_KEYS.has(key)) return `unexpected metadata field '${key}'`;
+  const snmp = meta.snmp;
+  if (snmp !== undefined) {
+    for (const [k, v] of Object.entries(snmp)) {
+      if (k === "version" ? !SNMP_VERSIONS.has(String(v)) : k === "communityKind" ? !COMMUNITY_KINDS.has(String(v)) : true) {
+        return `unexpected SNMP metadata field '${k}'`;
+      }
+    }
+  }
+  for (const a of meta.snmpAgents ?? []) {
+    for (const k of Object.keys(a)) if (!AGENT_KEYS.has(k)) return `unexpected SNMP agent field '${k}'`;
+    if (a.version !== undefined && !SNMP_VERSIONS.has(a.version)) return "unexpected SNMP agent version";
+    if (a.communityClass !== undefined && !COMMUNITY_CLASSES.has(a.communityClass)) return "unexpected SNMP agent community class";
+  }
+  return null;
 }
 
 export interface ReportSource {

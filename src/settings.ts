@@ -28,6 +28,12 @@ export interface ScanSettings {
   sipAll: boolean;
   /** Passive DHCP fingerprinting (needs root, like the other sniffers). */
   dhcpFingerprint: boolean;
+  /**
+   * The saved SNMP settings used a community or SNMPv3 password, which is never stored: it
+   * must be re-entered (SNMP Settings) before SNMP is used again. Until then scans run without
+   * SNMP instead of silently polling with "public" or v3 noAuthNoPriv.
+   */
+  snmpCredentialsMissing: boolean;
 }
 
 export const DEFAULT_SNMP: SnmpConfig = {
@@ -55,16 +61,50 @@ export const DEFAULT_SETTINGS: ScanSettings = {
   discoverServices: true,
   sipAll: false,
   dhcpFingerprint: false,
+  snmpCredentialsMissing: false,
 };
 
-/** What gets written to localStorage: never SNMP secrets (community / v3 passwords). */
-export function persistableSettings(s: ScanSettings): ScanSettings {
+/** A community worth protecting: anything but the well-known read default ("public") or none. */
+export function isSecretCommunity(community: string): boolean {
+  const t = community.trim();
+  return t !== "" && t !== "public";
+}
+
+/** Whether `c`, as used for polling, depends on a secret that is never persisted. */
+export function snmpHasSecret(c: SnmpConfig): boolean {
+  if (c.version === "v3") return Boolean(c.v3?.authPassword) || Boolean(c.v3?.privPassword);
+  return isSecretCommunity(c.community);
+}
+
+/**
+ * Stored settings as the app uses them: defaults for missing fields. Settings saved before
+ * `snmpCredentialsMissing` existed had their community replaced by "public" on save, so with
+ * SNMP enabled they need the credentials re-entered too.
+ */
+export function normalizeSettings(raw: Partial<ScanSettings> | null | undefined): ScanSettings {
+  const r = raw ?? {};
   return {
-    ...s,
+    ...DEFAULT_SETTINGS,
+    ...r,
+    snmp: { ...DEFAULT_SNMP, ...r.snmp },
+    snmpCredentialsMissing: typeof r.snmpCredentialsMissing === "boolean" ? r.snmpCredentialsMissing : r.snmpEnabled === true,
+  };
+}
+
+/**
+ * What gets written to localStorage: never SNMP secrets (a community other than "public", v3
+ * passwords). When one was in use (or is still missing from an earlier session), the stored
+ * settings say so, and the next session asks for it instead of polling without it.
+ */
+export function persistableSettings(s: ScanSettings): ScanSettings {
+  const n = normalizeSettings(s);
+  return {
+    ...n,
+    snmpCredentialsMissing: n.snmpCredentialsMissing || snmpHasSecret(n.snmp),
     snmp: {
-      ...s.snmp,
-      community: "public",
-      v3: s.snmp.v3 ? { ...s.snmp.v3, authPassword: null, privPassword: null } : null,
+      ...n.snmp,
+      community: isSecretCommunity(n.snmp.community) ? "" : n.snmp.community,
+      v3: n.snmp.v3 ? { ...n.snmp.v3, authPassword: null, privPassword: null } : null,
     },
   };
 }
@@ -92,6 +132,8 @@ export function vlanSelectionFrom(s: Pick<ScanSettings, "vlanMode" | "vlanIds">)
 export interface BuiltConfig {
   config: ScanConfig;
   targetCount: number | null;
+  /** SNMP is enabled but its credentials must be re-entered: the scan runs without SNMP. */
+  snmpSkipped: boolean;
 }
 
 export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
@@ -101,7 +143,9 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
   if (!vlans.ok) return { ok: false, error: `VLAN: ${vlans.error}` };
   const ports = parsePorts(s.ports);
   if (!ports.ok) return { ok: false, error: `Ports: ${ports.error}` };
-  if (s.snmpEnabled && s.snmp.version === "v3") {
+  const snmpSkipped = s.snmpEnabled && s.snmpCredentialsMissing === true;
+  const snmpOn = s.snmpEnabled && !snmpSkipped;
+  if (snmpOn && s.snmp.version === "v3") {
     const problem = snmpV3Problem(s.snmp);
     if (problem) return { ok: false, error: `${problem} (SNMP Settings)` };
   }
@@ -111,8 +155,8 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
     vlans: vlans.value,
     discoverVlans: s.discoverVlans || vlans.value.mode === "auto_detect",
     cdpLldp: s.cdpLldp,
-    snmp: s.snmpEnabled ? snmpForWire(s.snmp) : null,
-    snmpAll: s.snmpEnabled && s.snmpAll,
+    snmp: snmpOn ? snmpForWire(s.snmp) : null,
+    snmpAll: snmpOn && s.snmpAll,
     ipv6: s.ipv6,
     ports: ports.value,
     resolveNames: s.resolveNames,
@@ -126,7 +170,7 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
     sipAll: s.discoverServices && s.sipAll,
     dhcpFingerprint: s.dhcpFingerprint,
   };
-  return { ok: true, value: { config, targetCount: range.value.spec === null ? null : range.value.count } };
+  return { ok: true, value: { config, targetCount: range.value.spec === null ? null : range.value.count, snmpSkipped } };
 }
 
 /** RFC 3414 minimum SNMPv3 password length (the backend rejects shorter ones). */

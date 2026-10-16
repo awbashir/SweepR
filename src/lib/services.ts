@@ -24,14 +24,16 @@ export const KIND_LABEL: Record<string, string> = {
 export interface NetBadge {
   id: "dhcp_server" | "ipv6_router";
   label: string;
+  /** Compact label for narrow table cells. */
+  short: string;
   title: string;
 }
 
 /** Small badges for network services a device was seen offering (rogue DHCP / RA candidates). */
 export function netServiceBadges(d: Pick<Device, "dhcpServer" | "ipv6Router">): NetBadge[] {
   const out: NetBadge[] = [];
-  if (d.dhcpServer === true) out.push({ id: "dhcp_server", label: "DHCP server", title: "Seen answering as a DHCP server (OFFER / ACK / NAK) during the scan" });
-  if (d.ipv6Router === true) out.push({ id: "ipv6_router", label: "IPv6 RA", title: "Sent an IPv6 router advertisement during the scan" });
+  if (d.dhcpServer === true) out.push({ id: "dhcp_server", label: "DHCP server", short: "DHCP", title: "Seen answering as a DHCP server (OFFER / ACK / NAK) during the scan" });
+  if (d.ipv6Router === true) out.push({ id: "ipv6_router", label: "IPv6 RA", short: "RA", title: "Sent an IPv6 router advertisement during the scan" });
   return out;
 }
 

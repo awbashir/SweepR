@@ -380,6 +380,8 @@ export interface ScanSummary {
   gateway?: string;
   /** This machine's host name (full scans only). */
   scannerHost?: string;
+  /** The job ended with an error or crashed (an error log precedes the event). */
+  failed?: boolean;
 }
 
 /** Community class of an SNMP poll: never the community itself. */

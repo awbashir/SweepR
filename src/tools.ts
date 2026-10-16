@@ -5,7 +5,8 @@
 import { useSyncExternalStore } from "react";
 import { backend, errorMessage } from "./api.ts";
 import type { IperfAvailability, IperfInterval, IperfOptions, IperfSummary, IperfUpdate, TraceUpdate, WebIdentity } from "./types.ts";
-import { LatencyController, LatencyStore, type LatencyEntry } from "./lib/latency.ts";
+import { LatencyController, LatencyStore, tcpPortsFor, type LatencyEntry } from "./lib/latency.ts";
+import { parseIdList } from "./lib/storage.ts";
 import { iperfForWire } from "./lib/iperf.ts";
 
 // --- keyed external store ---------------------------------------------------------------------
@@ -59,11 +60,39 @@ const reducedMotion = (): boolean => {
 export const latencyStore = new LatencyStore({ throttleMs: reducedMotion() ? 1000 : 250 });
 
 const MONITORS_KEY = "sweepr.latency.monitors";
+const TRACES_KEY = "sweepr.trace.ids";
+const IPERF_KEY = "sweepr.iperf.ids";
 const errorListeners = new Set<(msg: string) => void>();
+
+/** Devices whose known open ports feed the latency monitor's TCP fallback (set by the app). */
+let portSource: () => Iterable<{ ip: string; openPorts: readonly number[] }> = () => [];
+export function setLatencyPortSource(fn: () => Iterable<{ ip: string; openPorts: readonly number[] }>): void {
+  portSource = fn;
+}
+
+/** Remember running job ids for the session: they outlive a webview reload. */
+function rememberIds(key: string, ids: ReadonlySet<number>): void {
+  try {
+    if (ids.size === 0) sessionStorage.removeItem(key);
+    else sessionStorage.setItem(key, JSON.stringify([...ids]));
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Stop the jobs a previous page load left running (ids saved under `key`). */
+function stopLeftovers(key: string, stop: (id: number) => Promise<boolean>): void {
+  try {
+    for (const id of parseIdList(sessionStorage.getItem(key))) void stop(id).catch(() => undefined);
+    sessionStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
 
 export const latencyCtl = new LatencyController(
   {
-    start: (ips, intervalMs) => backend.startLatencyMonitor(ips, intervalMs),
+    start: (ips, intervalMs) => backend.startLatencyMonitor(ips, intervalMs, tcpPortsFor(ips, portSource())),
     stop: (id) => backend.stopLatencyMonitor(id),
   },
   {
@@ -104,6 +133,11 @@ export interface TraceJob {
 
 export const traceStore = new KeyedStore<TraceJob>();
 const traceKeys = new Map<number, string>();
+/** Running trace ids (saved for the session, see `initTools`). */
+const liveTraces = new Set<number>();
+const traceEnded = (id: number): void => {
+  if (liveTraces.delete(id)) rememberIds(TRACES_KEY, liveTraces);
+};
 const earlyTrace = new Map<number, TraceUpdate>();
 
 function handleTrace(u: TraceUpdate): void {
@@ -115,7 +149,10 @@ function handleTrace(u: TraceUpdate): void {
   traceStore.update(key, (j) =>
     j && j.traceId === u.traceId ? { ...j, update: u, running: !u.done, error: u.done ? u.error : j.error } : j,
   );
-  if (u.done) traceKeys.delete(u.traceId);
+  if (u.done) {
+    traceKeys.delete(u.traceId);
+    traceEnded(u.traceId);
+  }
 }
 
 export async function startTrace(key: string, ip: string, maxHops: number, rounds: number): Promise<void> {
@@ -124,6 +161,8 @@ export async function startTrace(key: string, ip: string, maxHops: number, round
   traceStore.set(key, { ip, traceId: null, update: null, running: true, error: null, startedAt: Date.now() });
   try {
     const id = await backend.startTrace(ip, maxHops, rounds);
+    liveTraces.add(id);
+    rememberIds(TRACES_KEY, liveTraces);
     traceKeys.set(id, key);
     traceStore.update(key, (j) => (j ? { ...j, traceId: id } : j));
     const early = earlyTrace.get(id);
@@ -142,7 +181,10 @@ export async function stopTrace(key: string): Promise<void> {
   const j = traceStore.get(key);
   if (!j || j.traceId === null) return;
   const was = await backend.stopTrace(j.traceId);
-  if (!was) traceStore.update(key, (x) => (x ? { ...x, running: false } : x));
+  if (!was) {
+    traceEnded(j.traceId);
+    traceStore.update(key, (x) => (x ? { ...x, running: false } : x));
+  }
 }
 
 // --- web identity ---------------------------------------------------------------------------------------
@@ -184,6 +226,11 @@ export interface IperfJob {
 
 export const iperfStore = new KeyedStore<IperfJob>();
 const iperfKeys = new Map<number, string>();
+/** Running iPerf3 run ids (saved for the session, see `initTools`). */
+const liveIperf = new Set<number>();
+const iperfEnded = (id: number): void => {
+  if (liveIperf.delete(id)) rememberIds(IPERF_KEY, liveIperf);
+};
 const earlyIperf = new Map<number, IperfUpdate[]>();
 /** Intervals kept per run (60 s at most per test, multiple streams summarized by iperf3). */
 const MAX_INTERVALS = 600;
@@ -200,7 +247,10 @@ function handleIperf(u: IperfUpdate): void {
     const intervals = u.interval ? [...j.intervals, u.interval].slice(-MAX_INTERVALS) : j.intervals;
     return { ...j, intervals, summary: u.summary ?? j.summary, running: !u.done, error: u.done ? u.error : j.error };
   });
-  if (u.done) iperfKeys.delete(u.runId);
+  if (u.done) {
+    iperfKeys.delete(u.runId);
+    iperfEnded(u.runId);
+  }
 }
 
 let iperfAvail: Promise<IperfAvailability> | null = null;
@@ -226,6 +276,8 @@ export async function startIperf(key: string, ip: string, options: IperfOptions)
   iperfStore.set(key, { ip, runId: null, options: wire, intervals: [], summary: null, running: true, error: null, startedAt: Date.now() });
   try {
     const id = await backend.startIperf(ip, wire);
+    liveIperf.add(id);
+    rememberIds(IPERF_KEY, liveIperf);
     iperfKeys.set(id, key);
     iperfStore.update(key, (j) => (j ? { ...j, runId: id } : j));
     for (const u of earlyIperf.get(id) ?? []) handleIperf(u);
@@ -241,24 +293,25 @@ export async function stopIperf(key: string): Promise<void> {
   const j = iperfStore.get(key);
   if (!j || j.runId === null) return;
   const was = await backend.stopIperf(j.runId);
-  if (!was) iperfStore.update(key, (x) => (x ? { ...x, running: false } : x));
+  if (!was) {
+    iperfEnded(j.runId);
+    iperfStore.update(key, (x) => (x ? { ...x, running: false } : x));
+  }
 }
 
 // --- lifecycle ------------------------------------------------------------------------------------------------
 
 let initialized: Promise<() => void> | null = null;
 
-/** Subscribe to the utility events once (idempotent) and stop monitors left by a reload. */
+/**
+ * Subscribe to the utility events once (idempotent) and stop the latency monitors, traces and
+ * iPerf3 runs a previous page load (webview reload) left running in the backend.
+ */
 export function initTools(): Promise<() => void> {
   if (initialized) return initialized;
-  try {
-    const raw = sessionStorage.getItem(MONITORS_KEY);
-    const ids: unknown = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(ids)) for (const id of ids) if (typeof id === "number") void backend.stopLatencyMonitor(id).catch(() => undefined);
-    sessionStorage.removeItem(MONITORS_KEY);
-  } catch {
-    /* ignore */
-  }
+  stopLeftovers(MONITORS_KEY, (id) => backend.stopLatencyMonitor(id));
+  stopLeftovers(TRACES_KEY, (id) => backend.stopTrace(id));
+  stopLeftovers(IPERF_KEY, (id) => backend.stopIperf(id));
   try {
     window.matchMedia("(prefers-reduced-motion: reduce)").addEventListener("change", (e) => {
       latencyStore.throttleMs = e.matches ? 1000 : 250;
@@ -280,6 +333,10 @@ export function clearTools(): void {
   for (const j of iperfStore.values()) if (j.running && j.runId !== null) void backend.stopIperf(j.runId).catch(() => undefined);
   traceKeys.clear();
   iperfKeys.clear();
+  liveTraces.clear();
+  liveIperf.clear();
+  rememberIds(TRACES_KEY, liveTraces);
+  rememberIds(IPERF_KEY, liveIperf);
   traceStore.clear();
   iperfStore.clear();
   webStore.clear();

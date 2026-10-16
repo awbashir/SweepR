@@ -32,3 +32,15 @@ export function removeKey(key: string): void {
     /* ignore */
   }
 }
+
+/** Job ids saved in sessionStorage (positive integers; anything else is dropped; at most 256). */
+export function parseIdList(raw: string | null): number[] {
+  if (raw === null) return [];
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (!Array.isArray(v)) return [];
+    return v.filter((x): x is number => typeof x === "number" && Number.isSafeInteger(x) && x > 0).slice(0, 256);
+  } catch {
+    return [];
+  }
+}

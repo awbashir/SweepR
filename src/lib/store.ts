@@ -434,6 +434,20 @@ export class ScanStore {
     this.markDirty("other");
   }
 
+  /**
+   * Leave the busy state when the backend job is gone without a `finished` event (it crashed,
+   * or `finished` was lost): only when `scanId` is still the adopted, running job. Late events
+   * of that job are still applied. Returns whether the state was reset.
+   */
+  forceIdle(scanId: number | null, reason: string): boolean {
+    if (!this.running || this.starting || this.scanId === null || (scanId !== null && scanId !== this.scanId)) return false;
+    this.running = false;
+    this.jobFinishedMs = Date.now();
+    this.log("warn", reason);
+    this.markDirty("other");
+    return true;
+  }
+
   /** Route a `scan-event` payload: only the current job's events are applied. */
   handlePayload = (payload: ScanEventPayload): void => {
     if (this.scanId !== null && payload.scanId === this.scanId) {
@@ -481,10 +495,14 @@ export class ScanStore {
         this.running = false;
         this.starting = false;
         if (this.progress) this.progress = { ...this.progress, phase: "done" };
-        this.log(
-          "info",
-          `${event.data.cancelled ? "Stopped" : "Finished"}: ${event.data.devices} devices, ${event.data.vlans} VLANs, ${event.data.neighbors} neighbors in ${(event.data.elapsedMs / 1000).toFixed(1)} s`,
-        );
+        if (event.data.failed === true) {
+          this.log("error", `Failed after ${(event.data.elapsedMs / 1000).toFixed(1)} s${event.data.cancelled ? " (stopped)" : ""}`);
+        } else {
+          this.log(
+            "info",
+            `${event.data.cancelled ? "Stopped" : "Finished"}: ${event.data.devices} devices, ${event.data.vlans} VLANs, ${event.data.neighbors} neighbors in ${(event.data.elapsedMs / 1000).toFixed(1)} s`,
+          );
+        }
         break;
     }
   }

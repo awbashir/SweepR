@@ -60,10 +60,15 @@ export interface TopologyOptions {
   individualMax?: number;
   /** Endpoints on one port that form their own cluster (default 4). */
   portClusterMin?: number;
+  /**
+   * Unlinked infrastructure (no CDP/LLDP or CAM link, nothing attached) of one role and VLAN
+   * that is grouped into a cluster once there are this many (default 6).
+   */
+  infraClusterMin?: number;
 }
 
 export type TopoNodeKind = "device" | "infra" | "scanner" | "root" | "cluster";
-export type ClusterKind = "vlan" | "port" | "wireless" | "unattached";
+export type ClusterKind = "vlan" | "port" | "wireless" | "unattached" | "infra";
 export type TopoStatus = "ok" | "warn" | "unknown";
 
 export interface TopoMember {
@@ -318,6 +323,22 @@ interface Loc {
 
 const DEFAULT_INDIVIDUAL_MAX = 5;
 const DEFAULT_PORT_CLUSTER_MIN = 4;
+const DEFAULT_INFRA_CLUSTER_MIN = 6;
+
+const ROLE_SINGULAR: Record<DeviceRole, string> = {
+  switch: "switch",
+  firewall: "firewall",
+  router: "router",
+  access_point: "access point",
+  host: "device",
+};
+const ROLE_PLURAL: Record<DeviceRole, string> = {
+  switch: "switches",
+  firewall: "firewalls",
+  router: "routers",
+  access_point: "access points",
+  host: "devices",
+};
 /** Default number of members an expanded cluster shows (and the "+N more" step). */
 export const EXPAND_STEP = 60;
 
@@ -331,6 +352,7 @@ function nodeIdForKey(key: string): string {
 export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}): TopologyGraph {
   const individualMax = opts.individualMax ?? DEFAULT_INDIVIDUAL_MAX;
   const portClusterMin = opts.portClusterMin ?? DEFAULT_PORT_CLUSTER_MIN;
+  const infraClusterMin = Math.max(2, opts.infraClusterMin ?? DEFAULT_INFRA_CLUSTER_MIN);
   const expanded = opts.expanded ?? new Map<string, number>();
   const roleF = opts.roles && opts.roles.size > 0 ? opts.roles : null;
   const vlanF = opts.vlans && opts.vlans.size > 0 ? opts.vlans : null;
@@ -711,22 +733,24 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
   bfs(gateways, 0);
   const primaryRoot = gateways[0] ?? null;
   const inferredEdges: Array<{ parent: string; child: string; minlen: number }> = [];
-  // Components without a gateway: root them at their best-connected switch.
-  for (;;) {
-    const rest = infraList.filter((n) => !depth.has(n.id));
-    if (rest.length === 0) break;
+  // Components without a gateway: root them at their best-connected switch. One pass in
+  // infraList order (each component is walked once), so thousands of unlinked devices stay
+  // linear instead of re-filtering the whole list per component.
+  const rankCmp = (x: InfraNode, y: InfraNode): number =>
+    ROLE_RANK[x.role] - ROLE_RANK[y.role] || (adj.get(y.id)?.length ?? 0) - (adj.get(x.id)?.length ?? 0) || naturalCmp(x.label, y.label);
+  for (const first of infraList) {
+    if (depth.has(first.id)) continue;
     const comp = new Set<string>();
-    const stack = [rest[0]!.id];
+    const stack = [first.id];
+    let top = first;
     while (stack.length > 0) {
       const c = stack.pop()!;
       if (comp.has(c)) continue;
       comp.add(c);
+      const node = infra.get(c)!;
+      if (rankCmp(node, top) < 0) top = node;
       for (const x of adj.get(c) ?? []) if (!depth.has(x)) stack.push(x);
     }
-    const members = rest.filter((n) => comp.has(n.id));
-    const top = [...members].sort(
-      (x, y) => ROLE_RANK[x.role] - ROLE_RANK[y.role] || (adj.get(y.id)?.length ?? 0) - (adj.get(x.id)?.length ?? 0) || naturalCmp(x.label, y.label),
-    )[0]!;
     if (primaryRoot) {
       parentOf.set(top.id, primaryRoot);
       bfs([top.id], 1);
@@ -738,6 +762,7 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
       bfs([top.id], 0);
     }
   }
+  const inferredSet = new Map(inferredEdges.map((e) => [e.child, e]));
 
   // 7. Scanner node --------------------------------------------------------------------------------
   const anyInfra = infra.size > 0;
@@ -829,6 +854,30 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
   }
   const visibleUnattached = unattached.filter(endpointVisible);
 
+  // 9b. Unlinked infrastructure: no link of any kind and nothing attached. Many of one role and
+  // VLAN (e.g. thousands of APs nobody has CAM data for) become one expandable cluster instead
+  // of a row of thousands of cards under the gateway.
+  /** Infra node id -> the cluster that holds it. */
+  const infraClusterOf = new Map<string, string>();
+  const infraClusters = new Map<string, InfraNode[]>();
+  {
+    const groups = new Map<string, InfraNode[]>();
+    for (const n of infraList) {
+      if (n.synthetic || n.id === primaryRoot || n.id === scannerLink?.parent || (adj.get(n.id)?.length ?? 0) > 0 || endpointsOf.has(n.id)) continue;
+      const vlan = n.row ? deviceVlan(n.row.device) : null;
+      const k = `${n.role}|${vlanKey(vlan)}`;
+      const l = groups.get(k);
+      if (l) l.push(n);
+      else groups.set(k, [n]);
+    }
+    for (const [k, list] of groups) {
+      if (list.length < infraClusterMin) continue;
+      const id = `c:infra|${k}`;
+      infraClusters.set(id, list);
+      for (const n of list) infraClusterOf.set(n.id, id);
+    }
+  }
+
   // 10. Emit nodes + edges ------------------------------------------------------------------------------
   const nodes: TopoNode[] = [];
   const edges: TopoEdge[] = [];
@@ -870,7 +919,7 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
       markWithAncestors(primaryRoot);
       anchor = primaryRoot;
     } else {
-      const firstTop = infraList.find((n) => visible.has(n.id) && (parentOf.get(n.id) ?? null) === null);
+      const firstTop = infraList.find((n) => visible.has(n.id) && !infraClusterOf.has(n.id) && (parentOf.get(n.id) ?? null) === null);
       anchor = firstTop?.id ?? ROOT_ID;
     }
   }
@@ -902,7 +951,7 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
       out.status = "warn";
       out.note = "SNMP data is partial.";
     }
-    if (inferredEdges.some((e) => e.child === n.id)) {
+    if (inferredSet.has(n.id)) {
       out.status = out.status === "ok" ? "warn" : out.status;
       out.note = [out.note, "No link data: placed under the gateway by role."].filter(Boolean).join(" ");
     }
@@ -1066,6 +1115,82 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
     }
   };
 
+  const infraMember = (n: InfraNode): TopoMember => ({
+    deviceKind: null,
+    poeWatts: null,
+    key: n.row?.key ?? n.id,
+    label: n.label,
+    ip: n.ip ?? "",
+    mac: n.row?.device.mac ?? ([...n.macs][0] ?? null),
+    vendor: n.detail,
+    port: null,
+    vlan: n.row ? deviceVlan(n.row.device) : null,
+  });
+
+  const emitInfraCluster = (id: string, list: InfraNode[], parentId: string | null, parentDepth: number): void => {
+    const vis = list.filter((n) => visible.has(n.id));
+    if (vis.length === 0) return;
+    clusterCount++;
+    const role = vis[0]!.role;
+    const minlen = Math.max(1, ROLE_RANK[role]);
+    const out = baseNode(id, "cluster", parentId, parentId === null ? 0 : parentDepth + minlen);
+    out.role = role;
+    out.clusterKind = "infra";
+    out.count = vis.length;
+    out.status = "warn";
+    out.note = "No link data (CDP/LLDP or CAM) for these: grouped by role and VLAN. Expand to list them.";
+    const keys: string[] = [];
+    const vlanSet = new Set<number>();
+    const vendors = new Map<string, number>();
+    for (const n of vis) {
+      for (const k of n.row ? [n.row.key, ...n.aliasKeys] : []) {
+        keys.push(k);
+        nodeOfKey.set(k, id);
+      }
+      const v = n.row ? deviceVlan(n.row.device) : null;
+      if (v !== null) vlanSet.add(v);
+      const vendor = shortVendor(n.row?.device.vendor ?? null);
+      if (vendor) vendors.set(vendor, (vendors.get(vendor) ?? 0) + 1);
+    }
+    out.memberKeys = keys;
+    out.vlans = [...vlanSet].sort((a, b) => a - b);
+    out.label = `${vis.length.toLocaleString("en-US")} ${vis.length === 1 ? ROLE_SINGULAR[role] : ROLE_PLURAL[role]}`;
+    out.portsLabel = "link unknown";
+    out.detail =
+      [...vendors]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([v, c]) => `${v} ${c}`)
+        .join(" · ") || null;
+    const limit = expanded.get(id);
+    if (limit !== undefined && limit > 0) {
+      out.expanded = true;
+      const prio = opts.priorityKeys;
+      const sorted = [...vis].sort(
+        (a, b) =>
+          (prio ? (prio.has(a.row?.key ?? "") ? 0 : 1) - (prio.has(b.row?.key ?? "") ? 0 : 1) : 0) || naturalCmp(a.label, b.label),
+      );
+      out.members = sorted.slice(0, limit).map(infraMember);
+      out.more = Math.max(0, vis.length - limit);
+    }
+    nodes.push(out);
+    if (parentId !== null) {
+      emitEdge({
+        source: parentId,
+        target: id,
+        kind: "inferred",
+        sourcePort: null,
+        targetPort: null,
+        vlans: [],
+        nativeVlan: null,
+        label: null,
+        sublabel: "link unknown",
+        tree: true,
+        minlen,
+      });
+    }
+  };
+
   // Root (no infrastructure at all).
   if (anchor === ROOT_ID) {
     const root = baseNode(ROOT_ID, "root", null, 0);
@@ -1088,9 +1213,8 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
     if (l) l.push(n);
     else childrenOf.set(p, [n]);
   }
-  const inferredSet = new Map(inferredEdges.map((e) => [e.child, e]));
   const emitInfra = (n: InfraNode): void => {
-    if (!visible.has(n.id)) return;
+    if (!visible.has(n.id) || infraClusterOf.has(n.id)) return;
     const out = infraNodeOut(n);
     nodes.push(out);
     const p = parentOf.get(n.id) ?? null;
@@ -1125,6 +1249,7 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
       return ROLE_RANK[x.role] - ROLE_RANK[y.role] || naturalCmp(px ?? "~", py ?? "~") || naturalCmp(x.label, y.label);
     });
     for (const k of kids) emitInfra(k);
+    if (n.id === primaryRoot) for (const [id, list] of infraClusters) emitInfraCluster(id, list, n.id, depth.get(n.id) ?? 0);
     if (n.id === scannerLink?.parent && roleF === null && vlanF === null) emitScanner(n.id, (depth.get(n.id) ?? 0) + 1);
     const eps = visibleEndpoints.get(n.id);
     if (eps) emitEndpoints(n.id, eps, (depth.get(n.id) ?? 0) + 1, n.role === "access_point" ? "wireless" : "wired");
@@ -1157,6 +1282,7 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
   };
 
   for (const n of infraList) if ((parentOf.get(n.id) ?? null) === null) emitInfra(n);
+  if (primaryRoot === null) for (const [id, list] of infraClusters) emitInfraCluster(id, list, null, 0);
   if (anchor === ROOT_ID) emitEndpoints(ROOT_ID, visibleUnattached.length > 0 ? visibleUnattached : [], 1, "unattached");
 
   // Cross links (redundant uplinks, HA pairs): drawn, but not used for ranking.

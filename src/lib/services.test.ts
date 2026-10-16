@@ -28,9 +28,8 @@ import {
   buildReportMeta,
   classifyCommunity,
   ipOfKey,
-  leaksSecret,
   snmpMeta,
-  snmpSecrets,
+  reportMetaProblem,
   vlanSpec,
   type ScanContext,
 } from "./report.ts";
@@ -312,8 +311,13 @@ test("report metadata: the scan config without SNMP secrets", () => {
     finishedMs: 5000,
   });
   assert.equal(JSON.stringify(meta).includes(SECRET_COMMUNITY), false);
-  assert.equal(leaksSecret(meta, snmpSecrets(v2)), false);
-  assert.equal(leaksSecret({ snmp: { community: SECRET_COMMUNITY } }, snmpSecrets(v2)), true, "the leak check catches a raw community");
+  assert.equal(reportMetaProblem(meta), null);
+  // The structural check catches a raw community anywhere the GUI builds metadata.
+  assert.match(reportMetaProblem({ snmp: { community: SECRET_COMMUNITY } as never }) ?? "", /community/);
+  assert.match(reportMetaProblem({ community: SECRET_COMMUNITY } as never) ?? "", /community/);
+  assert.notEqual(reportMetaProblem({ snmp: { version: "v2c", communityKind: SECRET_COMMUNITY as never } }), null);
+  assert.notEqual(reportMetaProblem({ snmpAgents: [{ ip: "10.0.0.1", answered: true, communityClass: SECRET_COMMUNITY }] }), null);
+  assert.notEqual(reportMetaProblem({ snmpAgents: [{ ip: "10.0.0.1", answered: true, community: SECRET_COMMUNITY } as never] }), null);
 
   const v3: SnmpConfig = {
     version: "v3",
@@ -327,7 +331,7 @@ test("report metadata: the scan config without SNMP secrets", () => {
   const m3 = buildReportMeta(ctx(config(v3)));
   const json = JSON.stringify(m3);
   for (const s of [SECRET_COMMUNITY, AUTH, PRIV, "monitor"]) assert.equal(json.includes(s), false, s);
-  assert.deepEqual(snmpSecrets(v3), [AUTH, PRIV]);
+  assert.equal(reportMetaProblem(m3), null);
 
   // No SNMP: the SNMP rules are "not evaluated"; no scan: only what is known.
   assert.equal(buildReportMeta(ctx(config(null))).snmp, undefined);
@@ -529,7 +533,10 @@ test("report metadata: interface / gateway / scanner host from the scan summary,
     ["10.0.0.2", "custom", true],
     ["10.0.0.3", "public", false],
   ]);
-  assert.equal(leaksSecret(meta, snmpSecrets(v2)), false);
+  assert.equal(reportMetaProblem(meta), null);
+  assert.equal(JSON.stringify(meta).includes(SECRET_COMMUNITY), false);
+  // Unknown classes from the event are never copied.
+  assert.equal(reportSnmpAgents([agent("10.0.0.9", { communityClass: SECRET_COMMUNITY as never })])[0]?.communityClass, undefined);
   // No summary: the config's / resolved interface, and no gateway key at all.
   const plain = buildReportMeta({ ...ctx(config(v2)), summary: { gateway: undefined } as never });
   assert.equal(plain.interface, "en0");
@@ -548,4 +555,60 @@ test("DHCP server / IPv6 RA badges and search", () => {
   assert.ok(row.search.includes("router advertisement"));
   assert.equal(buildRow("10.0.0.5", device("10.0.0.5"), undefined).search.includes("dhcp server"), false);
   assert.equal(deviceKindLabel("media_player"), "Media Player");
+});
+
+test("report: short and common communities never block a report (no substring scan over device data)", async () => {
+  const sysDescrs = [
+    "Cisco IOS Software, C2960X Software (C2960X-UNIVERSALK9-M), Version 15.2(7)E2, RELEASE SOFTWARE (fc3)\r\nTechnical Support: http://www.cisco.com/techsupport\r\nCopyright (c) 1986-2020 by Cisco Systems, Inc.",
+    "HP J9773A 2530-24G-PoEP Switch, revision YA.16.10.0012, ROM YA.15.20 (/ws/swbuildm/rel_ukiah_qaoff/code/build/lakes(swbuildm_rel_ukiah_qaoff_rel_ukiah))",
+    "Linux ap-1 5.4.0 #1 SMP aarch64 build 1.1",
+  ];
+  for (const community of ["cisco", "a", "1", "hp"]) {
+    const snmp: SnmpConfig = { version: "v2c", community, v3: null, port: 161, timeoutMs: 2000, retries: 1 };
+    const meta = buildReportMeta({
+      ...ctx(config(snmp)),
+      summary: { interface: "en0", gateway: "10.0.0.1", scannerHost: "a-host-1.local" },
+      snmpAgents: sysDescrs.map((d, i) => agent(`10.0.0.${i + 1}`, { sysDescr: d })),
+    });
+    assert.equal(reportMetaProblem(meta), null, community);
+    assert.deepEqual(meta.snmp, { version: "v2c", communityKind: "custom" });
+    const info = (d: string, i: number): SnmpDeviceInfo & { ip: string } => ({
+      ip: `10.1.0.${i}`,
+      sysName: `${community}-core-${i}`,
+      sysDescr: d,
+      sysUptimeTicks: 1,
+      sysObjectId: "1.3.6.1.4.1.9.1.2694",
+      role: "switch",
+      vlans: [],
+      portMappings: [],
+      portMacCounts: [],
+      poeBudget: null,
+      partial: false,
+      warnings: [],
+    });
+    const args = await buildReportArgs(
+      {
+        rows: [buildRow("10.1.0.1", device("10.1.0.1", { hostname: `${community}-sw1`, vendor: "Cisco Systems, Inc" }), undefined)],
+        latency: () => undefined,
+        vlans: [],
+        neighbors: [],
+        portMappings: [],
+        snmp: Object.fromEntries(sysDescrs.map((d, i) => [`10.1.0.${i}`, info(d, i)])),
+        snmpAgents: [],
+      },
+      meta,
+      { format: "html" },
+    );
+    assert.equal(args.snmpInfos?.length, 3, "device data containing the community is sent untouched");
+    assert.equal(reportMetaProblem(args.meta ?? {}), null);
+  }
+});
+
+test("report: the community string is never copied into the metadata", () => {
+  const COMMUNITY = "Zq7-only-in-config";
+  const snmp: SnmpConfig = { version: "v1", community: COMMUNITY, v3: null, port: 161, timeoutMs: 2000, retries: 1 };
+  const meta = buildReportMeta({ ...ctx(config(snmp)), snmpAgents: [agent("10.0.0.2", { version: "v1" })] });
+  assert.equal(JSON.stringify(meta).includes(COMMUNITY), false);
+  assert.deepEqual(meta.snmp, { version: "v1", communityKind: "custom" });
+  assert.deepEqual(meta.snmpAgents, [{ ip: "10.0.0.2", answered: true, version: "v1", communityClass: "custom" }]);
 });

@@ -4,10 +4,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deviceKey, ipSortKey, ipv6Groups, urlHost } from "./ip.ts";
-import { formatPorts, parsePorts, parseRange, parseVlanSelection } from "./parse.ts";
+import { formatPorts, parsePorts, parseRange, parseVlanSelection, withoutUrlPassword } from "./parse.ts";
 import { MAX_MAPPINGS, ScanStore, buildRow, exportDevice, type DeviceRow } from "./store.ts";
 import { DEFAULT_SETTINGS, buildScanConfig, snmpV3Problem } from "../settings.ts";
 import { normalizePortMacCounts, neighborsForDevice } from "./infra.ts";
+import { crashTestArea, describeCrash, isChunkLoadError } from "./crash.ts";
+import { IP_COL_MAX, IP_COL_MIN, autoIpWidth } from "./columns.ts";
+import { netServiceBadges } from "./services.ts";
 import type { CdpLldpNeighbor, Device, ScanEventPayload } from "../types.ts";
 
 function device(ip: string, patch: Partial<Device> = {}): Device {
@@ -326,4 +329,72 @@ test("infra helpers", () => {
   assert.equal(neighborsForDevice(device("10.0.0.2", { mac: "00:1b:54:00:00:01" }), [n]).length, 1);
   assert.equal(neighborsForDevice(device("10.9.9.9"), [n]).length, 1);
   assert.equal(neighborsForDevice(device("10.0.0.3"), [n]).length, 0);
+});
+
+test("store: a job that never sends finished can be reset; failed jobs log as failures", () => {
+  const s = new ScanStore(() => 0);
+  // Still starting (no id yet): never reset underneath the pending start.
+  const t = s.beginStart("scan");
+  assert.equal(s.forceIdle(null, "gone"), false);
+  s.startResolved(7, t);
+  assert.equal(s.forceIdle(6, "other job"), false, "only the adopted job");
+  assert.equal(s.forceIdle(7, "The backend has no running job."), true);
+  let snap = s.flushNow();
+  assert.equal(snap.running, false);
+  assert.equal(snap.starting, false);
+  assert.ok(snap.jobFinishedMs !== null);
+  assert.equal(snap.logs.at(-1)?.level, "warn");
+  assert.equal(s.forceIdle(7, "again"), false, "already idle");
+  // Late events of that job still apply.
+  s.handlePayload({ scanId: 7, event: { type: "device", data: device("10.0.0.9") } });
+  assert.equal(s.flushNow().rows.length, 1);
+
+  const t2 = s.beginStart("scan");
+  s.startResolved(8, t2);
+  s.handlePayload({ scanId: 8, event: { type: "log", data: { level: "error", message: "the job crashed unexpectedly: boom" } } as ScanEventPayload["event"] });
+  s.handlePayload({ scanId: 8, event: { type: "finished", data: { devices: 0, vlans: 0, neighbors: 0, elapsedMs: 1200, cancelled: false, failed: true } } });
+  snap = s.flushNow();
+  assert.equal(snap.running, false);
+  assert.equal(snap.logs.at(-1)?.level, "error");
+  assert.match(snap.logs.at(-1)?.message ?? "", /^Failed after 1\.2 s/);
+});
+
+test("error boundary messages: chunk load failures vs crashes", () => {
+  for (const msg of [
+    "Failed to fetch dynamically imported module: http://tauri.localhost/assets/TopologyView-x.js",
+    "Importing a module script failed.",
+    "error loading dynamically imported module",
+  ]) {
+    assert.equal(isChunkLoadError(new TypeError(msg)), true, msg);
+  }
+  const chunk = describeCrash("The topology map", new TypeError("Importing a module script failed."));
+  assert.equal(chunk.chunk, true);
+  assert.equal(chunk.title, "The topology map could not be loaded");
+  const crash = describeCrash("The details panel", new Error("x".repeat(400)));
+  assert.equal(crash.chunk, false);
+  assert.equal(crash.title, "The details panel ran into a problem");
+  assert.equal(crash.detail.length, 301);
+  assert.equal(describeCrash("SweepR", "boom").detail, "boom");
+  assert.equal(describeCrash("SweepR", { weird: true }).detail, "unknown error");
+  assert.equal(crashTestArea("?crash=drawer&x=1"), "drawer");
+  assert.equal(crashTestArea(""), null);
+});
+
+test("table: the IP column fits IPv6 addresses and the +N badge; role badges are compact", () => {
+  const r = (ip: string, extraIps: string[] = []) => ({ device: { ip, extraIps } });
+  assert.equal(autoIpWidth([]), IP_COL_MIN);
+  assert.equal(autoIpWidth([r("10.0.0.1")]), IP_COL_MIN);
+  const v6 = autoIpWidth([r("10.0.0.1"), r("2001:db8:85a3:1234:5678:8a2e:370:7334")]);
+  assert.ok(v6 >= 39 * 7 && v6 <= IP_COL_MAX, `${v6}`);
+  assert.ok(autoIpWidth([r("255.255.255.255", ["10.0.0.2"])]) > autoIpWidth([r("255.255.255.255")]), "room for the badge");
+  assert.equal(autoIpWidth([r("x".repeat(200))]), IP_COL_MAX);
+  assert.deepEqual(netServiceBadges({ dhcpServer: true, ipv6Router: true }).map((b) => b.short), ["DHCP", "RA"]);
+});
+
+test("custom URL template: a password is never persisted", () => {
+  assert.deepEqual(withoutUrlPassword("https://admin:s3cret@{ip}:8443/ui"), { value: "https://admin@{ip}:8443/ui", stripped: true });
+  assert.deepEqual(withoutUrlPassword("http://:pw@{ip}/"), { value: "http://{ip}/", stripped: true });
+  assert.deepEqual(withoutUrlPassword("ssh://admin@{ip}"), { value: "ssh://admin@{ip}", stripped: false }, "a user name alone is kept");
+  assert.deepEqual(withoutUrlPassword("http://{ip}:8080/a:b@c"), { value: "http://{ip}:8080/a:b@c", stripped: false }, "only the authority");
+  assert.deepEqual(withoutUrlPassword("http://{ip}:8080/"), { value: "http://{ip}:8080/", stripped: false });
 });

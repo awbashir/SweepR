@@ -314,21 +314,25 @@ function MemberKindIcon({ kind }: { kind: string }) {
   return <Icon size={11} strokeWidth={1.9} aria-label={deviceKindLabel(kind)} className="shrink-0 text-accent" />;
 }
 
-/** Collapsible group of endpoints ("31 hosts on Gi1/0/1-43"). */
+/** Collapsible group of endpoints ("31 hosts on Gi1/0/1-43") or of unlinked infrastructure ("40 access points"). */
 export const ClusterNode = memo(function ClusterNode({ data }: NodeProps<TopoRfNode>) {
   const a = useActions();
   const n = data.topo;
   const wireless = n.clusterKind === "wireless";
-  const Icon = wireless ? Wifi : Users;
+  // Unlinked infrastructure grouped by role: the role's icon and color.
+  const infraRole = n.clusterKind === "infra" ? (n.role ?? "switch") : null;
+  const Icon = wireless ? Wifi : infraRole ? ROLE_ICON[infraRole] : Users;
   const cols = clusterCols(n.members.length);
-  const tone = wireless ? ROLE_VAR.access_point : n.clusterKind === "unattached" ? "var(--faint)" : ROLE_VAR.host;
+  const tone = wireless ? ROLE_VAR.access_point : infraRole ? ROLE_VAR[infraRole] : n.clusterKind === "unattached" ? "var(--faint)" : ROLE_VAR.host;
   return (
     <div className={cx(frameClass(data), "topo-cluster")} style={{ borderLeft: `4px double ${tone}` }}>
       <Handles dir={data.dir} />
       <div className="flex items-start gap-1.5 px-2 pt-1.5">
         <Icon size={14} strokeWidth={1.9} aria-hidden className="mt-px shrink-0" style={{ color: tone }} />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[12px] font-semibold">{n.label}</div>
+          <div className="truncate text-[12px] font-semibold" title={n.note ?? undefined}>
+            {n.label}
+          </div>
           <div className="topo-detail flex min-w-0 items-center gap-1 text-[10.5px] text-muted">
             {n.portsLabel && <span className="truncate font-mono">{n.portsLabel}</span>}
             {!n.portsLabel && wireless && <span>Wi-Fi clients</span>}

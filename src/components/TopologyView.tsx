@@ -62,7 +62,8 @@ import {
   type Pos,
   type Size,
 } from "../lib/topologyLayout.ts";
-import { topologySvg, type SvgPalette } from "../lib/topologySvg.ts";
+import { bytesToBase64, exportFileName, pngScale, svgDataUrl, topologySvg, type SvgPalette } from "../lib/topologySvg.ts";
+import { backend, errorMessage } from "../api.ts";
 import { ContextMenu, type MenuState } from "./Menu.tsx";
 import { useToasts } from "./Toasts.tsx";
 import {
@@ -111,9 +112,6 @@ const PREFS_KEY = "sweepr.topology.v1";
 const DEFAULT_PREFS: TopoPrefs = { dir: "TB", minimap: true, bannerDismissed: false };
 /** Largest member count an expanded cluster grows to via "+N more". */
 const MAX_EXPANDED = 480;
-/** Safari / WKWebView canvas limit (16.7 Mpx); larger PNG exports are scaled down. */
-const MAX_CANVAS_AREA = 16_000_000;
-const MAX_CANVAS_SIDE = 16_000;
 
 const prefersReducedMotion = (): boolean => {
   try {
@@ -222,6 +220,15 @@ function TopologyCanvas(p: TopologyViewProps) {
   const [farOut, setFarOut] = useState(false);
   const [matchIndex, setMatchIndex] = useState(0);
   const wrapRef = useRef<HTMLDivElement>(null);
+  // A narrow map (small window, drawer open): the overview sits below the map toolbar.
+  const [narrowMap, setNarrowMap] = useState(false);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setNarrowMap(el.clientWidth < 760));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   const pinned = useRef<Record<string, Pos>>({});
   const prevLayout = useRef<{ positions: Record<string, Pos>; sizes: Record<string, Size> } | null>(null);
   const lastSig = useRef("");
@@ -311,8 +318,11 @@ function TopologyCanvas(p: TopologyViewProps) {
     setLayout(r);
   }, []);
 
+  /** The newest layout request (the main-thread fallback lays out this one, never a stale one). */
+  const lastReq = useRef<LayoutRequest | null>(null);
   const runLayout = useCallback(
     (req: LayoutRequest) => {
+      lastReq.current = req;
       if (workerRef.current === undefined) {
         const w = createLayoutWorker();
         if (w) {
@@ -327,7 +337,8 @@ function TopologyCanvas(p: TopologyViewProps) {
             // Module workers unavailable: lay out on the main thread from now on.
             workerRef.current = null;
             w.terminate();
-            window.setTimeout(() => handleResult(stableLayout(req)), 0);
+            const latest = lastReq.current;
+            if (latest) window.setTimeout(() => handleResult(stableLayout(latest)), 0);
           };
         }
         workerRef.current = w;
@@ -638,70 +649,58 @@ function TopologyCanvas(p: TopologyViewProps) {
     });
   }, [graph, layout, rf, dir, stacked]);
 
-  const renderImage = useCallback(
-    async (kind: "png" | "svg"): Promise<Blob> => {
-      const { svg, width, height } = renderSvg();
-      const svgBlob = new Blob([svg], { type: "image/svg+xml" });
-      if (kind === "svg") return svgBlob;
-      // Fit the canvas limits (WebKit: 16.7 Mpx); 2x for small maps.
-      let scale = Math.min(2, MAX_CANVAS_SIDE / width, MAX_CANVAS_SIDE / height, Math.sqrt(MAX_CANVAS_AREA / (width * height)));
-      scale = Math.max(scale, 0.05);
-      const url = URL.createObjectURL(svgBlob);
-      try {
-        const img = new Image();
-        img.decoding = "async";
-        await new Promise<void>((resolve, reject) => {
-          img.onload = () => resolve();
-          img.onerror = () => reject(new Error("could not rasterize the SVG"));
-          img.src = url;
-        });
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.floor(width * scale));
-        canvas.height = Math.max(1, Math.floor(height * scale));
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("canvas unavailable");
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        return await new Promise<Blob>((resolve, reject) =>
-          canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("PNG encoding failed"))), "image/png"),
-        );
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    },
-    [renderSvg],
-  );
+  // Rasterized from a data: URL: the CSP (`img-src 'self' data:`) blocks blob: images.
+  const renderPng = useCallback(async (): Promise<Blob> => {
+    const { svg, width, height } = renderSvg();
+    const scale = pngScale(width, height);
+    const img = new Image();
+    img.decoding = "async";
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("could not rasterize the SVG"));
+      img.src = svgDataUrl(svg);
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.floor(width * scale));
+    canvas.height = Math.max(1, Math.floor(height * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("canvas unavailable");
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return await new Promise<Blob>((resolve, reject) =>
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("PNG encoding failed"))), "image/png"),
+    );
+  }, [renderSvg]);
 
+  // Saved by the backend (`save_file` opens the native save dialog): WKWebView cancels
+  // `<a download>` links, so only a returned path proves the file was written.
   const download = useCallback(
     async (kind: "png" | "svg") => {
-      toast.push("info", `Exporting the map as ${kind.toUpperCase()}…`);
+      const label = kind.toUpperCase();
       try {
-        const blob = await renderImage(kind);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `sweepr-topology-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.${kind}`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 5000);
-        toast.push("success", `Saved the map as ${kind.toUpperCase()}`, `${(blob.size / 1024).toFixed(0)} KB, to your Downloads folder`);
+        const contents = kind === "svg" ? renderSvg().svg : bytesToBase64(new Uint8Array(await (await renderPng()).arrayBuffer()));
+        const path = await backend.saveFile(kind, contents, exportFileName(kind));
+        if (path === null) toast.push("info", "Map not saved", "The save dialog was cancelled.");
+        else toast.push("success", `Saved the map as ${label}`, path);
       } catch (e) {
-        toast.push("error", `${kind.toUpperCase()} export failed`, e instanceof Error ? e.message : String(e));
+        toast.push("error", `${label} export failed`, errorMessage(e));
       }
     },
-    [renderImage, toast],
+    [renderSvg, renderPng, toast],
   );
 
   const copyPng = useCallback(async () => {
+    if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) {
+      toast.push("error", "Could not copy the map", "Image copying is not available here. Use Save as PNG instead.");
+      return;
+    }
     try {
-      if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) throw new Error("image clipboard is not available here");
       // Pass the promise straight to ClipboardItem so Safari / WKWebView keeps the user gesture.
-      await navigator.clipboard.write([new ClipboardItem({ "image/png": renderImage("png") })]);
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": renderPng() })]);
       toast.push("success", "Copied the map as PNG");
     } catch (e) {
-      toast.push("error", "Could not copy the map", e instanceof Error ? e.message : String(e));
+      toast.push("error", "Could not copy the map", `${errorMessage(e).replace(/\.$/, "")}. Use Save as PNG instead.`);
     }
-  }, [renderImage, toast]);
+  }, [renderPng, toast]);
 
   const exportBtn = useRef<HTMLButtonElement>(null);
   const openExport = (): void => {
@@ -712,8 +711,8 @@ function TopologyCanvas(p: TopologyViewProps) {
       label: "Export map",
       items: [
         { kind: "header", label: "Export map" },
-        { kind: "item", label: "Download PNG", icon: FileImage, onSelect: () => void download("png") },
-        { kind: "item", label: "Download SVG", icon: Share2, onSelect: () => void download("svg") },
+        { kind: "item", label: "Save as PNG…", icon: FileImage, onSelect: () => void download("png") },
+        { kind: "item", label: "Save as SVG…", icon: Share2, onSelect: () => void download("svg") },
         { kind: "item", label: "Copy as PNG", icon: ClipboardCopy, onSelect: () => void copyPng() },
       ],
     });
@@ -798,6 +797,7 @@ function TopologyCanvas(p: TopologyViewProps) {
           {prefs.minimap && (
             <MiniMap
               position="top-right"
+              className={narrowMap ? "!mt-14" : undefined}
               pannable
               zoomable
               ariaLabel="Topology overview"
@@ -881,7 +881,9 @@ function TopologyCanvas(p: TopologyViewProps) {
               </div>
             </Panel>
           )}
-          <Panel position="bottom-left" className="!m-2">
+          {/* Legend and stats share one corner (stacked), so they never overlap on narrow maps. */}
+          <Panel position="bottom-left" className="!m-2 flex max-w-[min(560px,calc(100%-80px))] flex-col items-start gap-1">
+            <Legend />
             <div className="rounded-[6px] border border-line bg-panel/95 px-2 py-1 text-[11px] text-muted tabular shadow-[0_1px_2px_rgb(0_0_0/0.1)]" aria-live="off">
               {stats ? (
                 <>
@@ -898,7 +900,6 @@ function TopologyCanvas(p: TopologyViewProps) {
               )}
             </div>
           </Panel>
-          <Legend />
         </ReactFlow>
         {!menu && <HoverTooltip store={hover} graph={graph} />}
         {menu && <ContextMenu menu={menu} onClose={() => setMenu(null)} />}
@@ -1008,7 +1009,7 @@ function Tooltip({ hover, graph }: { hover: { node: TopoNode; x: number; y: numb
 function Legend() {
   const [open, setOpen] = useState(false);
   return (
-    <Panel position="bottom-center" className="!mb-2">
+    <>
       {open ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-[6px] border border-line bg-panel/95 px-2 py-1 text-[11px] shadow-[0_1px_2px_rgb(0_0_0/0.1)]">
           <LegendLine label="Trunk / uplink" stroke="var(--edge-trunk)" width={2.4} />
@@ -1025,7 +1026,7 @@ function Legend() {
           Legend
         </button>
       )}
-    </Panel>
+    </>
   );
 }
 

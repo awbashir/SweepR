@@ -19,17 +19,17 @@ import {
 } from "lucide-react";
 import { backend, errorMessage } from "./api.ts";
 import type { DeviceOverride, ExportFormat, InterfaceInfo, ReportFormat, ScanConfig, WakeOptions } from "./types.ts";
-import { clearTools, grabWebIdentity, initTools, latencyCtl, latencyStore, onLatencyError, webStore } from "./tools.ts";
+import { clearTools, grabWebIdentity, initTools, latencyCtl, latencyStore, onLatencyError, setLatencyPortSource, webStore } from "./tools.ts";
 import { webProbePorts, webTargets } from "./lib/webid.ts";
 import { ScanStore, exportDevice, type DeviceRow } from "./lib/store.ts";
 import { urlHost } from "./lib/ip.ts";
-import { formatPorts, parsePorts, vlanSelectionLabel } from "./lib/parse.ts";
+import { formatPorts, parsePorts, vlanSelectionLabel, withoutUrlPassword } from "./lib/parse.ts";
 import { PORT_PRESETS } from "./lib/ports.ts";
 import {
   DEFAULT_SETTINGS,
-  DEFAULT_SNMP,
   buildScanConfig,
   interfaceCidr,
+  normalizeSettings,
   persistableSettings,
   snmpForWire,
   subnetHint,
@@ -39,7 +39,7 @@ import {
 import { usePersistentState } from "./hooks/usePersistentState.ts";
 import { detectAutoColumns } from "./lib/columns.ts";
 import { modelSerialText, rtspCandidates } from "./lib/services.ts";
-import { buildReportArgs, buildReportMeta, leaksSecret, snmpSecrets, yieldToEventLoop } from "./lib/report.ts";
+import { buildReportArgs, buildReportMeta, reportMetaProblem, yieldToEventLoop } from "./lib/report.ts";
 import type { ServiceQueryState } from "./components/DrawerServices.tsx";
 import { DeviceTable, type EditField } from "./components/DeviceTable.tsx";
 import { DetailsDrawer, type DrawerSection, type PortScanState, type SnmpQueryState } from "./components/DetailsDrawer.tsx";
@@ -50,9 +50,26 @@ import { LogPanel, StatusBar } from "./components/StatusBar.tsx";
 import { ToastProvider, useToasts } from "./components/Toasts.tsx";
 import { FilterBar, Toolbar, type DevicesMode, type RoleFilter, type View } from "./components/Toolbar.tsx";
 import { Button, Kbd } from "./components/ui.tsx";
+import { ErrorBoundary, errorFallbackShown } from "./components/ErrorBoundary.tsx";
+import { armCrashTest, crashTestArea, crashTestArmed } from "./lib/crash.ts";
 
-// React Flow + dagre load only when the topology map is first shown.
-const TopologyView = lazy(() => import("./components/TopologyView.tsx"));
+/** `?crash=<area>` in mock mode: that area throws until "Try Again" (headless checks). */
+armCrashTest(backend.isMock ? crashTestArea(window.location.search) : null);
+function CrashTest({ area }: { area: string }): null {
+  if (crashTestArmed(area)) throw new Error(`Test crash in ${area} (?crash=${area})`);
+  return null;
+}
+
+// React Flow + dagre load only when the topology map is first shown. A new lazy component per
+// attempt, so "Try Again" after a failed chunk load really imports it again.
+function lazyTopology() {
+  return lazy(() => {
+    if (crashTestArmed("topology-chunk")) {
+      return Promise.reject(new TypeError("Failed to fetch dynamically imported module: TopologyView.js (?crash=topology-chunk)"));
+    }
+    return import("./components/TopologyView.tsx");
+  });
+}
 
 /** One store for the app's lifetime; React reads throttled snapshots of it. */
 const store = new ScanStore();
@@ -75,6 +92,9 @@ interface UiPrefs {
   pinned: string[];
 }
 
+/** How long a stopped job may take to send its `finished` event before the UI resets. */
+const STOP_GRACE_MS = 5000;
+
 /** Pinned devices kept at most (live latency monitors at most `MAX_MONITORED` hosts). */
 const MAX_PINNED = 100;
 
@@ -92,25 +112,32 @@ const DEFAULT_UI: UiPrefs = {
   pinned: [],
 };
 
+function persistableUi(u: UiPrefs): UiPrefs {
+  return typeof u.urlTemplate === "string" ? { ...u, urlTemplate: withoutUrlPassword(u.urlTemplate).value } : u;
+}
+
 export default function App() {
   return (
-    <ToastProvider>
-      <Main />
-    </ToastProvider>
+    <ErrorBoundary what="SweepR" fullPage>
+      <ToastProvider>
+        <Main />
+      </ToastProvider>
+    </ErrorBoundary>
   );
 }
 
 function Main() {
   const toast = useToasts();
+  const [topologyAttempt, setTopologyAttempt] = useState(0);
+  // A new lazy component per attempt (Try Again after a failed chunk load).
+  const TopologyView = useMemo(() => lazyTopology(), [topologyAttempt]);
   const snap = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
   const [rawSettings, setRawSettings] = usePersistentState<ScanSettings>("sweepr.settings.v1", DEFAULT_SETTINGS, persistableSettings);
-  const settings = useMemo<ScanSettings>(
-    () => ({ ...DEFAULT_SETTINGS, ...rawSettings, snmp: { ...DEFAULT_SNMP, ...rawSettings.snmp } }),
-    [rawSettings],
-  );
+  const settings = useMemo<ScanSettings>(() => normalizeSettings(rawSettings), [rawSettings]);
   const patchSettings = useCallback((patch: Partial<ScanSettings>) => setRawSettings((s) => ({ ...s, ...patch })), [setRawSettings]);
-  const [ui, setUi] = usePersistentState<UiPrefs>("sweepr.ui.v1", DEFAULT_UI);
+  // A password typed into the custom URL template is used for the session only, never saved.
+  const [ui, setUi] = usePersistentState<UiPrefs>("sweepr.ui.v1", DEFAULT_UI, persistableUi);
   const patchUi = useCallback((patch: Partial<UiPrefs>) => setUi((u) => ({ ...u, ...patch })), [setUi]);
 
   const [interfaces, setInterfaces] = useState<InterfaceInfo[]>([]);
@@ -179,9 +206,25 @@ function Main() {
     }
   }, [toast, setRawSettings]);
 
+  // SNMP secrets are never stored: after a restart with SNMP on, say once that scans skip
+  // SNMP until the credentials are re-entered.
+  const credentialsNotice = useRef(false);
+  useEffect(() => {
+    if (credentialsNotice.current || !settings.snmpEnabled || !settings.snmpCredentialsMissing) return;
+    credentialsNotice.current = true;
+    toast.push("warn", "SNMP credentials needed", "Communities and SNMPv3 passwords are not stored between sessions. Scans run without SNMP until you re-enter them.", {
+      label: "SNMP Settings",
+      onClick: () => setSnmpOpen(true),
+    });
+  }, [settings.snmpEnabled, settings.snmpCredentialsMissing, toast]);
+
   // --- network utilities: event subscriptions and live latency selection -------------------------
 
   useEffect(() => {
+    // Known open ports feed the latency monitor's TCP fallback (hosts that drop ICMP).
+    setLatencyPortSource(function* () {
+      for (const r of store.getSnapshot().rows) yield r.device;
+    });
     initTools().catch((e: unknown) => toast.push("error", "Could not subscribe to utility events", errorMessage(e)));
     return onLatencyError((msg) => toast.push("error", "Live latency monitor failed", msg));
   }, [toast]);
@@ -250,6 +293,9 @@ function Main() {
         toast.push("error", "Cannot start scan", built.error);
         return;
       }
+      if (built.value.snmpSkipped) {
+        store.log("warn", "SNMP credentials are not stored between sessions: this scan runs without SNMP. Re-enter them in SNMP Settings.");
+      }
       const token = store.beginStart("scan");
       const defaultIface = interfaces.find((i) => i.isDefault);
       lastScan.current = { config: built.value.config, iface: built.value.config.interface ?? defaultIface?.name ?? null, startedMs: Date.now() };
@@ -272,9 +318,21 @@ function Main() {
   const start = useCallback(() => void startWith(settings), [startWith, settings]);
 
   const stop = useCallback(async () => {
+    const id = snap.scanId;
+    const reset = (why: string): boolean => {
+      if (!store.forceIdle(id, `${why} The scan state was reset; results so far are kept.`)) return false;
+      toast.push("warn", "The scan ended unexpectedly", `${why} Results so far are kept.`);
+      return true;
+    };
     try {
-      const signalled = await backend.stopScan(snap.scanId ?? undefined);
-      if (!signalled) store.log("info", "No running job to stop.");
+      const signalled = await backend.stopScan(id ?? undefined);
+      if (!signalled) {
+        // Nothing is running in the backend: the job ended without its `finished` event.
+        if (!reset("The backend has no running job.")) store.log("info", "No running job to stop.");
+        return;
+      }
+      // `finished` follows a stop within moments; if it never comes, do not stay busy forever.
+      window.setTimeout(() => reset(`No "finished" event arrived within ${STOP_GRACE_MS / 1000} s of stopping.`), STOP_GRACE_MS);
     } catch (e) {
       toast.push("error", "Could not stop the scan", errorMessage(e));
     }
@@ -337,6 +395,13 @@ function Main() {
     },
     [snap.rows, snap.overrides, toast],
   );
+
+  // An edit whose row left the table (filtered out, removed, cleared) or whose table is no
+  // longer shown is dropped instead of lingering.
+  useEffect(() => {
+    if (editing === null) return;
+    if (!tableShown || !filtered.some((r) => r.key === editing.key)) setEditing(null);
+  }, [editing, filtered, tableShown]);
 
   const cancelEdit = useCallback(() => {
     setEditing(null);
@@ -424,6 +489,12 @@ function Main() {
 
   const querySnmp = useCallback(
     async (row: DeviceRow) => {
+      if (settings.snmpCredentialsMissing) {
+        // Never query with "public" / noAuthNoPriv in place of credentials that were not kept.
+        toast.push("warn", "Re-enter the SNMP credentials", "SNMP communities and passwords are not stored between sessions.");
+        setSnmpOpen(true);
+        return;
+      }
       const key = row.key;
       setSnmpQueries((s) => ({ ...s, [key]: { status: "running" } }));
       try {
@@ -440,7 +511,7 @@ function Main() {
         toast.push("error", `SNMP query of ${row.device.ip} failed`, msg);
       }
     },
-    [settings.snmp, toast],
+    [settings.snmp, settings.snmpCredentialsMissing, toast],
   );
 
   const wake = useCallback(
@@ -539,11 +610,10 @@ function Main() {
           summary: snap.scanMeta,
           snmpAgents: snap.snmpAgents,
         });
-        // Defence in depth: the metadata must never carry the community or v3 passwords.
-        const secrets = [...snmpSecrets(settings.snmp), ...snmpSecrets(scan?.config.snmp)];
-        if (leaksSecret(meta, secrets)) {
-          throw "internal error: the report metadata contained an SNMP secret; nothing was sent";
-        }
+        // Defence in depth: the metadata is built from an allow-list (SNMP version and
+        // community class only); verify its shape so no field could carry a credential.
+        const problem = reportMetaProblem(meta);
+        if (problem) throw `internal error: ${problem} in the report metadata; nothing was sent`;
         const t0 = performance.now();
         const args = await buildReportArgs(
           { rows, latency: (ip) => latencyStore.get(ip)?.stats, vlans: snap.vlans, neighbors: snap.neighbors, portMappings: snap.portMappings, snmp: snap.snmp, snmpAgents: snap.snmpAgents },
@@ -554,9 +624,6 @@ function Main() {
             await yieldToEventLoop();
           },
         );
-        if (leaksSecret(args.snmpInfos, secrets)) {
-          throw "internal error: the SNMP data contained an SNMP secret; nothing was sent";
-        }
         const buildMs = performance.now() - t0;
         if (rows.length >= 5000) store.log("info", `Report input: ${rows.length.toLocaleString()} devices prepared in ${buildMs.toFixed(0)} ms`);
         setReportBusy(format === "pdf" ? "Rendering the PDF…" : "Building the report…");
@@ -586,7 +653,7 @@ function Main() {
         setReportBusy(null);
       }
     },
-    [filtered, snap, interfaces, toolVersion, settings.snmp, setReportPrefs, toast],
+    [filtered, snap, interfaces, toolVersion, setReportPrefs, toast],
   );
 
   const togglePin = useCallback(
@@ -824,6 +891,7 @@ function Main() {
         searchRef.current?.focus();
         searchRef.current?.select();
       } else if (k === "r" && !e.shiftKey) {
+        if (errorFallbackShown()) return; // the error screen's ⌘R reloads the window
         e.preventDefault(); // also suppresses the webview reload
         if (!snap.running) start();
       } else if (k === ".") {
@@ -886,6 +954,7 @@ function Main() {
 
   return (
     <div className="flex h-full flex-col">
+      <CrashTest area="root" />
       <Toolbar
         settings={settings}
         onSettings={patchSettings}
@@ -933,28 +1002,31 @@ function Main() {
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
           {ui.view === "devices" && ui.devicesMode === "topology" && (
-            <Suspense fallback={<div className="flex flex-1 items-center justify-center text-muted">Loading the topology map…</div>}>
-              <TopologyView
-                rows={snap.rows}
-                neighbors={snap.neighbors}
-                vlans={snap.vlans}
-                portMappings={snap.portMappings}
-                snmp={snap.snmpView}
-                running={snap.running}
-                roleFilter={roleFilter}
-                search={deferredSearch}
-                selectedKey={selectedKey}
-                onOpenDetails={openDetails}
-                onDeviceMenu={openDeviceMenu}
-                onCopy={copyText}
-                onScanCdp={scanWithCdp}
-                onOpenSnmp={openSnmp}
-                onPassiveListen={passiveListen}
-                cdpLldp={settings.cdpLldp}
-                snmpEnabled={settings.snmpEnabled}
-                liveLatency={ui.liveLatency}
-              />
-            </Suspense>
+            <ErrorBoundary what="The topology map" onReset={() => setTopologyAttempt((n) => n + 1)}>
+              <Suspense fallback={<div className="flex flex-1 items-center justify-center text-muted">Loading the topology map…</div>}>
+                <CrashTest area="topology" />
+                <TopologyView
+                  rows={snap.rows}
+                  neighbors={snap.neighbors}
+                  vlans={snap.vlans}
+                  portMappings={snap.portMappings}
+                  snmp={snap.snmpView}
+                  running={snap.running}
+                  roleFilter={roleFilter}
+                  search={deferredSearch}
+                  selectedKey={selectedKey}
+                  onOpenDetails={openDetails}
+                  onDeviceMenu={openDeviceMenu}
+                  onCopy={copyText}
+                  onScanCdp={scanWithCdp}
+                  onOpenSnmp={openSnmp}
+                  onPassiveListen={passiveListen}
+                  cdpLldp={settings.cdpLldp}
+                  snmpEnabled={settings.snmpEnabled}
+                  liveLatency={ui.liveLatency}
+                />
+              </Suspense>
+            </ErrorBoundary>
           )}
           {ui.view === "devices" && ui.devicesMode === "table" && (
             <DeviceTable
@@ -991,38 +1063,41 @@ function Main() {
           {ui.view === "neighbors" && <NeighborView neighbors={snap.neighbors} onSelectIp={selectIp} />}
         </main>
         {ui.drawerOpen && (
-          <DetailsDrawer
-            row={selectedRow}
-            rows={snap.rows}
-            neighbors={snap.neighbors}
-            vlans={snap.vlans}
-            portMappings={snap.portMappings}
-            snmp={selectedKey !== null ? snap.snmpView[selectedKey] : undefined}
-            snmpQuery={selectedKey !== null ? snmpQueries[selectedKey] : undefined}
-            portScan={selectedKey !== null ? portScans[selectedKey] : undefined}
-            portPreset={ui.portPreset}
-            customPorts={ui.customPorts}
-            onPortPreset={(portPreset) => patchUi({ portPreset })}
-            onCustomPorts={(customPorts) => patchUi({ customPorts })}
-            onRunPortScan={() => selectedRow && void runPortScan(selectedRow)}
-            onQuerySnmp={() => selectedRow && void querySnmp(selectedRow)}
-            onOpenUrl={(scheme, port) => selectedRow && openScheme(selectedRow, scheme, port)}
-            onCopy={(text, what) => void copy(text, what)}
-            onSelectIp={selectIp}
-            onClose={() => patchUi({ drawerOpen: false })}
-            liveLatency={ui.liveLatency}
-            onEnableLive={() => patchUi({ liveLatency: true })}
-            pinned={selectedIp !== null && pinned.includes(selectedIp)}
-            onTogglePin={() => selectedIp && togglePin(selectedIp)}
-            onWake={() => selectedRow && wakeRow(selectedRow)}
-            onGrabWeb={() => selectedRow && void grabWeb(selectedRow)}
-            onOpenWebUrl={(url) => void openUrl(url)}
-            serviceQuery={selectedKey !== null ? serviceQueries[selectedKey] : undefined}
-            onDiscoverServices={() => selectedRow && void discoverServices(selectedRow)}
-            traceToken={traceToken}
-            iperfToken={iperfToken}
-            focus={drawerFocus}
-          />
+          <ErrorBoundary what="The details panel" resetKey={selectedKey} className="w-[360px] flex-none shrink-0 border-l border-line bg-panel">
+            <CrashTest area="drawer" />
+            <DetailsDrawer
+              row={selectedRow}
+              rows={snap.rows}
+              neighbors={snap.neighbors}
+              vlans={snap.vlans}
+              portMappings={snap.portMappings}
+              snmp={selectedKey !== null ? snap.snmpView[selectedKey] : undefined}
+              snmpQuery={selectedKey !== null ? snmpQueries[selectedKey] : undefined}
+              portScan={selectedKey !== null ? portScans[selectedKey] : undefined}
+              portPreset={ui.portPreset}
+              customPorts={ui.customPorts}
+              onPortPreset={(portPreset) => patchUi({ portPreset })}
+              onCustomPorts={(customPorts) => patchUi({ customPorts })}
+              onRunPortScan={() => selectedRow && void runPortScan(selectedRow)}
+              onQuerySnmp={() => selectedRow && void querySnmp(selectedRow)}
+              onOpenUrl={(scheme, port) => selectedRow && openScheme(selectedRow, scheme, port)}
+              onCopy={(text, what) => void copy(text, what)}
+              onSelectIp={selectIp}
+              onClose={() => patchUi({ drawerOpen: false })}
+              liveLatency={ui.liveLatency}
+              onEnableLive={() => patchUi({ liveLatency: true })}
+              pinned={selectedIp !== null && pinned.includes(selectedIp)}
+              onTogglePin={() => selectedIp && togglePin(selectedIp)}
+              onWake={() => selectedRow && wakeRow(selectedRow)}
+              onGrabWeb={() => selectedRow && void grabWeb(selectedRow)}
+              onOpenWebUrl={(url) => void openUrl(url)}
+              serviceQuery={selectedKey !== null ? serviceQueries[selectedKey] : undefined}
+              onDiscoverServices={() => selectedRow && void discoverServices(selectedRow)}
+              traceToken={traceToken}
+              iperfToken={iperfToken}
+              focus={drawerFocus}
+            />
+          </ErrorBoundary>
         )}
       </div>
       {ui.logOpen && <LogPanel logs={snap.logs} onClear={() => store.clearLogs()} />}
@@ -1048,7 +1123,8 @@ function Main() {
           enabled={settings.snmpEnabled}
           pollAll={settings.snmpAll}
           config={settings.snmp}
-          onSave={(snmpEnabled, snmpAll, snmp) => patchSettings({ snmpEnabled, snmpAll, snmp })}
+          credentialsMissing={settings.snmpCredentialsMissing}
+          onSave={(snmpEnabled, snmpAll, snmp) => patchSettings({ snmpEnabled, snmpAll, snmp, snmpCredentialsMissing: false })}
           onClose={() => setSnmpOpen(false)}
         />
       )}

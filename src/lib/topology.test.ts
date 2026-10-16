@@ -16,7 +16,7 @@ import {
   type TopologyInput,
 } from "./topology.ts";
 import { layoutInput, nodeSize, stableLayout, stackedLeaves, type Pos } from "./topologyLayout.ts";
-import { topologySvg } from "./topologySvg.ts";
+import { MAX_CANVAS_AREA, MAX_CANVAS_SIDE, bytesToBase64, exportFileName, pngScale, svgDataUrl, topologySvg } from "./topologySvg.ts";
 import type { CdpLldpNeighbor, Device, DeviceRole, SwitchPortMapping } from "../types.ts";
 
 function dev(ip: string, patch: Partial<Device> = {}): Device {
@@ -396,4 +396,97 @@ test("SVG export: plain vector shapes, escaped text, bus edges for stacked leave
   assert.ok(svg.includes("a&lt;b&gt;&amp;c"));
   assert.ok(svg.includes("Te1/0/1 ↔ Te1/1/1"));
   assert.equal((svg.match(/<path /g) ?? []).length, g.edges.length);
+});
+
+test("map export: data: URLs (the CSP has no blob:), chunked base64, canvas limits, file names", () => {
+  const bytes = new Uint8Array(200_000).map((_, i) => (i * 31) & 0xff);
+  assert.equal(bytesToBase64(bytes), Buffer.from(bytes).toString("base64"));
+  assert.equal(bytesToBase64(new Uint8Array()), "");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg"><text>Bâtiment ⇄ “core” 交换机</text></svg>`;
+  const url = svgDataUrl(svg);
+  assert.ok(url.startsWith("data:image/svg+xml;base64,"));
+  assert.equal(Buffer.from(url.slice(url.indexOf(",") + 1), "base64").toString("utf8"), svg);
+  assert.equal(pngScale(800, 600), 2, "small maps at 2x");
+  for (const [w, h] of [[92_000, 300], [9000, 9000], [1, 400_000]] as const) {
+    const s = pngScale(w, h);
+    assert.ok(w * s <= MAX_CANVAS_SIDE + 1 || s === 0.05, `${w}x${h}`);
+    assert.ok(w * h * s * s <= MAX_CANVAS_AREA + 1 || s === 0.05, `${w}x${h}`);
+  }
+  assert.equal(exportFileName("png", new Date("2026-10-16T14:03:22.123Z")), "sweepr-topology-2026-10-16-14-03-22.png");
+});
+
+// --- unlinked infrastructure: clustering and build cost ----------------------------------------------
+
+function unlinkedLab(aps: number, switches: number, gateway = true): TopologyInput & { devices: TopoDeviceInput[] } {
+  const devices: Device[] = [];
+  if (gateway) devices.push(dev("10.0.0.1", { role: "firewall", mac: mac(1), dnsName: "fw1.corp" }));
+  for (let i = 0; i < aps; i++) devices.push(dev(`10.30.${i >> 8}.${i & 255}`, { role: "access_point", mac: mac(1000 + i), vlanId: 30, vendor: "Aruba Networks" }));
+  for (let i = 0; i < switches; i++) devices.push(dev(`10.40.0.${i + 1}`, { role: "switch", mac: mac(30000 + i), dnsName: `sw${i + 1}.corp` }));
+  return { devices: devices.map((d) => row(d)), neighbors: [], vlans: [], portMappings: [], snmp: {} };
+}
+
+test("unlinked infrastructure of one role and VLAN is clustered (expandable, searchable, filterable)", () => {
+  const input = unlinkedLab(10, 3);
+  const g = buildTopology(input);
+  const cluster = g.nodes.find((n) => n.kind === "cluster" && n.clusterKind === "infra");
+  assert.ok(cluster, "the APs form a cluster");
+  assert.equal(cluster.role, "access_point");
+  assert.equal(cluster.label, "10 access points");
+  assert.equal(cluster.count, 10);
+  assert.deepEqual(cluster.vlans, [30]);
+  assert.equal(cluster.parentId, "d:10.0.0.1", "under the gateway");
+  assert.equal(cluster.memberKeys.length, 10);
+  assert.equal(g.nodeOfKey.get("10.30.0.3@30"), cluster.id, "search / selection lands on the cluster");
+  const edge = g.edges.find((e) => e.target === cluster.id);
+  assert.equal(edge?.kind, "inferred");
+  assert.equal(edge?.minlen, 2, "APs rank below switches");
+  // Below the threshold: the three switches stay individual cards.
+  assert.equal(g.nodes.filter((n) => n.kind === "infra" && n.role === "switch").length, 3);
+  assert.equal(g.nodes.some((n) => n.id === "d:10.30.0.0@30"), false, "clustered APs have no own node");
+  assert.equal(g.stats.clusters, 1);
+
+  // Expanded: members in natural order, "+N more" past the limit.
+  const ex = buildTopology(input, { expanded: new Map([[cluster.id, 4]]), priorityKeys: new Set(["10.30.0.9@30"]) });
+  const exC = ex.nodes.find((n) => n.id === cluster.id)!;
+  assert.equal(exC.expanded, true);
+  assert.equal(exC.members.length, 4);
+  assert.equal(exC.members[0]?.key, "10.30.0.9@30", "search matches first");
+  assert.equal(exC.more, 6);
+
+  // Role filter: only switches -> no AP cluster.
+  const sw = buildTopology(input, { roles: new Set(["switch"]) });
+  assert.equal(sw.nodes.some((n) => n.clusterKind === "infra"), false);
+  assert.equal(sw.nodes.filter((n) => n.role === "switch").length, 3);
+
+  // Many switches without a gateway: a root-level cluster (no edge).
+  const noGw = buildTopology(unlinkedLab(0, 40, false));
+  const swc = noGw.nodes.find((n) => n.clusterKind === "infra");
+  assert.equal(swc?.label, "40 switches");
+  assert.equal(swc?.parentId, null);
+  assert.equal(noGw.edges.length, 0);
+
+  // A switch with endpoints attached is never folded into a cluster.
+  const withHost = unlinkedLab(0, 8);
+  withHost.devices.push(row(dev("10.40.9.9", { mac: mac(50000), switchPort: { switchName: "sw1.corp", switchIp: "10.40.0.1", portName: "Gi1/0/7", portIndex: null, vlanId: null, mac: "" } })));
+  const wh = buildTopology(withHost);
+  assert.ok(wh.nodes.some((n) => n.id === "d:10.40.0.1" && n.kind === "infra"), "sw1 keeps its own node");
+  assert.equal(wh.nodes.find((n) => n.clusterKind === "infra")?.count, 7);
+});
+
+test("perf: 6,000 unlinked infrastructure devices and 20,000 hosts build quickly", () => {
+  const big = unlinkedLab(4000, 2000);
+  for (let i = 0; i < 20_000; i++) big.devices.push(row(dev(`10.50.${i >> 8}.${i & 255}`, { mac: mac(60000 + i) })));
+  // Warm-up, then measure (CI machines vary: the bound is generous; the old builder took ~1 s).
+  buildTopology(big);
+  let t0 = performance.now();
+  const g = buildTopology(big);
+  const clustered = performance.now() - t0;
+  assert.ok(g.nodes.length < 20, `compact map (${g.nodes.length} nodes)`);
+  assert.ok(clustered < 400, `clustered build took ${clustered.toFixed(0)} ms`);
+  // Even without clustering the ranking pass stays linear.
+  t0 = performance.now();
+  const flat = buildTopology(big, { infraClusterMin: 1_000_000 });
+  const unclustered = performance.now() - t0;
+  assert.equal(flat.nodes.filter((n) => n.kind === "infra").length, 6001);
+  assert.ok(unclustered < 400, `unclustered build took ${unclustered.toFixed(0)} ms`);
 });
