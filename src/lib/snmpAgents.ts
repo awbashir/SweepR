@@ -58,14 +58,18 @@ export function mergeQueryWithAgent(q: SnmpDeviceInfo, a: SnmpAgentStatus | unde
   };
 }
 
+const AGENT_VERSIONS: ReadonlySet<string> = new Set(["v1", "v2c", "v3"]);
+const AGENT_CLASSES: ReadonlySet<string> = new Set(["public", "private", "custom", "none", "v3"]);
+
 /** `meta.snmpAgents`: every polled agent with an IP, community class only. */
 export function reportSnmpAgents(agents: readonly SnmpAgentStatus[]): NonNullable<ReportMeta["snmpAgents"]> {
   const out: NonNullable<ReportMeta["snmpAgents"]> = [];
   for (const a of agents) {
     if (typeof a.ip !== "string" || a.ip === "") continue;
     const rec: NonNullable<ReportMeta["snmpAgents"]>[number] = { ip: a.ip, answered: a.answered === true };
-    if (a.version) rec.version = a.version;
-    if (a.communityClass) rec.communityClass = a.communityClass;
+    // Allow-listed values only (the event never carries the community, and this keeps it so).
+    if (a.version && AGENT_VERSIONS.has(a.version)) rec.version = a.version;
+    if (a.communityClass && AGENT_CLASSES.has(a.communityClass)) rec.communityClass = a.communityClass;
     out.push(rec);
   }
   return out;

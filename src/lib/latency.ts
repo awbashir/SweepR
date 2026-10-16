@@ -603,3 +603,36 @@ export function sparkline(history: History, width: number, height: number, opts:
   if (segLen === 1) path += "h0.6";
   return { path, lost, max };
 }
+
+/** TCP ports a host's latency fallback tries first (cheap, almost always answered quickly). */
+const TCP_PORT_PREFERENCE = [443, 80, 22, 8443, 8080, 445, 3389];
+/** Ports per host the backend's TCP fallback uses (`latency.rs`). */
+export const TCP_PORTS_PER_HOST = 4;
+
+/**
+ * `start_latency_monitor`'s `tcpPorts`: each monitored IP's known open ports (common ones
+ * first, at most `TCP_PORTS_PER_HOST`), so hosts that drop ICMP are measured on a port that
+ * is really open instead of the generic 443 / 80 / 8080 guess. `null` when none is known.
+ */
+export function tcpPortsFor(
+  ips: readonly string[],
+  devices: Iterable<{ ip: string; openPorts: readonly number[] }>,
+): Record<string, number[]> | null {
+  const want = new Set(ips);
+  const out: Record<string, number[]> = {};
+  let any = false;
+  const rank = (p: number): number => {
+    const i = TCP_PORT_PREFERENCE.indexOf(p);
+    return i < 0 ? TCP_PORT_PREFERENCE.length : i;
+  };
+  for (const d of devices) {
+    if (!want.has(d.ip) || d.openPorts.length === 0 || out[d.ip]) continue;
+    const ports = [...new Set(d.openPorts.filter((p) => Number.isInteger(p) && p > 0 && p <= 65535))]
+      .sort((a, b) => rank(a) - rank(b) || a - b)
+      .slice(0, TCP_PORTS_PER_HOST);
+    if (ports.length === 0) continue;
+    out[d.ip] = ports;
+    any = true;
+  }
+  return any ? out : null;
+}

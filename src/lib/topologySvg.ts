@@ -161,7 +161,16 @@ export function topologySvg(input: SvgInput): { svg: string; width: number; heig
   for (const n of placed) {
     const b = box(n.id)!;
     const role = n.role ?? "host";
-    const tone = n.kind === "cluster" ? (n.clusterKind === "wireless" ? pal.role.access_point : n.clusterKind === "unattached" ? pal.faint : pal.role.host) : pal.role[role];
+    const tone =
+      n.kind === "cluster"
+        ? n.clusterKind === "wireless"
+          ? pal.role.access_point
+          : n.clusterKind === "infra"
+            ? pal.role[role]
+            : n.clusterKind === "unattached"
+              ? pal.faint
+              : pal.role.host
+        : pal.role[role];
     const round = n.kind === "root" || n.kind === "scanner" ? b.h / 2 : 8;
     out.push(`<g>`);
     out.push(
@@ -211,4 +220,41 @@ export function topologySvg(input: SvgInput): { svg: string; width: number; heig
   out.push(...labels);
   out.push(`</svg>`);
   return { svg: out.join(""), width, height };
+}
+
+// --- export helpers -----------------------------------------------------------------------------
+// The app's CSP (`img-src 'self' data:`) has no `blob:`, so the SVG is rasterized from a data:
+// URL, and files are saved by the backend (`save_file`), never through `<a download href=blob:>`
+// (which WKWebView cancels).
+
+/** Safari / WKWebView canvas limit (16.7 Mpx); larger PNG exports are scaled down. */
+export const MAX_CANVAS_AREA = 16_000_000;
+export const MAX_CANVAS_SIDE = 16_000;
+
+/** Base64 of `bytes` (chunked, so large images never overflow the argument limit). */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/** A `data:image/svg+xml;base64,…` URL for `svg` (UTF-8 safe). */
+export function svgDataUrl(svg: string): string {
+  return `data:image/svg+xml;base64,${bytesToBase64(new TextEncoder().encode(svg))}`;
+}
+
+/** Raster scale for a `width` x `height` map: 2x for small maps, within the canvas limits. */
+export function pngScale(width: number, height: number): number {
+  const w = Math.max(1, width);
+  const h = Math.max(1, height);
+  const scale = Math.min(2, MAX_CANVAS_SIDE / w, MAX_CANVAS_SIDE / h, Math.sqrt(MAX_CANVAS_AREA / (w * h)));
+  return Math.max(scale, 0.05);
+}
+
+/** "sweepr-topology-2026-10-16-14-03-22.png" */
+export function exportFileName(kind: "png" | "svg", at: Date = new Date()): string {
+  return `sweepr-topology-${at.toISOString().slice(0, 19).replace(/[:T]/g, "-")}.${kind}`;
 }

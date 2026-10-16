@@ -20,6 +20,7 @@ import {
   Search,
   Square,
   Table2,
+  TriangleAlert,
   Network,
   Power,
   X,
@@ -29,6 +30,7 @@ import { ROLE_LABEL } from "../types.ts";
 import { interfaceLabel, subnetHint, vlanSelectionFrom, type ScanSettings, type VlanMode } from "../settings.ts";
 import { parsePorts, parseRange } from "../lib/parse.ts";
 import { LATENCY_INTERVALS } from "../lib/latency.ts";
+import { useMinWidth } from "../hooks/useMinWidth.ts";
 import { ContextMenu, type MenuState } from "./Menu.tsx";
 import { Button, RoleIcon, Select, Separator, TextInput, Toggle, cx } from "./ui.tsx";
 
@@ -61,8 +63,15 @@ interface ToolbarProps {
   reportBusy: boolean;
 }
 
+/** Below this width the latency interval and the Export label fold away (one toolbar row at 1360). */
+const COMPACT_MIN = 1440;
+/** Below this width the IPv6 / CDP-LLDP toggles move into the "More" menu (one row at 980). */
+const NARROW_MIN = 1200;
+
 export function Toolbar(p: ToolbarProps) {
   const s = p.settings;
+  const wide = useMinWidth(COMPACT_MIN);
+  const roomy = useMinWidth(NARROW_MIN);
   const [exportMenu, setExportMenu] = useState<MenuState | null>(null);
   const exportBtn = useRef<HTMLButtonElement>(null);
   const moreBtn = useRef<HTMLButtonElement>(null);
@@ -132,7 +141,38 @@ export function Toolbar(p: ToolbarProps) {
       x: r ? r.right - 200 : 0,
       y: r ? r.bottom + 4 : 0,
       label: "More actions",
-      items: [{ kind: "item", label: "Wake by MAC…", icon: Power, onSelect: p.onWakeByMac }],
+      items: [
+        // Controls the toolbar folds away on narrower windows live here instead.
+        ...(roomy
+          ? []
+          : ([
+              { kind: "header", label: "Scan" },
+              { kind: "check", label: "IPv6 (ICMPv6 / NDP)", checked: s.ipv6, disabled: p.running, onSelect: () => p.onSettings({ ipv6: !s.ipv6 }) },
+              {
+                kind: "check",
+                label: "CDP/LLDP listening",
+                checked: s.cdpLldp,
+                disabled: p.running,
+                onSelect: () => p.onSettings({ cdpLldp: !s.cdpLldp }),
+              },
+              { kind: "separator" },
+            ] satisfies MenuState["items"])),
+        ...(wide
+          ? []
+          : ([
+              { kind: "header", label: "Live latency interval" },
+              ...LATENCY_INTERVALS.map(
+                (ms): MenuState["items"][number] => ({
+                  kind: "check",
+                  label: `Every ${ms / 1000} s`,
+                  checked: p.latencyIntervalMs === ms,
+                  onSelect: () => p.onLatencyInterval(ms),
+                }),
+              ),
+              { kind: "separator" },
+            ] satisfies MenuState["items"])),
+        { kind: "item", label: "Wake by MAC…", icon: Power, onSelect: p.onWakeByMac },
+      ],
     });
   };
   const iface = p.interfaces.find((i) => i.name === s.iface) ?? p.interfaces.find((i) => i.isDefault);
@@ -166,7 +206,7 @@ export function Toolbar(p: ToolbarProps) {
   return (
     <div className="flex flex-wrap items-center gap-1.5 border-b border-line bg-chrome px-2 py-1.5">
       {p.running ? (
-        <Button variant="danger" icon={Square} onClick={p.onStop} className="w-[114px] justify-center" title="Stop the running job (⌘.)">
+        <Button variant="danger" icon={Square} onClick={p.onStop} className={cx(roomy ? "w-[114px]" : "w-[104px]", "justify-center")} title="Stop the running job (⌘.)">
           Stop
         </Button>
       ) : (
@@ -175,7 +215,7 @@ export function Toolbar(p: ToolbarProps) {
           icon={Play}
           onClick={p.onStart}
           disabled={p.starting}
-          className="w-[114px] justify-center"
+          className={cx(roomy ? "w-[114px]" : "w-[104px]", "justify-center")}
           title="Start scanning (⌘R)"
         >
           Start SweepR
@@ -189,7 +229,7 @@ export function Toolbar(p: ToolbarProps) {
         id="tb-iface"
         value={s.iface}
         onChange={(e) => p.onSettings({ iface: e.target.value })}
-        className="w-[180px]"
+        className={roomy ? "w-[180px]" : "w-[140px]"}
         title="Network interface"
         disabled={p.running}
       >
@@ -200,7 +240,10 @@ export function Toolbar(p: ToolbarProps) {
           </option>
         ))}
       </Select>
-      <label className="flex min-w-[130px] flex-1 items-center gap-1.5" title="CIDR, start-end range or comma list; empty scans the interface subnet">
+      <label
+        className={cx("flex flex-1 items-center gap-1.5", roomy ? "min-w-[130px]" : "min-w-[88px]")}
+        title="CIDR, start-end range or comma list; empty scans the interface subnet"
+      >
         <span className="hidden whitespace-nowrap text-muted min-[1680px]:inline">Scan from</span>
         <TextInput
           value={s.range}
@@ -217,7 +260,7 @@ export function Toolbar(p: ToolbarProps) {
         value={s.vlanMode}
         onChange={(e) => p.onSettings({ vlanMode: e.target.value as VlanMode })}
         aria-label="VLAN selection"
-        className="w-[150px]"
+        className={roomy ? "w-[150px]" : "w-[120px]"}
         disabled={p.running}
       >
         <option value="untagged">Untagged</option>
@@ -244,20 +287,36 @@ export function Toolbar(p: ToolbarProps) {
         aria-label="TCP ports to probe"
         invalid={!ports.ok}
         title={!ports.ok ? ports.error : `TCP ports probed per device (${ports.value.length})`}
-        className="w-[100px]"
+        className={roomy ? "w-[100px]" : "w-[84px]"}
         disabled={p.running}
       />
-      <Toggle checked={s.ipv6} onChange={(v) => p.onSettings({ ipv6: v })} label="IPv6" title="ICMPv6 / NDP neighbor discovery" disabled={p.running} />
-      <Toggle
-        checked={s.cdpLldp}
-        onChange={(v) => p.onSettings({ cdpLldp: v })}
-        label="CDP/LLDP"
-        title="Listen for CDP and LLDP advertisements while scanning"
-        disabled={p.running}
-      />
-      <Button icon={KeyRound} onClick={p.onOpenSnmp} pressed={s.snmpEnabled} title="SNMP settings">
-        SNMP{s.snmpEnabled ? ` ${s.snmp.version}` : ""}
-      </Button>
+      {roomy && (
+        <>
+          <Toggle checked={s.ipv6} onChange={(v) => p.onSettings({ ipv6: v })} label="IPv6" title="ICMPv6 / NDP neighbor discovery" disabled={p.running} />
+          <Toggle
+            checked={s.cdpLldp}
+            onChange={(v) => p.onSettings({ cdpLldp: v })}
+            label="CDP/LLDP"
+            title="Listen for CDP and LLDP advertisements while scanning"
+            disabled={p.running}
+          />
+        </>
+      )}
+      {s.snmpEnabled && s.snmpCredentialsMissing ? (
+        <Button
+          icon={TriangleAlert}
+          onClick={p.onOpenSnmp}
+          className="text-warn"
+          title="SNMP credentials are not stored between sessions: re-enter them. Until then scans run without SNMP."
+          aria-label="SNMP settings: re-enter credentials"
+        >
+          SNMP<span className="hidden min-[1500px]:inline">: re-enter credentials</span>
+        </Button>
+      ) : (
+        <Button icon={KeyRound} onClick={p.onOpenSnmp} pressed={s.snmpEnabled} title="SNMP settings">
+          SNMP{s.snmpEnabled ? ` ${s.snmp.version}` : ""}
+        </Button>
+      )}
       <Button
         ref={discoveryBtn}
         icon={ScanSearch}
@@ -270,32 +329,37 @@ export function Toolbar(p: ToolbarProps) {
         <span className="hidden min-[1760px]:inline">Discovery</span>
         <ChevronDown size={11} aria-hidden className="-ml-0.5 text-muted" />
       </Button>
-      <Separator />
-      <div className="flex items-center rounded-[6px]" title="Ping the visible, selected and pinned devices continuously">
+      {roomy && <Separator />}
+      <div
+        className="flex items-center rounded-[6px]"
+        title={`Ping the visible, selected and pinned devices continuously (every ${p.latencyIntervalMs / 1000} s)`}
+      >
         <Toggle
           checked={p.liveLatency}
           onChange={p.onLiveLatency}
           label={
             <span className="flex items-center gap-1">
               <Activity size={13} strokeWidth={1.75} aria-hidden className={p.liveLatency ? "text-accent" : "text-muted"} />
-              Live latency
+              <span className={roomy ? undefined : "sr-only"}>Live latency</span>
             </span>
           }
         />
-        <Select
-          value={p.latencyIntervalMs}
-          onChange={(e) => p.onLatencyInterval(Number(e.target.value))}
-          aria-label="Latency probe interval"
-          title="Probe interval"
-          disabled={!p.liveLatency}
-          className="w-[64px]"
-        >
-          {LATENCY_INTERVALS.map((ms) => (
-            <option key={ms} value={ms}>
-              {ms / 1000} s
-            </option>
-          ))}
-        </Select>
+        {wide && (
+          <Select
+            value={p.latencyIntervalMs}
+            onChange={(e) => p.onLatencyInterval(Number(e.target.value))}
+            aria-label="Latency probe interval"
+            title="Probe interval"
+            disabled={!p.liveLatency}
+            className="w-[64px]"
+          >
+            {LATENCY_INTERVALS.map((ms) => (
+              <option key={ms} value={ms}>
+                {ms / 1000} s
+              </option>
+            ))}
+          </Select>
+        )}
       </div>
       <Separator />
       <Button
@@ -304,9 +368,10 @@ export function Toolbar(p: ToolbarProps) {
         onClick={openExport}
         aria-haspopup="menu"
         aria-expanded={exportMenu?.label === "Export"}
+        aria-label="Export"
         title="Export results"
       >
-        Export
+        {wide && "Export"}
       </Button>
       <span
         className="inline-flex"
@@ -447,6 +512,7 @@ export const FilterBar = forwardRef<HTMLInputElement, FilterBarProps>(function F
                 aria-checked={active}
                 onClick={() => p.onRoleFilter(pill.id)}
                 title={pill.id === "all" ? "All devices" : ROLE_LABEL[pill.id]}
+                aria-label={`${pill.label} ${n.toLocaleString()}`}
                 className={cx(
                   "flex h-[22px] items-center gap-1 rounded-full border px-2 text-[11.5px] whitespace-nowrap",
                   active ? "border-accent bg-accent text-accent-fg" : "border-line bg-field hover:bg-chrome-2",
@@ -454,7 +520,8 @@ export const FilterBar = forwardRef<HTMLInputElement, FilterBarProps>(function F
                 )}
               >
                 {pill.id !== "all" && <RoleIcon role={pill.id} size={12} inherit={active} />}
-                {pill.label}
+                {/* Narrow windows: the role icon stands for the label (one filter row at 980 px). */}
+                <span className={pill.id === "all" ? undefined : "hidden min-[1200px]:inline"}>{pill.label}</span>
                 <span className={cx("tabular", active ? "text-accent-fg/80" : "text-muted")}>{n.toLocaleString()}</span>
               </button>
             );

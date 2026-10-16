@@ -82,3 +82,23 @@ export function effectiveVisibility(stored: Readonly<Record<string, boolean>>, a
     ...stored,
   };
 }
+
+/** IP column width bounds (px) for the automatic fit. */
+export const IP_COL_MIN = 130;
+export const IP_COL_MAX = 300;
+
+/**
+ * Width that shows the longest address in full (IPv6 included) plus the "+N" badge when any
+ * row has extra addresses (monospace 11.5 px: ~7 px per character, 16 px padding). Used until
+ * the user resizes the column.
+ */
+export function autoIpWidth(rows: readonly { device: { ip: string; extraIps: readonly string[] } }[]): number {
+  let longest = 0;
+  let extra = false;
+  for (const r of rows) {
+    if (r.device.ip.length > longest) longest = r.device.ip.length;
+    if (r.device.extraIps.length > 0) extra = true;
+  }
+  const w = Math.ceil(longest * 7) + 18 + (extra ? 30 : 0);
+  return Math.min(IP_COL_MAX, Math.max(IP_COL_MIN, w));
+}

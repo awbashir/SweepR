@@ -191,3 +191,14 @@ export function spanLabel(span: Ipv4Span): string {
     ? numberToIpv4(span.start)
     : `${numberToIpv4(span.start)} – ${numberToIpv4(span.end)}`;
 }
+
+/**
+ * The URL template without a password in its userinfo (`https://admin:pw@{ip}/` ->
+ * `https://admin@{ip}/`), for persisting: credentials typed into the template are used for
+ * the session only. `stripped` tells whether anything was removed.
+ */
+export function withoutUrlPassword(template: string): { value: string; stripped: boolean } {
+  const re = /^(\s*[a-z][a-z0-9+.-]*:\/\/)([^/?#@:]*):[^/?#@]*@/i;
+  if (!re.test(template)) return { value: template, stripped: false };
+  return { value: template.replace(re, (_m, scheme: string, user: string) => (user ? `${scheme}${user}@` : scheme)), stripped: true };
+}

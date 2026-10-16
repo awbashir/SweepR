@@ -65,6 +65,11 @@ export interface Backend {
   revealReport(): Promise<boolean>;
   /** Application version ("0.1.0"). */
   appVersion(): Promise<string>;
+  /**
+   * Saves an image the GUI rendered (SVG text, or base64 PNG) through the native save dialog
+   * opened by the backend; resolves to the written path, or `null` when the user cancelled.
+   */
+  saveFile(kind: "svg" | "png", contents: string, suggestedName: string): Promise<string | null>;
 }
 
 /** Tauri command errors are plain strings; everything else is normalized to one. */
@@ -127,6 +132,7 @@ function createTauriBackend(): Backend {
     generateReport: (args) => invoke<string | null>("generate_report", { ...args }),
     revealReport: () => invoke<boolean>("reveal_report"),
     appVersion: () => getVersion(),
+    saveFile: (kind, contents, suggestedName) => invoke<string | null>("save_file", { kind, contents, suggestedName }),
   };
 }
 

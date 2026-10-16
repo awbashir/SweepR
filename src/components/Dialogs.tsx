@@ -1,10 +1,11 @@
 // SNMP settings and "Open custom URL" dialogs.
 
 import { useState, type ReactNode } from "react";
-import { LoaderCircle } from "lucide-react";
+import { LoaderCircle, TriangleAlert } from "lucide-react";
 import type { InterfaceInfo, ReportFormat, SnmpAuthProtocol, SnmpConfig, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, WakeOptions } from "../types.ts";
 import { DEFAULT_SNMP, interfaceLabel, snmpV3Problem } from "../settings.ts";
 import { ipv4ToNumber } from "../lib/ip.ts";
+import { withoutUrlPassword } from "../lib/parse.ts";
 import { parseSecureOn, parseWolMac } from "../lib/wol.ts";
 import { DEFAULT_REPORT_TITLE } from "../lib/report.ts";
 import { Modal } from "./Modal.tsx";
@@ -33,12 +34,15 @@ export function SnmpDialog({
   enabled,
   pollAll,
   config,
+  credentialsMissing = false,
   onSave,
   onClose,
 }: {
   enabled: boolean;
   pollAll: boolean;
   config: SnmpConfig;
+  /** The community / v3 passwords were not kept from an earlier session. */
+  credentialsMissing?: boolean;
   onSave: (enabled: boolean, pollAll: boolean, config: SnmpConfig) => void;
   onClose: () => void;
 }) {
@@ -88,6 +92,15 @@ export function SnmpDialog({
           e.preventDefault();
         }}
       >
+        {credentialsMissing && (
+          <div role="alert" className="mb-2 flex items-start gap-2 rounded-[8px] border border-warn/40 bg-warn-soft px-3 py-2">
+            <TriangleAlert size={15} className="mt-px shrink-0 text-warn" aria-hidden />
+            <p>
+              <strong>Re-enter the credentials.</strong> SweepR does not store SNMP communities or SNMPv3 passwords between sessions.
+              Until you save them here, scans run without SNMP.
+            </p>
+          </div>
+        )}
         <Row label="">
           <Toggle checked={on} onChange={setOn} label="Poll infrastructure over SNMP during scans" />
         </Row>
@@ -282,6 +295,9 @@ export function CustomUrlDialog({
           invalid={!valid}
           className="w-full"
         />
+        {withoutUrlPassword(value).stripped && (
+          <p className="mt-2 text-[11px] text-warn">The password in this URL is used for this session only; it is not saved.</p>
+        )}
         <p className="mt-2 text-[11px] text-muted">
           <code className="font-mono">{"{ip}"}</code> is replaced with the device address. Allowed schemes: http, https, ssh, telnet.
         </p>
@@ -510,6 +526,10 @@ export function ReportDialog({
           {count.toLocaleString()} device{count === 1 ? "" : "s"}, VLANs, CDP/LLDP neighbors, MAC-to-port entries and SNMP results go into the
           report with your hostnames, comments and live latency. SNMP communities and SNMPv3 passwords are never included. You choose where
           to save it next.
+        </p>
+        <p className="mt-1 text-[11px] text-muted">
+          A logo in the header can be added with the command line:{" "}
+          <code className="selectable font-mono">sweepr report --input audit.json -o audit.html --logo logo.png</code> (from the JSON findings saved here).
         </p>
         {error && <p className="selectable mt-2 text-danger">{error}</p>}
       </form>

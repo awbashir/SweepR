@@ -31,12 +31,12 @@ import { MAX_OVERRIDE_LEN, ROLE_LABEL } from "../types.ts";
 import { usePersistentState } from "../hooks/usePersistentState.ts";
 import { formatLoss, formatMs, lossTone, type Tone } from "../lib/latency.ts";
 import { certSortKey, classifyCert } from "../lib/webid.ts";
-import { completeOrder, effectiveVisibility, type AutoColumns } from "../lib/columns.ts";
+import { autoIpWidth, completeOrder, effectiveVisibility, type AutoColumns } from "../lib/columns.ts";
 import { latencyStore, useLatency } from "../tools.ts";
 import { Sparkline } from "./Charts.tsx";
 import { ContextMenu, type MenuItem } from "./Menu.tsx";
 import { KindIcon, MiniBadge, RoleIcon, TONE_TEXT_CLASS, cx } from "./ui.tsx";
-import { deviceKindOf, formatWatts, netServiceBadges, poeSummary, poeTone } from "../lib/services.ts";
+import { deviceKindOf, formatWatts, netServiceBadges, poeSummary, poeTone, type NetBadge } from "../lib/services.ts";
 
 export const ROW_H = 22;
 const HEADER_H = 24;
@@ -81,7 +81,7 @@ export const COL_META: Record<ColId, ColMeta> = {
   ip: { label: "IP Address", size: 130, align: "left", mono: true },
   mac: { label: "MAC Address", size: 140, align: "left", mono: true },
   vlan: { label: "VLAN ID", size: 74, align: "right" },
-  role: { label: "Device Role", size: 108, align: "left" },
+  role: { label: "Device Role", size: 156, align: "left" },
   latency: { label: "Latency", size: 180, align: "left" },
   loss: { label: "Loss %", size: 64, align: "right" },
   hostname: { label: "Hostname", size: 150, align: "left" },
@@ -238,23 +238,27 @@ export function DeviceTable(props: DeviceTableProps) {
   const prefs = useMemo(() => sanitizePrefs(prefsRaw), [prefsRaw]);
   const { liveLatency, webTitle: autoTitle, certExpires: autoCert, deviceKind: aKind, modelFw: aModel, poe: aPoe, voiceVlan: aVoice, dhcpOs: aDhcp } =
     props.autoColumns;
-  const visibility = useMemo(
-    () =>
-      effectiveVisibility(prefs.visibility, {
-        liveLatency,
-        webTitle: autoTitle,
-        certExpires: autoCert,
-        deviceKind: aKind,
-        modelFw: aModel,
-        poe: aPoe,
-        voiceVlan: aVoice,
-        dhcpOs: aDhcp,
-      }),
-    [prefs.visibility, liveLatency, autoTitle, autoCert, aKind, aModel, aPoe, aVoice, aDhcp],
-  );
+  const editField = editing?.field ?? null;
+  const visibility = useMemo(() => {
+    const v = effectiveVisibility(prefs.visibility, {
+      liveLatency,
+      webTitle: autoTitle,
+      certExpires: autoCert,
+      deviceKind: aKind,
+      modelFw: aModel,
+      poe: aPoe,
+      voiceVlan: aVoice,
+      dhcpOs: aDhcp,
+    });
+    // F2 / ⇧F2 on a hidden Hostname / Comments column: show it while the edit lasts.
+    return editField !== null && v[editField] === false ? { ...v, [editField]: true } : v;
+  }, [prefs.visibility, liveLatency, autoTitle, autoCert, aKind, aModel, aPoe, aVoice, aDhcp, editField]);
   const [headerMenu, setHeaderMenu] = useState<{ x: number; y: number; colId: ColId | null } | null>(null);
   const [dragOver, setDragOver] = useState<ColId | null>(null);
 
+  // The IP column fits the longest address (IPv6) until the user resizes it.
+  const ipAuto = useMemo(() => autoIpWidth(rows), [rows]);
+  const sizing = useMemo(() => (prefs.sizing.ip !== undefined ? prefs.sizing : { ...prefs.sizing, ip: ipAuto }), [prefs.sizing, ipAuto]);
   const table = useReactTable<DeviceRow>({
     data: rows,
     columns: COLUMNS,
@@ -263,7 +267,7 @@ export function DeviceTable(props: DeviceTableProps) {
       sorting: prefs.sorting,
       columnVisibility: visibility,
       columnOrder: prefs.order,
-      columnSizing: prefs.sizing,
+      columnSizing: sizing,
     },
     onSortingChange: (u) => setPrefs((p) => ({ ...p, sorting: resolve(u, sanitizePrefs(p).sorting) })),
     onColumnVisibilityChange: (u) => setPrefs((p) => ({ ...p, visibility: resolve(u, p.visibility ?? {}) })),
@@ -287,7 +291,7 @@ export function DeviceTable(props: DeviceTableProps) {
       }),
     // getSize() depends on sizing; visibleLeaf identity changes with visibility/order.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [visibleLeaf, prefs.sizing, prefs.align, table.getState().columnSizingInfo],
+    [visibleLeaf, sizing, prefs.align, table.getState().columnSizingInfo],
   );
   const totalWidth = colLayout.reduce((n, c) => n + c.width, 0);
 
@@ -687,6 +691,25 @@ const DeviceRowView = memo(function DeviceRowView(p: RowViewProps) {
   );
 });
 
+/**
+ * DHCP / IPv6 RA badges in the role cell: compact, the rest folded into "+N". A badge that
+ * does not fit wraps onto a hidden second line instead of being cut in half (the cell's
+ * tooltip lists them).
+ */
+function RoleBadges({ badges, selected }: { badges: NetBadge[]; selected: boolean }) {
+  const first = badges[0];
+  if (!first) return null;
+  const rest = badges.slice(1);
+  return (
+    <span className="-ml-1 flex h-[16px] min-w-0 shrink flex-wrap items-center gap-x-1 overflow-hidden">
+      {/* Zero-width first item: a lone badge that does not fit can still wrap out of view. */}
+      <span className="h-[16px] w-0" aria-hidden />
+      <MiniBadge label={first.short} title={first.title} inherit={selected} />
+      {rest.length > 0 && <MiniBadge label={`+${rest.length}`} title={rest.map((b) => `${b.label}: ${b.title}`).join("\n")} inherit={selected} />}
+    </span>
+  );
+}
+
 function Faint({ selected, children }: { selected: boolean; children: ReactNode }) {
   return <span className={cx(!selected && "text-faint", selected && "opacity-60")}>{children}</span>;
 }
@@ -703,11 +726,12 @@ function CellContent({ id, row, selected, width }: { id: ColId; row: DeviceRow; 
     case "ip":
       return (
         <span className="flex min-w-0 items-center gap-1" title={[d.ip, ...d.extraIps].join("\n")}>
-          <span className="truncate">{d.ip}</span>
+          {/* The address keeps its room: the "+N" badge gives way first (the tooltip lists all). */}
+          <span className="min-w-0 truncate">{d.ip}</span>
           {d.extraIps.length > 0 && (
             <span
               className={cx(
-                "shrink-0 rounded px-1 font-sans text-[9.5px]",
+                "min-w-0 shrink-[100] overflow-hidden rounded px-1 font-sans text-[9.5px] whitespace-nowrap",
                 selected ? "bg-white/20" : "bg-chrome-2 text-muted",
               )}
             >
@@ -722,12 +746,14 @@ function CellContent({ id, row, selected, width }: { id: ColId; row: DeviceRow; 
       return d.vlanId !== null ? <span className="tabular">{d.vlanId}</span> : <Faint selected={selected}>—</Faint>;
     case "role":
       return (
-        <span className="flex min-w-0 items-center gap-1.5">
+        <span
+          className="flex min-w-0 flex-1 items-center gap-1.5"
+          title={[ROLE_LABEL[d.role], ...netServiceBadges(d).map((b) => b.label)].join(" · ")}
+        >
           <RoleIcon role={d.role} inherit={selected} />
-          <span className="truncate">{ROLE_LABEL[d.role]}</span>
-          {netServiceBadges(d).map((b) => (
-            <MiniBadge key={b.id} label={b.label} title={b.title} inherit={selected} />
-          ))}
+          {/* The role label always stays; compact badges give way (clipped) before it. */}
+          <span className="shrink-0">{ROLE_LABEL[d.role]}</span>
+          <RoleBadges badges={netServiceBadges(d)} selected={selected} />
           {(d.warnings?.length ?? 0) > 0 && (
             <span
               className={cx("ml-auto flex shrink-0 items-center gap-0.5 text-[10px]", !selected && "text-warn")}
