@@ -1782,6 +1782,10 @@ pub struct ScanSummary {
     /// The scanning host's name (full scans only; additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scanner_host: Option<String>,
+    /// The job ended with an error or crashed (GUI jobs; an `error` log precedes the event).
+    /// Additive: only serialized when `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 /// This machine's host name (sanitized), for report metadata.

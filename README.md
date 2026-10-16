@@ -378,6 +378,11 @@ cd src-tauri && cargo run --features custom-protocol -- --gui
 Without `--features custom-protocol`, a debug binary loads `devUrl` (http://localhost:1420) and
 shows a blank window unless `npm run dev` is running. `tauri build` enables the feature for you.
 
+`src-tauri/Cargo.lock` is committed and required: `rust_xlsxwriter` depends on `zip` 8.x,
+whose releases are all yanked on crates.io, so only the locked version resolves. Build with
+the lockfile (`cargo build --locked`) and update dependencies one at a time
+(`cargo update -p <crate>`); a bare `cargo update` fails until `rust_xlsxwriter` moves on.
+
 ## Layout
 
 ```
@@ -438,6 +443,7 @@ The webview may call only the commands listed in `src-tauri/build.rs` and grante
 | `start_iperf` | `{ ip: string, options?: IperfOptions \| null }` | `runId` (number). Rejects right away when iperf3 is missing (message includes the install hint), on invalid options, or when 2 runs are active. |
 | `stop_iperf` | `{ runId: number }` | `true` if it was running (the iperf3 process is killed; a final `done` update with an error follows). |
 | `discover_services` | `{ ip: string, timeoutMs?: number }` | `ServiceDiscovery`. Unicast SSDP + WS-Discovery to the host plus SIP OPTIONS (`timeoutMs` default 2500, clamped 500-5000). Rejects on a bad IP, when 4 probes are already running, or when stopped by `stop_scan`. |
+| `save_file` | `{ kind: "svg" \| "png", contents: string, suggestedName?: string \| null }` | The written path, or `null` if the user cancelled the save dialog. `contents` is the SVG text for `svg` and base64 PNG data (a `data:image/png;base64,` prefix is accepted) for `png`. Rejects an unknown kind, content that is not an SVG document / PNG image, more than 64 MiB, a wrong extension, or a symlink / non-regular target. |
 
 Tauri maps Rust snake_case command arguments to camelCase in JS automatically (so
 `scan_id` is `scanId`, `timeout_secs` is `timeoutSecs`).
@@ -452,6 +458,13 @@ like `export_devices`: the webview never passes a path, the extension must match
 and symbolic links and non-regular files are refused. `reveal_report` takes no arguments, so
 it can only reveal the file the user just saved (the webview still has no opener permission
 for files).
+
+`save_file` saves images the GUI renders itself (the topology map export) the same way: the
+backend opens the save dialog, the webview only suggests a file name (reduced to a bare,
+non-hidden name with the kind's extension), the extension must match the kind (added when
+missing, refusing to replace an existing file the dialog did not confirm), and symbolic links
+and non-regular files are refused. The webview has no dialog or filesystem permission of its
+own.
 
 ```ts
 interface GenerateReportArgs {
@@ -552,6 +565,9 @@ of the job that produced it:
   ignore any payload whose `scanId` is not the id returned by its latest start call.
 - A stopped (not superseded) job still sends its remaining events and ends with `finished`
   (`cancelled: true`).
+- A job that fails (returns an error) or crashes (panics) ends with an `error` log followed
+  by `finished` with `failed: true` (additive; absent otherwise), so the UI always leaves its
+  busy state.
 - `device` and `vlan` events are full, merged snapshots: replace the row with the same key
   (device: `ip` plus `vlanId`; VLAN: `id`). `neighbor` events are sent when a neighbor is
   new or its advertisement changed.
@@ -597,6 +613,7 @@ interface ScanSummary {
   interface?: string;              // full scans only
   gateway?: string;                // IPv4 default gateway, when known
   scannerHost?: string;            // this machine's host name
+  failed?: boolean;                // true when the job ended with an error or crashed
 }
 
 interface SwitchPortMapping {

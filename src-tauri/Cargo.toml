@@ -68,6 +68,12 @@ httparse = "1"
 
 # --- Export ---
 csv = "1"
+# rust_xlsxwriter 0.99 needs `zip` ^8.3, and every zip 8.x release is yanked on crates.io. The
+# committed Cargo.lock (zip 8.6.0) is what makes the build resolve: keep Cargo.lock committed,
+# build with `--locked`, and update dependencies selectively (`cargo update -p <crate>`); a
+# bare `cargo update` or a lockfile-less build fails. An exact `zip = "=8.6.0"` pin would not
+# help: cargo never selects a yanked version for a new lockfile, even with `=`. Drop this note
+# once rust_xlsxwriter moves to zip 9.
 rust_xlsxwriter = "0.99"
 
 # --- Audit report (HTML / PDF) ---

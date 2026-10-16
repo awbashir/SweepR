@@ -1238,6 +1238,7 @@ pub async fn run_scan_with(
         interface: Some(iface.name.clone()),
         gateway,
         scanner_host: crate::models::local_hostname(),
+        failed: false,
     };
     let (sent, total) = counter.snapshot();
     let _ = tx
