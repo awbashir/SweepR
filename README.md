@@ -123,7 +123,9 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
     0.5-10 s with unprivileged ICMP / ICMPv6 and keeps the last 120 samples per host (last /
     avg / min / max / jitter / loss, plus a sparkline history). Hosts that never answer ICMP
     fall back to TCP connect round trips (SYN → SYN-ACK or RST) on a known open port or on
-    443 / 80 / 22 / 445. At most 2,000 hosts are monitored at once.
+    443 / 80 / 8080 (never SSH / SMB by default, so authentication logs stay quiet). Port
+    searches back off exponentially while a host stays silent, and a port that stops
+    answering is rotated to the back of the list. At most 2,000 hosts are monitored at once.
   - **MTR / traceroute** (`sweepr trace`, GUI `start_trace`): per-hop loss and last / avg /
     best / worst latency over several rounds, with reverse-DNS hop names. As root (or with
     `CAP_NET_RAW`) it sends raw ICMP echo probes with increasing TTL; otherwise it runs the
@@ -276,8 +278,18 @@ PoE, ...) is picked up when present; malformed records are skipped and counted.
   rule coverage and appendix). Written in pure Rust with `pdf-writer` using the standard
   Helvetica fonts (no font file embedded; characters outside Windows-1252 print as `?`).
 - **JSON**: score, findings, rule coverage, statistics and the normalized input (it can be
-  fed back into `sweepr report`). SNMP communities are never written: only whether the
-  default `public` / `private` or a custom community was used.
+  fed back into `sweepr report`). Every affected entry of every finding is kept (up to
+  100,000 per finding; `affectedCount` is the true count and `affectedTruncated` how many
+  were dropped); the HTML shows the first 200 per finding and the PDF a sample.
+  `inputWarnings` lists problems with the input (e.g. an unparsable `portSpec`). SNMP
+  communities are never written: only whether the default `public` / `private` or a custom
+  community was used.
+
+Output files (`-o`, `scan --report`, and GUI saves) are never written through a symbolic
+link and only when the target is (or becomes) a regular file: an existing file is opened
+with `O_NOFOLLOW | O_NONBLOCK` and checked on the open descriptor before it is truncated, a
+new one is created with `O_EXCL`. `--logo` must be a regular PNG / JPEG file of at most 1 MiB
+(enforced while reading).
 
 Rules (stable IDs, CWE / CIS Controls reference text, thresholds in the appendix): Telnet,
 FTP, TFTP, r-services, SMB / NetBIOS on infrastructure and broad SMB exposure, RDP, VNC,
@@ -286,13 +298,27 @@ incomplete SNMP walks, expired / expiring (< 30 days) / self-signed certificates
 or signatures, unidentified devices, locally administered MACs, duplicate IPs, one MAC on
 several IPs, multiple DHCP servers, multiple IPv6 routers (rogue RA), CDP/LLDP on user-facing
 ports, native VLAN 1, native VLAN mismatch, phones outside a voice VLAN, many hosts in VLAN 1,
-unused VLANs, and several MACs on an access port. Rules whose data was not collected are
-listed as "not evaluated" instead of passing.
+unused VLANs, several MACs on an access port, and Power over Ethernet: a switch PoE budget
+above 85% (100%: high), PoE-powered IP phones on ports without a voice VLAN (only on
+switches that report voice VLANs at all) and PoE left enabled (`searching`) on ports whose
+device draws no power. Rules whose data was not collected are listed as "not evaluated"
+instead of passing; in particular a rule never "passes" without evidence: TCP service rules
+need the port in `portSpec` (or, without one, some device with that port open), HTTP-only
+management needs an HTTPS port to have been scanned, the default-community rule needs an
+agent that was polled with `public` / `private` (a custom community or SNMPv3 means
+"defaults not tested"), and VLAN-1 counting refuses to conclude when unknown VLANs could
+reach the threshold. Routed hosts (no local `interface`) never inherit the scanner's native
+VLAN. A device counts as an IP phone only on real evidence: `deviceKind` / `sip.kind`
+`voip_phone`, a non-null `sip` object that is not a PBX, a CDP/LLDP Telephone capability
+(without Router), or a phone vendor on a non-infrastructure device; `null` / empty fields
+are treated exactly like absent ones throughout the audit and the report.
 
 Risk score: each finding contributes `weight x min(1 + log2(affected), 4)` points (critical
 15, high 8, medium 4, low 1.5, info 0); `score = round(100 * e^(-points/80))`; grade A >= 90,
 B >= 80, C >= 65, D >= 50, else F; any critical finding caps the grade at D and any high
-finding at B.
+finding at B. The grade states its coverage (`score.evaluatedChecks` of `score.totalChecks`,
+shown as "graded on N of M checks"); with fewer than half of the checks evaluated it is
+limited to B, with fewer than a quarter to C (`score.cappedBy` says why).
 
 `cargo run --example sample_audit_input > sample.json` writes a synthetic 300-device network
 for trying the report.
@@ -455,17 +481,28 @@ interface ReportMeta {               // every field optional
   discoverVlans?: boolean;
   resolveNames?: boolean;
   snmpAll?: boolean;
-  // `community` is only classified ("public" | "private" | "custom") and never written out.
-  snmp?: { version?: "v1" | "v2c" | "v3"; community?: string };
-  gateway?: string;
+  // Send `communityKind` (the GUI does); a raw `community` is still accepted, classified
+  // ("public" | "private" | "custom" | "none") and dropped, never written out. Versions are
+  // normalized ("2c", "SNMPv2c" -> "v2c"); an unrecognized version is not treated as v3.
+  snmp?: { version?: "v1" | "v2c" | "v3"; communityKind?: "public" | "private" | "custom" | "none"; community?: string };
+  // Every SNMP agent polled (collect the `snmp_agent` scan events, see below). Without it the
+  // SNMP rules only know the agents behind snmpInfos / portMappings.
+  snmpAgents?: { ip: string; version?: string; communityClass?: string; answered: boolean }[];
+  gateway?: string;                  // ScanSummary.gateway of the `finished` event
   dhcpServers?: string[];            // DHCP servers observed (rogue DHCP rule)
   ipv6Routers?: string[];            // IPv6 RA sources observed (rogue RA rule)
-  scannerHost?: string;
+  scannerHost?: string;              // ScanSummary.scannerHost of the `finished` event
 }
 ```
 
-Without `portSpec` the service rules still run on the open ports present but cannot tell
-"closed" from "not scanned"; without `snmp` the SNMP rules are reported as not evaluated.
+`meta: null` is the same as no meta, and one field of the wrong type is dropped (counted in
+`skippedRecords`) without losing the others. Without `portSpec` a service rule runs only when
+some device has its port open (otherwise "not evaluated"); an unparsable `portSpec` is
+reported in `inputWarnings`. Without `snmp` / `snmpAgents` / SNMP results the SNMP rules are
+reported as not evaluated. The rogue DHCP / RA rules also count devices with
+`dhcpServer: true` / `ipv6Router: true`, so the GUI needs no extra meta for them.
+`snmpInfos[].poeBudget` (the `query_snmp` / `snmp_agent` PoE budget) and
+`portMappings[].poe` / `voiceVlan` feed the PoE rules and the PoE line of each switch.
 
 `save_override` persists one record to a JSON file under the OS application-data directory.
 Saves are serialized by a process-wide lock and written durably (uniquely named temp file,
@@ -501,7 +538,15 @@ of the job that produced it:
 ```
 
 - `event` has the same `{ type, data }` shape as the CLI JSON events (`device`, `vlan`,
-  `neighbor`, `port_mapping`, `progress`, `log`, `finished`).
+  `neighbor`, `port_mapping`, `snmp_agent`, `progress`, `log`, `finished`).
+- `snmp_agent` (additive; ignore it if unknown): one per SNMP agent polled during a scan,
+  answered or not: `SnmpAgentStatus` (below). It carries the community *class* only, never
+  the community, plus the agent's `poeBudget`. To feed the report, collect them into
+  `ReportMeta.snmpAgents` (`{ ip, version, communityClass, answered }`) and, for answered
+  agents, into `snmpInfos` (`{ ip, sysName, sysDescr, role, poeBudget, partial, warnings }`),
+  as `sweepr scan --report` does.
+- `finished` (`ScanSummary`) of a full scan additionally carries `interface`, `gateway` and
+  `scannerHost` (absent for VLAN discovery) for `ReportMeta`.
 - Only the current job emits. Once a new `start_scan` / `start_vlan_discovery` supersedes a
   job, that job emits nothing more, including its `finished`. The frontend should still
   ignore any payload whose `scanId` is not the id returned by its latest start call.
@@ -530,6 +575,30 @@ The engine fills these fields on `Device` during enrichment: `vendor` (IEEE OUI 
 event payloads use these TypeScript-style shapes (all camelCase):
 
 ```ts
+interface SnmpAgentStatus {        // event "snmp_agent"
+  ip: string | null;
+  version: "v1" | "v2c" | "v3";
+  communityClass: "public" | "private" | "custom" | "none" | "v3";
+  answered: boolean;
+  partial: boolean;
+  sysName: string | null;
+  sysDescr: string | null;
+  role: "switch" | "firewall" | "access_point" | "router" | "host" | null;
+  poeBudget: PoeBudget | null;
+  warnings: string[];              // at most 8
+}
+
+interface ScanSummary {
+  devices: number;
+  vlans: number;
+  neighbors: number;
+  elapsedMs: number;
+  cancelled: boolean;
+  interface?: string;              // full scans only
+  gateway?: string;                // IPv4 default gateway, when known
+  scannerHost?: string;            // this machine's host name
+}
+
 interface SwitchPortMapping {
   switchName: string;
   switchIp: string | null;
@@ -612,6 +681,8 @@ interface Device {
   sip: SipInfo | null;
   poe: PoeInfo | null;               // PoE this endpoint draws (its switch port / own advert)
   dhcpFingerprint: DhcpFingerprint | null;
+  dhcpServer: boolean | null;        // seen answering as a DHCP server (OFFER / ACK / NAK)
+  ipv6Router: boolean | null;        // sent an IPv6 router advertisement during the scan
 }
 
 // Additive: new strings may appear; render unknown ones as-is.
@@ -619,7 +690,8 @@ type DeviceKind =
   | "voip_phone" | "pbx"                      // SIP
   | "camera"                                  // ONVIF NetworkVideoTransmitter / SSDP
   | "computer"                                // Windows host answering WS-Discovery
-  | "media_server" | "igd_router" | "printer" | "scanner" | "tv" | "nas"; // SSDP/UPnP
+  | "media_server" | "igd_router" | "printer" | "scanner" | "tv" | "nas"  // SSDP/UPnP
+  | "media_player";                           // UPnP MediaRenderer / ZonePlayer (speakers)
 
 // Device.sources may now also contain "ssdp" | "wsd" | "sip" | "dhcp".
 
@@ -725,9 +797,33 @@ Event behaviour of these features:
   the same MAC. In `start_vlan_discovery`, address-less clients become `log` lines instead.
   A capture that cannot start (no root / BPF) is reported as a `warn` log, never a failure.
 - `poe` / `voiceVlan` on an endpoint come from its chosen `switchPort` mapping when the switch
-  reported them (re-evaluated whenever the switch-port choice changes), else from the
-  endpoint's own CDP/LLDP advert. A switch's own adverts describe the scanning host's port
-  and are not copied onto the switch row.
+  reported them, else from the endpoint's own CDP/LLDP advert; both are recomputed (and
+  cleared) whenever the switch-port choice changes. On a port shared by several MACs (a PC
+  behind a phone) only the one powered-looking device (phone / AP / camera / member of the
+  voice VLAN) gets the port's PoE, and the voice VLAN goes to devices in it or phone-like
+  ones; when that is ambiguous nobody gets the PoE. An IP phone advertising Bridge +
+  Telephone is an endpoint (`role` stays `host`), not a switch. Per-port PoE is matched to
+  port names by module / port number and left out when two names claim the same PSE port.
+  A switch's own adverts describe the scanning host's port and are not copied onto the
+  switch row.
+- Service discovery only keeps (and fetches descriptions / ONVIF / WS-Transfer data from)
+  multicast responders whose address belongs to a device the scan discovered. Follow-up
+  requests are bounded: 4 s per request, 6 s per responder, 12 s per run; at most 2 distinct
+  `XAddrs` per responder are queried; replies are capped per responder (32 datagrams) and per
+  run (4 MiB). XAddrs, scopes and `LOCATION` keep their full length (URLs up to 2,048
+  characters; other names 256). `onvif.rtspUrl` never contains credentials (`user:pass@` is
+  stripped). In multi-VLAN scans a reply for an address several rows share goes to the
+  untagged row only (or nowhere). SIP OPTIONS candidates also include hosts whose name hints
+  at a PBX / phone, `SEP…` CDP IDs and phone / PBX device kinds; the default port list now
+  includes 5060, 8000 and 8080. Kamailio / OpenSIPS proxies and Cisco IOS gateways are
+  reported with no `kind` (they are not PBXes).
+- DHCP fingerprints come only from client DISCOVER / REQUEST / INFORM (BOOTREQUEST); a
+  client's address is taken from `ciaddr` or from option 50 of a REQUEST that names its
+  server (option 54); clients outside the scan targets are attached by MAC only (no new
+  row); the capture also matches 802.1Q-tagged frames; server replies mark the server's row
+  `dhcpServer: true` (servers outside the targets are logged). `sweepr vlans --json
+  --dhcp-fingerprint` adds `dhcpFingerprints` (the fingerprinted rows).
+- `discover_services` rejects unspecified, multicast and broadcast addresses.
 
 `discover_services` is a single-device drawer helper like `scan_ports`: it runs independently
 of any scan job, emits no `scan-event`s, holds one of 4 slots, and is cancelled by
@@ -747,8 +843,11 @@ run is cancelled when the app exits (child processes are killed).
 
 - `latency-update` (`LatencyUpdate`): at most one batch per 250 ms per monitor (≤ 4 events
   per second), carrying only the hosts that got a new sample since the previous batch. The
-  statistics cover the host's window (its last 120 samples); `history` is that window,
-  oldest first, `null` for lost probes. A monitor stops when `stop_latency_monitor` is called
+  statistics cover the host's window (its last 120 samples). `newSamples` holds every sample
+  taken since the host's previous update (oldest first, usually one); `history` (the whole
+  window, oldest first, `null` for lost probes) is sent only on a host's first update and
+  then at most every 30 s, and is absent in between (keep your own history from
+  `newSamples`). `sweepr ping --count N` stops right after the Nth probe. A monitor stops when `stop_latency_monitor` is called
   (one final batch may follow) or when the app exits. The engine never fills
   `device.latency`; the GUI may copy a sample into it (`lastMs = rttMs`, `updatedMs = ts`,
   the other fields by name) so that exports show the Latency / Loss % columns.
@@ -813,7 +912,8 @@ interface LatencySample {
   jitterMs: number | null;
   sent: number;
   received: number;
-  history: (number | null)[]; // up to 120 samples, oldest first
+  history?: (number | null)[]; // up to 120 samples, oldest first; first update + every 30 s
+  newSamples?: (number | null)[]; // samples since this host's previous update (live only)
 }
 
 interface LatencyUpdate {      // event "latency-update"
@@ -861,10 +961,12 @@ interface TlsCertInfo {
   notAfter: string | null;
   notBeforeMs: number | null;  // Unix ms
   notAfterMs: number | null;
-  daysRemaining: number | null; // negative once expired
-  selfSigned: boolean;
+  daysRemaining: number | null; // whole days, truncated toward zero (0 on the last day and on
+                               // the day it expired; negative after that)
+  selfSigned: boolean;         // signature verified, or issuer == subject (and matching key
+                               // IDs) for legacy algorithms the verifier cannot check
   expired: boolean;
-  keyType: string | null;      // "RSA", "EC P-256", "Ed25519", ...
+  keyType: string | null;      // "RSA", "EC P-256", "EC P-384", "EC P-521", "Ed25519", ...
   keyBits: number | null;
   signatureAlgorithm: string | null; // "sha256WithRSAEncryption", "ecdsa-with-SHA256", ...
   sha256: string | null;       // "AB:CD:..."
@@ -960,5 +1062,6 @@ interface WakeResult {
   packetsSent: number;
   interface: string | null;
   sourceIp: string | null;
+  failures: string[];          // "addr:port: error" for destinations that failed (additive)
 }
 ```

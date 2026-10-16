@@ -68,11 +68,19 @@ impl SipTransport {
     }
 }
 
+/// An IP for a SIP URI / `Via` host: IPv6 literals in brackets, without a scope id.
+fn uri_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) => format!("[{v6}]"),
+        IpAddr::V4(v4) => v4.to_string(),
+    }
+}
+
 /// Build an RFC 3261 `OPTIONS` request to `target` from `local`, over `transport`.
 pub fn build_options(local: SocketAddr, target: SocketAddr, transport: SipTransport) -> String {
     let branch = format!("z9hG4bK{}", unique_token());
     let tag = unique_token();
-    let call_id = format!("{}@{}", unique_token(), local.ip());
+    let call_id = format!("{}@{}", unique_token(), uri_host(local.ip()));
     let via = transport.via();
     format!(
         "OPTIONS sip:{tip}:{tport} SIP/2.0\r\n\
@@ -86,9 +94,9 @@ pub fn build_options(local: SocketAddr, target: SocketAddr, transport: SipTransp
          Accept: application/sdp\r\n\
          User-Agent: SweepR/1.0\r\n\
          Content-Length: 0\r\n\r\n",
-        tip = target.ip(),
+        tip = uri_host(target.ip()),
         tport = target.port(),
-        lip = local.ip(),
+        lip = uri_host(local.ip()),
         lport = local.port(),
     )
 }
@@ -107,26 +115,43 @@ pub struct SipResponse {
 /// Parse a SIP response message (`SIP/2.0 <code> <reason>` + headers). Returns `None` when the
 /// first line is not a SIP status line.
 pub fn parse_sip_response(buf: &[u8]) -> Option<SipResponse> {
-    let text = std::str::from_utf8(buf).ok()?;
-    let mut lines = text.split("\r\n");
+    let text = String::from_utf8_lossy(buf);
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     let status_line = lines.next()?;
     let rest = status_line.strip_prefix("SIP/2.0 ")?;
     let mut r = SipResponse {
         status: Some(sanitize_text(rest.trim())),
         ..SipResponse::default()
     };
+    // Unfold headers (RFC 3261 7.3.1: a line starting with whitespace continues the previous
+    // header).
+    let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        if line.starts_with([' ', '\t']) {
+            if let Some((_, v)) = headers.last_mut() {
+                if v.len() < 4096 {
+                    v.push(' ');
+                    v.push_str(line.trim());
+                }
+            }
             continue;
-        };
-        let value = sanitize_text(value.trim());
+        }
+        if headers.len() >= 128 {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+    for (name, value) in headers {
+        let value = sanitize_text(&value);
         if value.is_empty() {
             continue;
         }
-        match name.trim().to_ascii_lowercase().as_str() {
+        match name.as_str() {
             "server" => r.server = Some(value),
             "user-agent" => r.user_agent = Some(value),
             "allow" => r.allow = Some(value),
@@ -165,6 +190,26 @@ pub fn is_voip_vendor(vendor: &str) -> bool {
     VENDORS.iter().any(|n| v.contains(n))
 }
 
+/// Vendors that (practically) only make IP phones / voice endpoints, so their OUI alone
+/// suggests a phone. Unlike [`is_voip_vendor`] it leaves out vendors with large non-phone
+/// product lines (Cisco, Avaya, Mitel, AudioCodes, Sangoma).
+pub fn is_voip_vendor_strict(vendor: &str) -> bool {
+    const VENDORS: &[&str] = &[
+        "yealink",
+        "grandstream",
+        "polycom",
+        "snom",
+        "fanvil",
+        "gigaset",
+        "htek",
+        "akuvox",
+        "spectralink",
+        "aastra",
+    ];
+    let v = vendor.to_ascii_lowercase();
+    VENDORS.iter().any(|n| v.contains(n))
+}
+
 /// Identify `(vendor, model, firmware, kind)` from a SIP `Server` / `User-Agent` string.
 /// `kind` is [`DEVICE_KIND_PBX`] or [`DEVICE_KIND_VOIP_PHONE`] when recognised. Tested against
 /// a range of real-format identifiers.
@@ -181,47 +226,74 @@ pub fn identify(
     };
     let lower = agent.to_ascii_lowercase();
 
+    // --- SIP proxies and gateways: identified, but neither a PBX nor a phone. ---
+    let other = |vendor: &str| (Some(vendor.to_string()), None, extract_version(agent), None);
+    if lower.contains("kamailio") {
+        return other("Kamailio");
+    }
+    if lower.contains("opensips") || lower.contains("openser") {
+        return other("OpenSIPS");
+    }
+    if lower.contains("sipgateway") || lower.contains("iosgateway") {
+        return other("Cisco IOS gateway");
+    }
+
     // --- PBX / softswitch identifiers (checked first; several share phone keywords). ---
-    let pbx = |vendor: &str, model: Option<&str>| {
+    let pbx = |vendor: &str, version: Option<String>| {
         (
             Some(vendor.to_string()),
-            model.map(String::from),
-            extract_version(agent),
+            None,
+            version.or_else(|| extract_version(agent)),
             Some(DEVICE_KIND_PBX.to_string()),
         )
     };
+    if lower.starts_with("fpbx") || lower.contains("freepbx") {
+        // "FPBX-16.0.40(18.20.0)": FreePBX 16.0.40 on Asterisk 18.20.0.
+        let version = agent
+            .split(['-', ' '])
+            .nth(1)
+            .map(|v| v.split('(').next().unwrap_or(v).trim())
+            .filter(|v| looks_like_version(v))
+            .map(sanitize_text);
+        return pbx("FreePBX", version);
+    }
     if lower.contains("freeswitch") {
         return pbx("FreeSWITCH", None);
     }
     if lower.contains("asterisk") {
         return pbx("Asterisk", None);
     }
-    if lower.starts_with("fpbx") || lower.contains("freepbx") {
-        return pbx("FreePBX", None);
-    }
     if lower.contains("issabel") {
         return pbx("Issabel", None);
     }
-    if lower.contains("3cx") {
+    if lower.starts_with("3cx") {
         return pbx("3CX", None);
     }
-    if lower.contains("kamailio") {
-        return pbx("Kamailio", None);
-    }
-    if lower.contains("opensips") || lower.contains("openser") {
-        return pbx("OpenSIPS", None);
-    }
-    if lower.contains("cucm")
-        || lower.contains("communicationsmanager")
-        || lower.contains("cisco-sipgateway")
-    {
-        return pbx("Cisco CUCM", None);
+    if lower.contains("cucm") || lower.contains("communicationsmanager") {
+        // "Cisco-CUCM14.0"
+        let version = lower
+            .find("cucm")
+            .map(|i| &agent[i + 4..])
+            .and_then(|r| r.split_whitespace().next())
+            .filter(|v| looks_like_version(v))
+            .map(sanitize_text);
+        return pbx("Cisco CUCM", version);
     }
     if lower.contains("yeastar") {
         return pbx("Yeastar", None);
     }
-    if lower.contains("ucm") && lower.contains("grandstream") {
+    if lower.contains("grandstream") && lower.contains("ucm") {
         return pbx("Grandstream UCM", None);
+    }
+    if lower.contains("mivoice business")
+        || lower.contains("mivoice connect")
+        || lower.contains("mitel 3300")
+        || lower.contains("mx-one")
+    {
+        return pbx("Mitel", None);
+    }
+    if lower.starts_with("sipxecs") {
+        return pbx("sipXecs", None);
     }
 
     // --- Desk phones (vendor + model + firmware). ---
@@ -233,30 +305,33 @@ pub fn identify(
             Some(DEVICE_KIND_VOIP_PHONE.to_string()),
         )
     };
-    // "Yealink SIP-T54W 96.86.0.5"
+    // "Yealink SIP-T54W 96.86.0.5", "Yealink SIP VP-T49G 51.80.0.130", "Yealink W60B 77.85.0.25"
     if lower.contains("yealink") {
-        let mut parts = agent.split_whitespace();
-        let _ = parts.next(); // "Yealink"
-        let model = parts.next().map(sanitize_text).filter(|m| !m.is_empty());
-        let fw = parts.next().map(sanitize_text).filter(|m| !m.is_empty());
-        return phone("Yealink", model, fw);
+        let (m, f) = model_and_firmware(agent, "yealink");
+        return phone("Yealink", m, f);
     }
     // "Grandstream GXP2170 1.0.11.70" / "Grandstream HT801 ..."
     if lower.contains("grandstream") {
-        let mut parts = agent.split_whitespace();
-        let _ = parts.next();
-        let model = parts.next().map(sanitize_text).filter(|m| !m.is_empty());
-        let fw = parts.next().map(sanitize_text).filter(|m| !m.is_empty());
-        return phone("Grandstream", model, fw);
+        let (m, f) = model_and_firmware(agent, "grandstream");
+        return phone("Grandstream", m, f);
     }
-    // "PolycomVVX-VVX_411-UA/5.9.5.0614" or "Polycom/5.9.5 ..."
-    if lower.contains("polycom") || lower.starts_with("poly") {
-        let (model, fw) = split_slash(agent);
-        let model = model
-            .strip_prefix("Polycom")
-            .map(str::to_string)
-            .filter(|m| !m.is_empty())
-            .or(Some(model));
+    // "PolycomVVX-VVX_411-UA/5.9.5.0614", "PolycomSoundPointIP-SPIP_331-UA/4.0.15",
+    // "Poly CCX 500/7.2.2.1094"
+    if lower.contains("polycom") || lower.starts_with("poly ") || lower.starts_with("poly/") {
+        let (product, fw) = split_slash(agent);
+        let model = product
+            .split('-')
+            .find(|seg| seg.contains('_'))
+            .map(|seg| seg.replace('_', " "))
+            .or_else(|| {
+                let m = product
+                    .trim_start_matches("Polycom")
+                    .trim_start_matches("Poly")
+                    .trim_matches(|c: char| c == '-' || c.is_whitespace())
+                    .to_string();
+                (!m.is_empty()).then_some(m)
+            })
+            .map(|m| sanitize_text(&m));
         return phone("Poly", model, fw);
     }
     // "snom870/8.7.5.35"
@@ -266,44 +341,54 @@ pub fn identify(
     }
     // "Fanvil X4/2.12.5.6938"
     if lower.contains("fanvil") {
-        let (model, fw) = split_slash(agent);
-        let model = model.replace("Fanvil", "");
-        let model = sanitize_text(model.trim());
-        return phone("Fanvil", (!model.is_empty()).then_some(model), fw);
+        let (m, f) = model_and_firmware(agent, "fanvil");
+        return phone("Fanvil", m, f);
     }
-    // "Cisco-CP8841/12.6.1" / "Cisco/SPA504G-7.6.2"
+    // "Linksys/SPA942-6.1.5(a)": the model and firmware both follow the slash.
+    if lower.starts_with("linksys/") || lower.starts_with("cisco/") {
+        let vendor = if lower.starts_with("cisco") {
+            "Cisco"
+        } else {
+            "Linksys"
+        };
+        let (_, rest) = split_slash(agent);
+        if let Some(rest) = rest {
+            let (m, f) = match rest.split_once('-') {
+                Some((m, f)) => (m.to_string(), Some(f.to_string())),
+                None => (rest, None),
+            };
+            return phone(
+                vendor,
+                Some(sanitize_text(&m)),
+                f.map(|f| sanitize_text(&f)),
+            );
+        }
+        return phone(vendor, None, None);
+    }
+    // "Cisco-CP8841/12.6.1"
     if lower.contains("cisco") {
         let (model, fw) = split_slash(agent);
-        // "Cisco/SPA504G-7.6.2d": the model and firmware both follow the slash.
-        if model.eq_ignore_ascii_case("cisco") {
-            if let Some(rest) = fw {
-                let (m, f) = match rest.split_once('-') {
-                    Some((m, f)) => (m.to_string(), Some(f.to_string())),
-                    None => (rest, None),
-                };
-                return phone(
-                    "Cisco",
-                    Some(sanitize_text(&m)),
-                    f.map(|f| sanitize_text(&f)),
-                );
-            }
-        }
         let model = model
             .trim_start_matches("Cisco-")
-            .trim_start_matches("Cisco/")
             .trim_start_matches("Cisco ")
             .to_string();
         let model = sanitize_text(model.trim());
         return phone("Cisco", (!model.is_empty()).then_some(model), fw);
     }
-    // Avaya / Mitel desk phones.
+    // Avaya / Mitel (Aastra) desk phones: "Avaya one-X Deskphone", "Mitel-6869i 6.2.0.1011",
+    // "Aastra 6757i/3.3.1.4053".
     if lower.contains("avaya") {
-        let (model, fw) = split_slash(agent);
-        return phone("Avaya", Some(model), fw);
+        let (m, f) = model_and_firmware(agent, "avaya");
+        return phone("Avaya", m, f);
     }
-    if lower.contains("mitel") {
-        let (model, fw) = split_slash(agent);
-        return phone("Mitel", Some(model), fw);
+    if lower.contains("mitel") || lower.contains("aastra") {
+        let prefix = if lower.contains("mitel") {
+            "mitel"
+        } else {
+            "aastra"
+        };
+        let (m, f) = model_and_firmware(agent, prefix);
+        return phone("Mitel", m, f);
     }
 
     // Unknown but still a SIP agent: keep the raw string as the vendor, no kind.
@@ -313,6 +398,38 @@ pub fn identify(
         extract_version(agent),
         None,
     )
+}
+
+/// Model and firmware from `<Vendor>[ -/]<words...>`: the vendor prefix (case-insensitive)
+/// and filler words (`SIP`, `UA`) are skipped; the first version-like word is the firmware,
+/// the other words form the model.
+fn model_and_firmware(agent: &str, vendor_lower: &str) -> (Option<String>, Option<String>) {
+    let lower = agent.to_ascii_lowercase();
+    let rest = match lower.find(vendor_lower) {
+        Some(i) => &agent[i + vendor_lower.len()..],
+        None => agent,
+    };
+    let mut model: Vec<&str> = Vec::new();
+    let mut fw = None;
+    for w in rest
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .map(|w| w.trim_matches(|c: char| c == '-' || c == '(' || c == ')'))
+        .filter(|w| !w.is_empty())
+    {
+        if w.eq_ignore_ascii_case("sip") || w.eq_ignore_ascii_case("ua") {
+            continue;
+        }
+        let versionish = w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.');
+        if versionish {
+            if fw.is_none() {
+                fw = Some(sanitize_text(w));
+            }
+        } else if fw.is_none() && model.len() < 3 {
+            model.push(w);
+        }
+    }
+    let model = sanitize_text(&model.join(" "));
+    ((!model.is_empty()).then_some(model), fw)
 }
 
 /// Split a `product/version` identifier into `(product, Some(version))`.
@@ -596,18 +713,6 @@ mod tests {
                 None,
                 DEVICE_KIND_PBX,
             ),
-            (
-                "kamailio (5.5.2 (x86_64/linux))",
-                "Kamailio",
-                None,
-                DEVICE_KIND_PBX,
-            ),
-            (
-                "OpenSIPS (3.1.3 (x86_64/linux))",
-                "OpenSIPS",
-                None,
-                DEVICE_KIND_PBX,
-            ),
         ];
         for (agent, vendor, model, kind) in cases {
             let (v, m, _fw, k) = identify(Some(agent));
@@ -623,13 +728,162 @@ mod tests {
         // Firmware extraction on a few.
         let (_, _, fw, _) = identify(Some("Yealink SIP-T54W 96.86.0.5"));
         assert_eq!(fw.as_deref(), Some("96.86.0.5"));
+        // FreePBX's own version, not the Asterisk version in parentheses.
         let (_, _, fw, _) = identify(Some("FPBX-15.0.17(16.20.0)"));
-        assert_eq!(fw.as_deref(), Some("16.20.0"));
+        assert_eq!(fw.as_deref(), Some("15.0.17"));
         // Unknown agent: vendor kept, no kind.
         let (v, _, _, k) = identify(Some("MyCustomUA/1.0"));
         assert_eq!(v.as_deref(), Some("MyCustomUA/1.0"));
         assert!(k.is_none());
         assert_eq!(identify(None), (None, None, None, None));
+    }
+
+    /// Identification table regressions from the roadmap review: (agent, vendor, model,
+    /// firmware, kind).
+    #[test]
+    fn identification_table_regressions() {
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let phone = Some(DEVICE_KIND_VOIP_PHONE);
+        let pbx = Some(DEVICE_KIND_PBX);
+        let cases: &[Case] = &[
+            (
+                "Yealink SIP VP-T49G 51.80.0.130",
+                "Yealink",
+                Some("VP-T49G"),
+                Some("51.80.0.130"),
+                phone,
+            ),
+            (
+                "Yealink W60B 77.85.0.25",
+                "Yealink",
+                Some("W60B"),
+                Some("77.85.0.25"),
+                phone,
+            ),
+            (
+                "PolycomVVX-VVX_450-UA/6.4.3.5018",
+                "Poly",
+                Some("VVX 450"),
+                Some("6.4.3.5018"),
+                phone,
+            ),
+            (
+                "Poly CCX 500/7.2.2.1094",
+                "Poly",
+                Some("CCX 500"),
+                Some("7.2.2.1094"),
+                phone,
+            ),
+            ("Cisco-CUCM14.0", "Cisco CUCM", None, Some("14.0"), pbx),
+            (
+                "FPBX-16.0.40(18.20.0)",
+                "FreePBX",
+                None,
+                Some("16.0.40"),
+                pbx,
+            ),
+            (
+                "Grandstream UCM6202 V1.0A 1.0.20.31",
+                "Grandstream UCM",
+                None,
+                None,
+                pbx,
+            ),
+            (
+                "Mitel-6869i 6.2.0.1011",
+                "Mitel",
+                Some("6869i"),
+                Some("6.2.0.1011"),
+                phone,
+            ),
+            (
+                "Aastra 6757i/3.3.1.4053",
+                "Mitel",
+                Some("6757i"),
+                Some("3.3.1.4053"),
+                phone,
+            ),
+            (
+                "Linksys/SPA942-6.1.5(a)",
+                "Linksys",
+                Some("SPA942"),
+                Some("6.1.5(a)"),
+                phone,
+            ),
+            // Proxies and gateways are not PBXes.
+            (
+                "kamailio (5.7.1 (x86_64/linux))",
+                "Kamailio",
+                None,
+                None,
+                None,
+            ),
+            (
+                "OpenSIPS (3.1.3 (x86_64/linux))",
+                "OpenSIPS",
+                None,
+                None,
+                None,
+            ),
+            (
+                "Cisco-SIPGateway/IOS-15.6.2",
+                "Cisco IOS gateway",
+                None,
+                None,
+                None,
+            ),
+            // "3CX-compatible" in a door station's agent is no 3CX PBX.
+            (
+                "Hikvision DS-KV6113 3CX-compatible",
+                "Hikvision DS-KV6113 3CX-compatible",
+                None,
+                None,
+                None,
+            ),
+        ];
+        for (agent, vendor, model, fw, kind) in cases {
+            let (v, m, f, k) = identify(Some(agent));
+            assert_eq!(v.as_deref(), Some(*vendor), "vendor for {agent}");
+            assert_eq!(k.as_deref(), *kind, "kind for {agent}");
+            if model.is_some() {
+                assert_eq!(m.as_deref(), *model, "model for {agent}");
+            }
+            if fw.is_some() {
+                assert_eq!(f.as_deref(), *fw, "firmware for {agent}");
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_sip_uris_are_bracketed() {
+        let local: SocketAddr = "[fe80::2]:5062".parse().unwrap();
+        let target: SocketAddr = "[fe80::1]:5060".parse().unwrap();
+        let req = build_options(local, target, SipTransport::Udp);
+        assert!(
+            req.starts_with("OPTIONS sip:[fe80::1]:5060 SIP/2.0\r\n"),
+            "{req}"
+        );
+        assert!(req.contains("Via: SIP/2.0/UDP [fe80::2]:5062;"));
+        assert!(req.contains("<sip:sweepr@[fe80::2]:5062>"));
+    }
+
+    #[test]
+    fn folded_and_lf_only_headers() {
+        let folded = "SIP/2.0 200 OK\r\nAllow: INVITE,\r\n ACK, OPTIONS\r\nUser-Agent: Yealink SIP-T46S\r\n 66.86.0.15\r\n\r\n";
+        let r = parse_sip_response(folded.as_bytes()).unwrap();
+        assert_eq!(r.allow.as_deref(), Some("INVITE, ACK, OPTIONS"));
+        assert_eq!(r.user_agent.as_deref(), Some("Yealink SIP-T46S 66.86.0.15"));
+        let lf = "SIP/2.0 200 OK\nServer: Asterisk PBX 18\n\n";
+        assert_eq!(
+            parse_sip_response(lf.as_bytes()).unwrap().server.as_deref(),
+            Some("Asterisk PBX 18")
+        );
     }
 
     #[test]

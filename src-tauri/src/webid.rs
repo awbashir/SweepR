@@ -126,6 +126,27 @@ impl ServerCertVerifier for AcceptAnyCert {
     }
 }
 
+/// Describe a TLS handshake failure; version / cipher negotiation failures say that the
+/// server only speaks legacy TLS (SweepR offers TLS 1.2 and 1.3 only).
+fn tls_failure_message(err: &str) -> String {
+    let legacy = [
+        "ProtocolVersion",
+        "HandshakeFailure",
+        "PeerIncompatible",
+        "InsufficientSecurity",
+        "NoCipherSuitesInCommon",
+        "IllegalParameter",
+    ];
+    if legacy.iter().any(|k| err.contains(k)) {
+        format!(
+            "TLS handshake failed: the server appears to offer only legacy TLS (1.0 / 1.1 or \
+             obsolete ciphers), which SweepR does not negotiate ({err})"
+        )
+    } else {
+        format!("TLS handshake failed: {err}")
+    }
+}
+
 /// The shared read-only TLS client config (TLS 1.2 + 1.3, ALPN `http/1.1`, `ring`).
 fn tls_connector() -> Option<TlsConnector> {
     static CFG: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
@@ -239,26 +260,41 @@ pub fn parse_cert(der: &[u8], port: u16, now_ms: u64) -> Option<TlsCertInfo> {
     let not_before = cert.validity().not_before.timestamp();
     let not_after = cert.validity().not_after.timestamp();
     let now_secs = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
-    let days_remaining = not_after.saturating_sub(now_secs).div_euclid(86_400);
+    // Whole days, truncated toward zero: 9 d 23 h left is "9 days", expired 2 h ago is 0
+    // ("today"), not "1 day ago".
+    let days_remaining = not_after.saturating_sub(now_secs) / 86_400;
 
     let spki = cert.public_key();
     let alg = spki.algorithm.algorithm.to_id_string();
     let (key_type, key_bits) = match spki.parsed() {
         Ok(PublicKey::RSA(rsa)) => (Some("RSA".to_string()), Some(rsa.key_size())),
         Ok(PublicKey::EC(ec)) => {
-            let bits = ec.key_size();
-            let name = match bits {
-                256 | 384 | 521 => format!("EC P-{bits}"),
-                _ => "EC".to_string(),
-            };
-            (Some(name), Some(bits))
+            // The named curve (algorithm parameter) decides; the point length of P-521 is
+            // 66 bytes per coordinate, so the raw key size would read 528.
+            let curve = spki
+                .algorithm
+                .parameters
+                .as_ref()
+                .and_then(|p| p.as_oid().ok())
+                .map(|o| o.to_id_string());
+            match curve.as_deref() {
+                Some("1.2.840.10045.3.1.7") => (Some("EC P-256".to_string()), Some(256)),
+                Some("1.3.132.0.34") => (Some("EC P-384".to_string()), Some(384)),
+                Some("1.3.132.0.35") => (Some("EC P-521".to_string()), Some(521)),
+                _ => match ec.key_size() {
+                    bits @ (256 | 384) => (Some(format!("EC P-{bits}")), Some(bits)),
+                    // 66-byte coordinates: P-521.
+                    521 | 528 => (Some("EC P-521".to_string()), Some(521)),
+                    bits => (Some("EC".to_string()), Some(bits)),
+                },
+            }
         }
         Ok(PublicKey::DSA(_)) => (Some("DSA".to_string()), None),
         _ if alg == "1.3.101.112" => (Some("Ed25519".to_string()), Some(256)),
         _ if alg == "1.3.101.113" => (Some("Ed448".to_string()), Some(456)),
         _ => (None, None),
     };
-    let self_signed = subject.as_raw() == issuer.as_raw() && cert.verify_signature(None).is_ok();
+    let self_signed = subject.as_raw() == issuer.as_raw() && self_signature_holds(&cert);
     let digest = ring::digest::digest(&ring::digest::SHA256, der);
     let sha256 = digest
         .as_ref()
@@ -293,7 +329,35 @@ pub fn parse_cert(der: &[u8], port: u16, now_ms: u64) -> Option<TlsCertInfo> {
     })
 }
 
-/// Warnings for an expired, soon-expiring, not-yet-valid or self-signed certificate.
+/// Whether a certificate whose issuer equals its subject signed itself. The signature is
+/// verified when possible; the verifier (ring) rejects legacy keys and algorithms (RSA < 2048,
+/// MD5, P-521, SHA-512 ECDSA, DSA) with the same error as a bad signature, so on failure
+/// issuer == subject decides, unless both key identifiers are present and differ.
+fn self_signature_holds(cert: &x509_parser::certificate::X509Certificate<'_>) -> bool {
+    use x509_parser::extensions::ParsedExtension;
+    match cert.verify_signature(None) {
+        Ok(()) => true,
+        Err(_) => {
+            let mut aki = None;
+            let mut ski = None;
+            for ext in cert.extensions() {
+                match ext.parsed_extension() {
+                    ParsedExtension::AuthorityKeyIdentifier(a) => {
+                        aki = a.key_identifier.as_ref().map(|k| k.0.to_vec());
+                    }
+                    ParsedExtension::SubjectKeyIdentifier(k) => ski = Some(k.0.to_vec()),
+                    _ => {}
+                }
+            }
+            match (aki, ski) {
+                (Some(a), Some(s)) => a == s,
+                _ => true,
+            }
+        }
+    }
+}
+
+/// Warnings for an expired, soon-expiring, not-yet-valid, self-signed or weak-key certificate.
 pub fn cert_warnings(c: &TlsCertInfo, now_ms: u64) -> Vec<String> {
     let mut out = Vec::new();
     let date = c
@@ -303,11 +367,15 @@ pub fn cert_warnings(c: &TlsCertInfo, now_ms: u64) -> Vec<String> {
         .unwrap_or_default();
     let days = c.days_remaining.unwrap_or(i64::MAX);
     if c.expired {
-        let ago = days.unsigned_abs().max(1);
-        out.push(format!(
-            "TLS certificate on port {} expired {ago} day(s) ago ({date})",
-            c.port
-        ));
+        let ago = days.unsigned_abs();
+        out.push(if ago == 0 {
+            format!("TLS certificate on port {} expired today ({date})", c.port)
+        } else {
+            format!(
+                "TLS certificate on port {} expired {ago} day(s) ago ({date})",
+                c.port
+            )
+        });
     } else if days < EXPIRY_WARNING_DAYS {
         out.push(format!(
             "TLS certificate on port {} expires in {days} day(s) ({date})",
@@ -324,6 +392,15 @@ pub fn cert_warnings(c: &TlsCertInfo, now_ms: u64) -> Vec<String> {
     }
     if c.self_signed {
         out.push(format!("TLS certificate on port {} is self-signed", c.port));
+    }
+    let kt = c.key_type.as_deref().unwrap_or("");
+    if let Some(bits) = c.key_bits {
+        if (kt == "RSA" || kt == "DSA") && bits < 2048 {
+            out.push(format!(
+                "TLS certificate on port {} uses a weak {bits}-bit {kt} key",
+                c.port
+            ));
+        }
     }
     out
 }
@@ -410,40 +487,50 @@ fn find_ci(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
 }
 
-fn rfind_ci(hay: &[u8], needle: &[u8], before: usize) -> Option<usize> {
-    if needle.is_empty() || before < needle.len() {
-        return None;
-    }
-    (0..=before.min(hay.len()).saturating_sub(needle.len()))
-        .rev()
-        .find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
+/// `true` when `body[i..]` starts with `<tag` (case-insensitive) followed by `>`, `/` or
+/// whitespace.
+fn tag_at(body: &[u8], i: usize, tag: &[u8]) -> bool {
+    body.get(i..i + tag.len())
+        .is_some_and(|t| t.eq_ignore_ascii_case(tag))
+        && body
+            .get(i + tag.len())
+            .is_some_and(|c| *c == b'>' || *c == b'/' || c.is_ascii_whitespace())
 }
 
 /// The document `<title>`: the first real `<title>` element (not `<titlefoo>`, not inside an
 /// inline `<svg>`) that is properly closed. Entity-decoded, whitespace-collapsed, sanitized;
-/// `None` when empty.
+/// `None` when empty. One forward pass tracking the `<svg>` nesting depth, so hostile bodies
+/// full of `<svg>` / `<title>` tags stay linear.
 pub fn extract_title(body: &[u8]) -> Option<String> {
     let body = &body[..body.len().min(MAX_BODY_BYTES)];
-    let mut from = 0;
-    while let Some(i) = find_ci(body, b"<title", from) {
-        from = i + 6;
-        let next = *body.get(i + 6)?;
-        if !(next == b'>' || next.is_ascii_whitespace()) {
-            continue;
-        }
-        // Inside an inline SVG? (an opening <svg before it without a closing </svg).
-        if let Some(svg) = rfind_ci(body, b"<svg", i) {
-            if rfind_ci(body, b"</svg", i).is_none_or(|close| close < svg) {
-                continue;
+    let mut svg_depth = 0usize;
+    let mut i = 0;
+    while i < body.len() {
+        let Some(off) = body[i..].iter().position(|b| *b == b'<') else {
+            break;
+        };
+        i += off;
+        if tag_at(body, i, b"<svg") {
+            let end = body[i..].iter().position(|b| *b == b'>').map(|p| i + p);
+            // `<svg ... />` opens nothing.
+            if !end.is_some_and(|e| e > 0 && body[e - 1] == b'/') {
+                svg_depth += 1;
             }
+            i += 4;
+        } else if tag_at(body, i, b"</svg") {
+            svg_depth = svg_depth.saturating_sub(1);
+            i += 5;
+        } else if svg_depth == 0 && tag_at(body, i, b"<title") {
+            let open_end = body[i..].iter().position(|b| *b == b'>')? + i + 1;
+            let close = find_ci(body, b"</title", open_end)?;
+            let raw = &body[open_end..close.min(open_end + 2048)];
+            let decoded = decode_entities(&bytes_to_text(raw));
+            let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+            let title = sanitize_text(&collapsed);
+            return (!title.is_empty()).then_some(title);
+        } else {
+            i += 1;
         }
-        let open_end = body[i..].iter().position(|b| *b == b'>')? + i + 1;
-        let close = find_ci(body, b"</title", open_end)?;
-        let raw = &body[open_end..close.min(open_end + 2048)];
-        let decoded = decode_entities(&bytes_to_text(raw));
-        let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
-        let title = sanitize_text(&collapsed);
-        return (!title.is_empty()).then_some(title);
     }
     None
 }
@@ -493,13 +580,65 @@ impl HttpResponse {
     }
 }
 
+/// Headers kept from one response (more are tolerated but ignored).
+const MAX_RESPONSE_HEADERS: usize = 128;
+
+/// Status, headers (lower-cased names, sanitized values) and header-block length of a
+/// response head. `Ok(None)` while incomplete; `Err` when it is not HTTP. A response with more
+/// than [`MAX_RESPONSE_HEADERS`] headers is still HTTP: the extra headers are dropped.
+/// A parsed response head: status, headers, header-block length.
+type Head = (u16, Vec<(String, String)>, usize);
+
+fn parse_head(raw: &[u8]) -> Result<Option<Head>, &'static str> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
+    let mut resp = httparse::Response::new(&mut headers);
+    match resp.parse(raw) {
+        Ok(httparse::Status::Complete(n)) => {
+            let status = resp.code.ok_or("missing status code")?;
+            let hs = resp
+                .headers
+                .iter()
+                .map(|h| {
+                    (
+                        h.name.to_ascii_lowercase(),
+                        sanitize_text(&bytes_to_text(h.value)),
+                    )
+                })
+                .collect();
+            Ok(Some((status, hs, n)))
+        }
+        Ok(httparse::Status::Partial) => Ok(None),
+        Err(httparse::Error::TooManyHeaders) => {
+            let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                return Ok(None);
+            };
+            let head = bytes_to_text(&raw[..end]);
+            let mut lines = head.split("\r\n");
+            let status = lines
+                .next()
+                .filter(|l| l.starts_with("HTTP/1."))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .ok_or("not an HTTP response")?;
+            // Keep the first headers plus the ones that frame or route the response.
+            let framing = ["content-length", "transfer-encoding", "location", "server"];
+            let hs = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(n, v)| (n.trim().to_ascii_lowercase(), v))
+                .enumerate()
+                .filter(|(i, (n, _))| *i < MAX_RESPONSE_HEADERS || framing.contains(&n.as_str()))
+                .take(MAX_RESPONSE_HEADERS + framing.len())
+                .map(|(_, (n, v))| (n, sanitize_text(v.trim())))
+                .collect();
+            Ok(Some((status, hs, end + 4)))
+        }
+        Err(_) => Err("not an HTTP response"),
+    }
+}
+
 /// Length of the header block (through the blank line), when complete.
 fn header_len(raw: &[u8]) -> Option<usize> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    match httparse::Response::new(&mut headers).parse(raw) {
-        Ok(httparse::Status::Complete(n)) => Some(n),
-        _ => None,
-    }
+    parse_head(raw).ok().flatten().map(|(_, _, n)| n)
 }
 
 /// Decode as much of a chunked body as is present and well-formed.
@@ -560,24 +699,7 @@ fn response_complete(raw: &[u8]) -> bool {
 
 /// Parse a raw HTTP/1.x response. Fails when it is not HTTP or the headers are incomplete.
 pub fn parse_response(raw: &[u8]) -> Result<HttpResponse, &'static str> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut resp = httparse::Response::new(&mut headers);
-    let n = match resp.parse(raw) {
-        Ok(httparse::Status::Complete(n)) => n,
-        Ok(httparse::Status::Partial) => return Err("incomplete HTTP response headers"),
-        Err(_) => return Err("not an HTTP response"),
-    };
-    let status = resp.code.ok_or("missing status code")?;
-    let headers: Vec<(String, String)> = resp
-        .headers
-        .iter()
-        .map(|h| {
-            (
-                h.name.to_ascii_lowercase(),
-                sanitize_text(&bytes_to_text(h.value)),
-            )
-        })
-        .collect();
+    let (status, headers, n) = parse_head(raw)?.ok_or("incomplete HTTP response headers")?;
     let chunked = headers
         .iter()
         .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
@@ -803,7 +925,7 @@ async fn fetch(
             let tls = match tokio::time::timeout_at(deadline, connector.connect(name, tcp)).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    return Err(FetchError::Protocol(format!("TLS handshake failed: {e}")))
+                    return Err(FetchError::Protocol(tls_failure_message(&e.to_string())))
                 }
                 Err(_) => return Err(FetchError::Protocol("TLS handshake timed out".into())),
             };
@@ -969,7 +1091,8 @@ pub async fn probe_port(
 // ---------------------------------------------------------------------------------------------
 
 struct Rule {
-    /// Lower-case needles. Needles of 4 characters or fewer must match whole words.
+    /// Lower-case needles. Needles of 4 characters or fewer, and needles written `=word`,
+    /// must match whole words ("unifi" must not match "Unified ...").
     needles: &'static [&'static str],
     identity: &'static str,
     role: Option<DeviceRole>,
@@ -1069,7 +1192,7 @@ const RULES: &[Rule] = &[
         "Ubiquiti EdgeOS",
         None,
     ),
-    rule(&["unifi", "ubiquiti"], "Ubiquiti UniFi", None),
+    rule(&["=unifi", "ubiquiti"], "Ubiquiti UniFi", None),
     rule(&["openwrt", "luci"], "OpenWrt", Some(DeviceRole::Router)),
     rule(&["dd-wrt"], "DD-WRT", Some(DeviceRole::Router)),
     rule(&["omada"], "TP-Link Omada", None),
@@ -1115,7 +1238,9 @@ pub fn identify(texts: &[&str]) -> Option<(&'static str, Option<DeviceRole>)> {
         .join(" | ");
     let hay_words = words(&hay);
     let has = |needle: &str| {
-        if needle.len() <= 4 && needle.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if let Some(word) = needle.strip_prefix('=') {
+            hay_words.contains(&word)
+        } else if needle.len() <= 4 && needle.chars().all(|c| c.is_ascii_alphanumeric()) {
             hay_words.contains(&needle)
         } else {
             hay.contains(needle)
@@ -1326,6 +1451,40 @@ EURrWL+1/QOB2V8oCRKyCouENoxU+foMXzbrm1jq/MWLlyb6sJH/q58N
 ";
     /// 2027-01-01T00:00:00Z.
     const NOW_2027: u64 = 1_798_761_600_000;
+    /// Self-signed RSA-1024 / SHA-256 (ring cannot verify keys under 2048 bits).
+    const LEGACY_RSA1024: &str = "-----BEGIN CERTIFICATE-----
+MIIBqTCCARICCQClu7vXSzDXdTANBgkqhkiG9w0BAQsFADAZMRcwFQYDVQQDDA5s
+ZWdhY3ktcnNhMTAyNDAeFw0yNjEwMTYwNzM0NTlaFw00NjEwMTEwNzM0NTlaMBkx
+FzAVBgNVBAMMDmxlZ2FjeS1yc2ExMDI0MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCB
+iQKBgQDGimuLf+yG/MncGRDs4HrytsrPy+R18dZ/XRfrvIeeCbrJkI4cDy+lPQFA
+wmpZKHacZbix6P2Hqhw68hBtJQzYCLYK3+doOyT/3Omb+uTkh0DU/F1LyR95xs5o
+1jcgqFtPrQlFBtcVO8dFX16a16Sm4ReP0BZB1yQDRXYGAGUvbwIDAQABMA0GCSqG
+SIb3DQEBCwUAA4GBAJSWj+69KxSD1UIbJ+Kf7CLDaH3+VCoKfJIB2EQKG7GGMsUy
+ScqBxfeNWnMcbyMpd9IbikmZ6flV9J7Clk/zze2O2168jtJdTFOWhV7DOOlIcbXh
+DPgtyyAY8xD5N8k/WtQCXDDnYQFdNYE+wkjtFk8tn+c/zgJFMURYbcpaUm6v
+-----END CERTIFICATE-----";
+    /// Self-signed EC P-521 / ECDSA-SHA512 (not supported by ring's verifier).
+    const LEGACY_P521: &str = "-----BEGIN CERTIFICATE-----
+MIIDZDCCAscCCQCa2YjVr+oLujAKBggqhkjOPQQDBDAWMRQwEgYDVQQDDAtsZWdh
+Y3ktcDUyMTAeFw0yNjEwMTYwNzM0NTlaFw00NjEwMTEwNzM0NTlaMBYxFDASBgNV
+BAMMC2xlZ2FjeS1wNTIxMIICXDCCAc8GByqGSM49AgEwggHCAgEBME0GByqGSM49
+AQECQgH/////////////////////////////////////////////////////////
+/////////////////////////////zCBngRCAf//////////////////////////
+///////////////////////////////////////////////////////////8BEFR
+lT65YY4cmh+SmiGgtoVA7qLacluZsxXzuLSJkY7xCeFWGTlR7H6TexZSwL07sb8H
+NXPfiD0sNPHvRR/Ua1A/AAMVANCeiAApHLhTlsxnFzkyhKqg2mS6BIGFBADGhY4G
+twQE6c2ePstmI5W0QpxkgTkFP7Uh+CivYGtNPbqhS1537+dZKP4dwSei/6jeM0iz
+wYVqQpv5fn4xwuW9ZgEYOSlqeJo7wARcil+0LH0b2Zj1RElXm0RoF6+9Fyc+ZiyX
+7nKZXvQmQMVQuQE/rQdhNTxwhqJywkCIvpR2n9FmUAJCAf//////////////////
+////////////////////////+lGGh4O/L5Zrf8wBSPcJpdA7tcm4iZxHrrtvtx6R
+OGQJAgEBA4GGAAQB+FLDa3bBA8EctEtsVxuDQ8YvfpaLG5gg53EINTOk+r/pndbg
+4U6WGE4Uo8HJvkQYstXsPy/XqGJO2qis/1iHJ2UBqKZrS6KOtM4piFiUTeEQ+aG/
+UVYd8lQZXnaqx6MJroWm27ErcAh6ucwHk2VoMgZ9XPgbSDX/Mkpwv284FCUdW0gw
+CgYIKoZIzj0EAwQDgYoAMIGGAkFBusRTHSAkRMr2rzuQengej7H++HkRzddzWhZC
+YTWBHC2ElVgRTl9zbzuX22A/Z7JC2luBSuqk5TSfFdHZ0CRpRQJBCzyQuo9IpeVz
+ITjci0Pxews2EbCldCk39WWwlylItHn21PBwCGnkvH3CcAooqy7Yh3SwvrWouGj0
+zQA2Rh3qfkc=
+-----END CERTIFICATE-----";
 
     fn cert_der() -> CertificateDer<'static> {
         CertificateDer::from_pem_slice(TEST_CERT.as_bytes()).unwrap()
@@ -1443,6 +1602,100 @@ EURrWL+1/QOB2V8oCRKyCouENoxU+foMXzbrm1jq/MWLlyb6sJH/q58N
             Some("https://10.0.0.1:8443/")
         );
         assert_eq!(meta_refresh_target(b"<meta charset=utf-8>"), None);
+    }
+
+    #[test]
+    fn many_headers_are_still_http() {
+        let mut raw = String::from("HTTP/1.1 200 OK\r\nServer: lighttpd\r\n");
+        for i in 0..150 {
+            raw.push_str(&format!("X-H{i}: v\r\n"));
+        }
+        raw.push_str("Content-Length: 2\r\n\r\nok");
+        let r = parse_response(raw.as_bytes()).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("server"), Some("lighttpd"));
+        assert!(r.headers.len() <= MAX_RESPONSE_HEADERS + 4);
+        assert_eq!(r.body, b"ok");
+        assert!(response_complete(raw.as_bytes()));
+    }
+
+    /// Worst-case title input (64 KiB of `<svg><title>`) stays fast (review M9: the old
+    /// backwards search per `<title>` was quadratic, ~3 s of CPU).
+    #[test]
+    fn title_extraction_is_linear() {
+        let unit = "<svg><title>i</title>";
+        let body = unit.repeat(MAX_BODY_BYTES / unit.len());
+        let started = std::time::Instant::now();
+        assert_eq!(extract_title(body.as_bytes()), None);
+        let mixed = "<title".repeat(MAX_BODY_BYTES / 6);
+        assert_eq!(extract_title(mixed.as_bytes()), None);
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(500), "took {took:?}");
+        // Self-closing SVGs open nothing; nesting is tracked.
+        assert_eq!(
+            extract_title(b"<svg/><title>A</title>").as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            extract_title(b"<svg><svg></svg><title>x</title></svg><title>B</title>").as_deref(),
+            Some("B")
+        );
+    }
+
+    #[test]
+    fn legacy_tls_failures_are_named() {
+        let m = tls_failure_message("received fatal alert: ProtocolVersion");
+        assert!(m.contains("legacy TLS"), "{m}");
+        let m = tls_failure_message("connection reset by peer");
+        assert_eq!(m, "TLS handshake failed: connection reset by peer");
+    }
+
+    #[test]
+    fn unifi_needs_a_whole_word() {
+        assert_eq!(
+            identify(&["UniFi Network"]).map(|(i, _)| i),
+            Some("Ubiquiti UniFi")
+        );
+        assert_eq!(identify(&["Unified Communications Portal"]), None);
+    }
+
+    /// Legacy self-signed certificates the signature verifier does not support still read
+    /// as self-signed, and weak RSA keys are flagged (review M10); P-521 reports 521 bits.
+    #[test]
+    fn legacy_certificates() {
+        let rsa1024 = CertificateDer::from_pem_slice(LEGACY_RSA1024.as_bytes()).unwrap();
+        let c = parse_cert(&rsa1024, 443, NOW_2027).unwrap();
+        assert!(c.self_signed, "RSA-1024 self-signed");
+        assert_eq!(
+            (c.key_type.as_deref(), c.key_bits),
+            (Some("RSA"), Some(1024))
+        );
+        let w = cert_warnings(&c, NOW_2027);
+        assert!(w.iter().any(|w| w.contains("weak 1024-bit RSA")), "{w:?}");
+        let p521 = CertificateDer::from_pem_slice(LEGACY_P521.as_bytes()).unwrap();
+        let c = parse_cert(&p521, 443, NOW_2027).unwrap();
+        assert!(c.self_signed, "P-521 / SHA-512 self-signed");
+        assert_eq!(
+            (c.key_type.as_deref(), c.key_bits),
+            (Some("EC P-521"), Some(521))
+        );
+        assert!(!cert_warnings(&c, NOW_2027)
+            .iter()
+            .any(|w| w.contains("weak")));
+    }
+
+    /// Day counts truncate toward zero: expired two hours ago is "today".
+    #[test]
+    fn expiry_day_counts() {
+        let der = cert_der();
+        let c = parse_cert(&der, 443, 0).unwrap();
+        let after = c.not_after_ms.unwrap() as u64;
+        let c = parse_cert(&der, 443, after + 2 * 3_600_000).unwrap();
+        assert!(c.expired);
+        assert_eq!(c.days_remaining, Some(0));
+        assert!(cert_warnings(&c, after + 2 * 3_600_000)[0].contains("expired today"));
+        let c = parse_cert(&der, 443, after - 10 * 86_400_000 + 3_600_000).unwrap();
+        assert_eq!(c.days_remaining, Some(9));
     }
 
     #[test]

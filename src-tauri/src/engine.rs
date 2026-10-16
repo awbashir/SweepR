@@ -434,27 +434,69 @@ impl Aggregate {
             .map(|(_, pm)| pm.clone())
     }
 
-    /// Recompute `dev.switch_port` from the stored mappings; returns `true` when it changed.
+    /// `true` when `dev` is the device a PoE port powers: the only MAC on the port, or the
+    /// only powered-looking device (phone / AP / camera / member of the voice VLAN) among
+    /// the MACs learned there. A PC daisy-chained behind a phone never gets the phone's power.
+    fn is_powered_endpoint(&self, key: &PortKey, dev: &Device, voice: Option<u16>) -> bool {
+        let Some(macs) = self.port_macs.get(key) else {
+            return true;
+        };
+        if macs.len() <= 1 {
+            return true;
+        }
+        if !looks_powered(dev, voice) {
+            return false;
+        }
+        let own = dev.mac.as_deref();
+        !macs.iter().filter(|m| Some(m.as_str()) != own).any(|m| {
+            self.devices_by_mac.get(m).is_some_and(|keys| {
+                keys.iter()
+                    .filter_map(|k| self.devices.get(k))
+                    .any(|d| looks_powered(d, voice))
+            })
+        })
+    }
+
+    /// Recompute `dev.switch_port` (and the PoE / voice VLAN that come with it) from the
+    /// stored mappings; returns `true` when anything changed.
+    ///
+    /// PoE and the voice VLAN are derived from the *chosen* port on every call, falling back
+    /// to the endpoint's own CDP/LLDP advertisement, so a provisional choice that later moves
+    /// to another port leaves nothing stale behind.
     fn assign_switch_port(&self, dev: &mut Device) -> bool {
         if self.port_mappings_by_mac.is_empty() {
             return false;
         }
         let best = self.best_port_mapping(dev);
-        if best == dev.switch_port {
+        let (own_poe, own_voice) = own_advertisement(dev);
+        let (port_poe, port_voice) = match &best {
+            Some(pm) => {
+                let key = port_key(pm);
+                let single = self.port_macs.get(&key).is_none_or(|m| m.len() <= 1);
+                let poe = pm
+                    .poe
+                    .clone()
+                    .filter(|_| self.is_powered_endpoint(&key, dev, pm.voice_vlan));
+                // The port's voice VLAN describes the phone on it, not a PC behind the phone
+                // in the data VLAN.
+                let voice = pm.voice_vlan.filter(|v| {
+                    single || dev.vlan_id == Some(*v) || looks_powered(dev, pm.voice_vlan)
+                });
+                (poe, voice)
+            }
+            None => (None, None),
+        };
+        let poe = port_poe.or(own_poe);
+        let voice = port_voice.or(own_voice);
+        if best == dev.switch_port && poe == dev.poe && voice == dev.voice_vlan {
             return false;
         }
-        if let Some(pm) = &best {
+        if best.is_some() {
             dev.add_source(DiscoverySource::Snmp);
-            // The access port's measured PoE and configured voice VLAN describe the endpoint
-            // on it (SNMP data wins over an endpoint's own CDP/LLDP claim).
-            if pm.poe.is_some() {
-                dev.poe = pm.poe.clone();
-            }
-            if pm.voice_vlan.is_some() {
-                dev.voice_vlan = pm.voice_vlan;
-            }
         }
         dev.switch_port = best;
+        dev.poe = poe;
+        dev.voice_vlan = voice;
         true
     }
 
@@ -595,6 +637,46 @@ fn same_advert(a: &CdpLldpNeighbor, b: &CdpLldpNeighbor) -> bool {
         last_seen_ms: a.last_seen_ms,
         ..b.clone()
     } == *a
+}
+
+/// A device that typically draws PoE: IP phone, access point, camera, or a member of the
+/// port's voice VLAN.
+fn looks_powered(dev: &Device, voice: Option<u16>) -> bool {
+    dev.role == DeviceRole::AccessPoint
+        || matches!(
+            dev.device_kind.as_deref(),
+            Some(crate::models::DEVICE_KIND_VOIP_PHONE | "camera" | "access_point")
+        )
+        || dev.onvif.as_ref().is_some_and(|o| o.is_camera)
+        || dev.neighbor.as_ref().is_some_and(|n| {
+            n.capabilities.contains(&Capability::Telephone)
+                || n.capabilities.contains(&Capability::WlanAccessPoint)
+        })
+        || (voice.is_some() && dev.vlan_id == voice)
+        || dev
+            .vendor
+            .as_deref()
+            .is_some_and(crate::sip::is_voip_vendor_strict)
+}
+
+/// PoE and voice VLAN from the device's own CDP/LLDP advertisement (an endpoint describing
+/// itself; a switch / router advertisement describes the port it is plugged into instead).
+fn own_advertisement(dev: &Device) -> (Option<crate::models::PoeInfo>, Option<u16>) {
+    match &dev.neighbor {
+        Some(n) if !is_infra_role(n.infer_role()) => (
+            n.poe_info.as_deref().cloned(),
+            n.voice_vlan
+                .filter(|_| n.capabilities.contains(&Capability::Telephone)),
+        ),
+        _ => (None, None),
+    }
+}
+
+fn is_infra_role(role: DeviceRole) -> bool {
+    matches!(
+        role,
+        DeviceRole::Switch | DeviceRole::Router | DeviceRole::Firewall
+    )
 }
 
 fn neighbor_matches(dev: &Device, n: &CdpLldpNeighbor) -> bool {
@@ -992,14 +1074,19 @@ pub async fn run_scan_with(
             arp_vlan::run_passive_sniffer(&name, own, duration, itx, cancel).await
         })
     });
-    // Passive DHCP fingerprinting over the same window (opt-in: needs raw capture).
+    // Passive DHCP fingerprinting over the same window (opt-in: needs raw capture). Clients
+    // outside the scan targets are attributed by MAC only, so a fingerprint never creates an
+    // out-of-scope row (which enrichment would then actively probe).
     let dhcp_sniffer = cfg.dhcp_fingerprint.then(|| {
-        let (itx, cancel, name) = (itx.clone(), cancel.child_token(), iface.name.clone());
+        let (dtx, drx) = mpsc::channel(EVENT_BUFFER);
+        let relay = tokio::spawn(scope_dhcp_rows(drx, itx.clone(), targets.clone()));
+        let (cancel, name) = (cancel.child_token(), iface.name.clone());
         let own = arp_vlan::local_macs(&all);
         let duration = Duration::from_secs(cfg.listen_secs.max(1));
-        tokio::spawn(async move {
-            dhcp_fp::run_dhcp_fingerprint(&name, own, duration, itx, cancel).await
-        })
+        let sniffer = tokio::spawn(async move {
+            dhcp_fp::run_dhcp_fingerprint(&name, own, duration, dtx, cancel).await
+        });
+        (sniffer, relay)
     });
 
     let vlans = arp_vlan::resolve_vlans(&cfg, &iface, &all, &itx, &cancel).await;
@@ -1118,13 +1205,15 @@ pub async fn run_scan_with(
             }
         }
     }
-    if let Some(handle) = dhcp_sniffer {
+    if let Some((handle, relay)) = dhcp_sniffer {
         if !cancel.is_cancelled() {
             let _ = itx
                 .send(progress(ScanPhase::Listening, Some(&counter)))
                 .await;
         }
-        report_dhcp_result(handle.await, &itx).await;
+        let res = handle.await;
+        let _ = relay.await;
+        report_dhcp_result(res, &itx).await;
     }
 
     drop(itx);
@@ -1135,12 +1224,20 @@ pub async fn run_scan_with(
     // discovery result so updates upsert onto the existing rows.
     let state = run_enrichment(state, &cfg, &iface, &counter, overrides, &tx, &cancel).await?;
 
+    let gateway = tokio::task::spawn_blocking(arp_vlan::default_gateway_v4)
+        .await
+        .ok()
+        .flatten()
+        .map(IpAddr::V4);
     let summary = ScanSummary {
         devices: state.devices.len() as u64,
         vlans: state.vlans.len() as u64,
         neighbors: state.neighbors.len() as u64,
         elapsed_ms: elapsed_ms(started),
         cancelled: cancel.is_cancelled(),
+        interface: Some(iface.name.clone()),
+        gateway,
+        scanner_host: crate::models::local_hostname(),
     };
     let (sent, total) = counter.snapshot();
     let _ = tx
@@ -1153,6 +1250,49 @@ pub async fn run_scan_with(
         .await;
     let _ = tx.send(ScanEvent::Finished(summary.clone())).await;
     Ok(summary)
+}
+
+/// Forward DHCP fingerprint rows, turning clients whose address lies outside `targets` into
+/// MAC-only observations (attached to an existing row by MAC, never creating one).
+async fn scope_dhcp_rows(
+    mut rx: Receiver<ScanEvent>,
+    out: Sender<ScanEvent>,
+    targets: Vec<Ipv4Range>,
+) {
+    while let Some(ev) = rx.recv().await {
+        let ev = match ev {
+            ScanEvent::Device(mut d) => {
+                if !dhcp_ip_in_scope(d.ip, &targets) {
+                    if d.dhcp_server == Some(true) {
+                        let _ = out
+                            .send(ScanEvent::info(format!(
+                                "DHCP server {} answered (outside the scan targets{})",
+                                d.ip,
+                                d.mac
+                                    .as_deref()
+                                    .map(|m| format!(", MAC {m}"))
+                                    .unwrap_or_default()
+                            )))
+                            .await;
+                    }
+                    d.ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+                }
+                ScanEvent::Device(d)
+            }
+            other => other,
+        };
+        if out.send(ev).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// `true` for an address a DHCP fingerprint may key a row on: inside one of the targets.
+fn dhcp_ip_in_scope(ip: IpAddr, targets: &[Ipv4Range]) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_unspecified() && targets.iter().any(|t| t.contains(v4)),
+        IpAddr::V6(_) => false,
+    }
 }
 
 /// Log how the DHCP fingerprint capture ended (count, or why it could not run).
@@ -1707,6 +1847,7 @@ pub async fn run_vlan_discovery_with(
         neighbors: res.neighbors.len() as u64,
         elapsed_ms: elapsed_ms(started),
         cancelled: cancel.is_cancelled(),
+        ..Default::default()
     };
     let _ = tx.send(progress(ScanPhase::Done, None)).await;
     let _ = tx.send(ScanEvent::Finished(summary)).await;
@@ -2462,6 +2603,33 @@ mod tests {
         assert!(state.devices.is_empty());
     }
 
+    /// DHCP fingerprints for addresses outside the scan targets never create rows (review M2).
+    #[tokio::test]
+    async fn out_of_scope_dhcp_rows_become_mac_only() {
+        let (itx, irx) = mpsc::channel(8);
+        let (otx, mut orx) = mpsc::channel(8);
+        let targets = vec![Ipv4Range::from_cidr("10.0.0.0".parse().unwrap(), 24).unwrap()];
+        let relay = tokio::spawn(scope_dhcp_rows(irx, otx, targets));
+        let mut inside = dhcp_obs("aa:00:00:00:00:51", "Windows");
+        inside.ip = "10.0.0.51".parse().unwrap();
+        let mut outside = dhcp_obs("aa:00:00:00:00:52", "Windows");
+        outside.ip = "192.168.50.52".parse().unwrap();
+        itx.send(ScanEvent::device(inside)).await.unwrap();
+        itx.send(ScanEvent::device(outside)).await.unwrap();
+        drop(itx);
+        relay.await.unwrap();
+        let mut ips = Vec::new();
+        while let Some(ScanEvent::Device(d)) = orx.recv().await {
+            ips.push(d.ip.to_string());
+        }
+        assert_eq!(ips, vec!["10.0.0.51", "0.0.0.0"]);
+        // The MAC-only observation creates no row of its own.
+        let mut outside = dhcp_obs("aa:00:00:00:00:52", "Windows");
+        outside.ip = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let state = aggregate_all(vec![ScanEvent::device(outside)]).await;
+        assert!(state.devices.is_empty());
+    }
+
     /// The chosen access port's SNMP PoE and voice VLAN describe the endpoint on it.
     #[tokio::test]
     async fn switch_port_poe_and_voice_vlan_reach_the_endpoint() {
@@ -2511,5 +2679,122 @@ mod tests {
         assert!(apply_neighbor(&mut sw, &sw_adv));
         assert_eq!(sw.role, DeviceRole::Switch);
         assert!(sw.voice_vlan.is_none() && sw.poe.is_none());
+    }
+
+    fn poe(watts: f32, switch: &str, port: &str) -> crate::models::PoeInfo {
+        crate::models::PoeInfo {
+            watts: Some(watts),
+            status: Some("delivering".into()),
+            switch_name: Some(switch.into()),
+            port: Some(port.into()),
+            ..Default::default()
+        }
+    }
+
+    /// PoE / voice VLAN from a provisional switch-port choice must not stay on the device
+    /// after the choice moves to a port without PoE data (review M7).
+    #[tokio::test]
+    async fn stale_poe_cleared_after_port_change() {
+        let mac = "aa:00:00:00:00:31";
+        let mut first = pm("acc-a", "Gi1/0/5", Some(20), mac);
+        first.poe = Some(poe(6.5, "acc-a", "Gi1/0/5"));
+        first.voice_vlan = Some(120);
+        let mut events = vec![
+            ScanEvent::device(dev_with_mac("10.0.20.31", mac, Some(20))),
+            ScanEvent::PortMapping(first),
+        ];
+        // acc-a Gi1/0/5 turns out to be an uplink (60 MACs).
+        for i in 0..60 {
+            events.push(ScanEvent::PortMapping(pm(
+                "acc-a",
+                "Gi1/0/5",
+                Some(20),
+                &format!("bb:00:00:00:00:{i:02x}"),
+            )));
+        }
+        // The real access port (on a switch without PoE data).
+        events.push(ScanEvent::PortMapping(pm(
+            "acc-b",
+            "Gi1/0/9",
+            Some(20),
+            mac,
+        )));
+        let state = aggregate_all(events).await;
+        let d = &state.devices["10.0.20.31@20"];
+        assert_eq!(d.switch_port.as_ref().unwrap().switch_name, "acc-b");
+        assert!(d.poe.is_none(), "stale PoE from acc-a Gi1/0/5: {:?}", d.poe);
+        assert!(
+            d.voice_vlan.is_none(),
+            "stale voice VLAN: {:?}",
+            d.voice_vlan
+        );
+    }
+
+    fn tlv(t: u16, v: &[u8]) -> Vec<u8> {
+        let mut out = ((t << 9) | v.len() as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(v);
+        out
+    }
+
+    /// An IP phone advertising LLDP capabilities Bridge + Telephone (phones with a PC port)
+    /// is an endpoint: it keeps its voice VLAN and PoE (review M8).
+    #[test]
+    fn lldp_phone_with_bridge_capability_is_an_endpoint() {
+        let src = [0xaa, 0, 0, 0, 0, 0x51];
+        let mut f = vec![0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e];
+        f.extend_from_slice(&src);
+        f.extend_from_slice(&0x88ccu16.to_be_bytes());
+        let mut chassis = vec![4];
+        chassis.extend_from_slice(&src);
+        f.extend(tlv(1, &chassis));
+        f.extend(tlv(2, b"\x07LAN"));
+        f.extend(tlv(3, &120u16.to_be_bytes()));
+        f.extend(tlv(5, b"SEP00AA00000051"));
+        f.extend(tlv(6, b"Cisco IP Phone CP-8865"));
+        // System capabilities Bridge|Telephone, enabled Bridge|Telephone.
+        f.extend(tlv(7, &[0x00, 0x24, 0x00, 0x24]));
+        // LLDP-MED network policy: voice, tagged, VLAN 110, priority 5, DSCP 46.
+        let bits: u32 = (1 << 22) | (110 << 9) | (5 << 6) | 46;
+        let b = bits.to_be_bytes();
+        f.extend(tlv(127, &[0x00, 0x12, 0xbb, 2, 1, b[1], b[2], b[3]]));
+        // LLDP-MED extended power: PD, source PSE, priority high, 6.3 W.
+        f.extend(tlv(127, &[0x00, 0x12, 0xbb, 4, 0x52, 0x00, 63]));
+        f.extend(tlv(0, &[]));
+        let n = arp_vlan::parse_lldp(&f, "en0").unwrap();
+        assert!(n.capabilities.contains(&Capability::Telephone));
+        assert_eq!(n.infer_role(), DeviceRole::Host);
+        let mut phone = dev_with_mac("10.0.0.51", "aa:00:00:00:00:51", None);
+        apply_neighbor(&mut phone, &n);
+        assert_eq!(phone.role, DeviceRole::Host);
+        assert_eq!(phone.voice_vlan, Some(110), "phone voice VLAN dropped");
+        assert!(phone.poe.is_some(), "phone PoE dropped");
+    }
+
+    /// A PC daisy-chained behind a phone shares the phone's switch port: only the phone gets
+    /// the port's PoE and voice VLAN, never both (review LOW, engine/models).
+    #[tokio::test]
+    async fn pc_behind_phone_does_not_get_phone_poe() {
+        let port_poe = poe(6.1, "acc", "Gi1/0/7");
+        let mut events = Vec::new();
+        for (ip, mac, vlan) in [
+            ("10.0.110.7", "aa:00:00:00:00:07", 110u16),
+            ("10.0.10.7", "bb:00:00:00:00:07", 10),
+        ] {
+            events.push(ScanEvent::device(dev_with_mac(ip, mac, Some(vlan))));
+            let mut m = pm("acc", "Gi1/0/7", Some(vlan), mac);
+            m.port_index = Some(10007);
+            m.poe = Some(port_poe.clone());
+            m.voice_vlan = Some(110);
+            events.push(ScanEvent::PortMapping(m));
+        }
+        let st = aggregate_all(events).await;
+        let pc = &st.devices["10.0.10.7@10"];
+        let phone = &st.devices["10.0.110.7@110"];
+        assert!(pc.poe.is_none(), "PC got the phone's PoE: {:?}", pc.poe);
+        assert!(pc.voice_vlan.is_none(), "PC got the voice VLAN");
+        assert_eq!(phone.poe.as_ref().and_then(|p| p.watts), Some(6.1));
+        assert_eq!(phone.voice_vlan, Some(110));
+        // Both still map to the shared port.
+        assert_eq!(pc.switch_port.as_ref().unwrap().port_name, "Gi1/0/7");
     }
 }

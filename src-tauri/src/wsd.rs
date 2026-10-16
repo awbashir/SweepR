@@ -15,27 +15,27 @@
 //! SOAP request/response path is tested against a local HTTP responder.
 
 use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use futures::StreamExt;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     limits::SocketBudget,
-    models::{now_ms, sanitize_text, OnvifInfo, MAX_SERVICE_LIST},
+    models::{now_ms, sanitize_text, sanitize_text_max, OnvifInfo, MAX_SERVICE_LIST, MAX_URL_LEN},
     ssdp::{
-        exchange_udp, for_each_xml_text, local_name, parse_http_url, url_host_is, DiscoveryTarget,
-        HttpUrl, CONCURRENT_FETCHES,
+        connect_addr, exchange_udp, for_each_xml_text, host_header, local_name, parse_http_url,
+        read_http_response, url_host_is, DiscoveryTarget, FetchCtx, HttpUrl, CONCURRENT_FETCHES,
     },
 };
+
+/// `XAddrs` of one responder that are queried (after de-duplication).
+const MAX_XADDRS_TRIED: usize = 2;
 
 const WSD_MCAST_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 /// WS-Discovery port.
@@ -98,19 +98,24 @@ pub struct WsdMatch {
 pub fn parse_wsd_match(xml: &[u8]) -> Option<WsdMatch> {
     let mut m = WsdMatch::default();
     for_each_xml_text(xml, |path, value| {
+        // Split the list first, then cap each item (a URL may be long; capping the whole
+        // list would cut URLs / scopes in half).
         let push_words = |list: &mut Vec<String>| {
             for w in value.split_whitespace() {
                 if list.len() >= MAX_SERVICE_LIST {
                     break;
                 }
-                list.push(w.to_string());
+                let w = sanitize_text_max(w, MAX_URL_LEN);
+                if !w.is_empty() && !list.contains(&w) {
+                    list.push(w);
+                }
             }
         };
         match path.last().map(String::as_str) {
             Some("xaddrs") => push_words(&mut m.xaddrs),
-            Some("types") if m.types.is_none() => m.types = Some(value.to_string()),
+            Some("types") if m.types.is_none() => m.types = Some(sanitize_text(value)),
             Some("scopes") => push_words(&mut m.scopes),
-            Some("address") if m.endpoint.is_none() => m.endpoint = Some(value.to_string()),
+            Some("address") if m.endpoint.is_none() => m.endpoint = Some(sanitize_text(value)),
             _ => {}
         }
     });
@@ -218,22 +223,40 @@ pub fn parse_get_device_information(xml: &[u8]) -> OnvifDeviceInformation {
             _ => return,
         };
         if slot.is_none() {
-            *slot = Some(value.to_string());
+            let v = sanitize_text(value);
+            if !v.is_empty() {
+                *slot = Some(v);
+            }
         }
     });
     info
 }
 
+/// Remove `user:password@` from a URL's authority, so camera credentials a device embeds in
+/// its stream URL are never stored, shown or exported.
+pub fn strip_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rfind('@') {
+        Some(i) => format!("{scheme}://{}{tail}", &authority[i + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Extract the first `<tt:Uri>` / `<Uri>` value from an ONVIF `GetStreamUriResponse`, only when
-/// it is an `rtsp://` URL (what the device itself reported; never a guess).
+/// it is an `rtsp://` URL (what the device itself reported; never a guess). Embedded
+/// credentials are stripped.
 pub fn parse_stream_uri(xml: &[u8]) -> Option<String> {
     let mut uri = None;
     for_each_xml_text(xml, |path, value| {
         if uri.is_none()
             && path.last().map(String::as_str) == Some("uri")
-            && value.to_ascii_lowercase().starts_with("rtsp://")
+            && value.trim().to_ascii_lowercase().starts_with("rtsp://")
         {
-            uri = Some(value.to_string());
+            uri = Some(strip_userinfo(&sanitize_text_max(value, MAX_URL_LEN)));
         }
     });
     uri
@@ -297,7 +320,7 @@ pub fn parse_media_xaddr(xml: &[u8]) -> Option<String> {
             && path.last().map(String::as_str) == Some("xaddr")
             && path.iter().any(|p| p == "media")
         {
-            xaddr = Some(value.to_string());
+            xaddr = Some(sanitize_text_max(value, MAX_URL_LEN));
         }
     });
     xaddr
@@ -332,6 +355,11 @@ pub fn first_profile_token(xml: &[u8]) -> Option<String> {
 pub fn rtsp_hints(manufacturer: Option<&str>, model: Option<&str>, host: &str) -> Vec<String> {
     let hay =
         format!("{} {}", manufacturer.unwrap_or(""), model.unwrap_or("")).to_ascii_lowercase();
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     let label = |path: &str| format!("rtsp://{host}:554{path} (guess, no credentials tried)");
     if hay.contains("hikvision") {
         vec![label("/Streaming/Channels/101")]
@@ -354,35 +382,45 @@ pub fn rtsp_hints(manufacturer: Option<&str>, model: Option<&str>, host: &str) -
 
 /// Discover WS-Discovery / ONVIF devices for `window` over IPv4 multicast from the interface
 /// address `v4` and, when `v6_index` is given, IPv6 multicast (`ff02::c` / `ff05::c`), then
-/// query each camera over HTTP (SSRF-guarded, no credentials).
+/// query each camera over HTTP (SSRF-guarded, no credentials). Only replies from `scope` (the
+/// addresses of the devices the scan discovered) are kept and queried; follow-up requests are
+/// bounded per responder and per run ([`FetchCtx`]).
 pub async fn discover_wsd(
     v4: Option<Ipv4Addr>,
     v6_index: Option<u32>,
     window: Duration,
+    scope: &HashSet<IpAddr>,
     budget: &SocketBudget,
     cancel: &CancellationToken,
 ) -> HashMap<IpAddr, OnvifInfo> {
     let payloads = vec![build_probe(&message_id())];
+    let exchange = |t: DiscoveryTarget| {
+        exchange_udp(
+            t,
+            WSD_PORT,
+            WSD_MCAST_V4,
+            &payloads,
+            window,
+            Some(scope),
+            budget,
+            cancel,
+        )
+    };
     let v4_fut = async {
         match v4 {
-            Some(ip) => {
-                let t = DiscoveryTarget::MulticastV4(ip);
-                exchange_udp(t, WSD_PORT, WSD_MCAST_V4, &payloads, window, budget, cancel).await
-            }
+            Some(ip) => exchange(DiscoveryTarget::MulticastV4(ip)).await,
             None => Vec::new(),
         }
     };
     let v6_fut = async {
         match v6_index {
-            Some(index) => {
-                let t = DiscoveryTarget::MulticastV6(index);
-                exchange_udp(t, WSD_PORT, WSD_MCAST_V4, &payloads, window, budget, cancel).await
-            }
+            Some(index) => exchange(DiscoveryTarget::MulticastV6(index)).await,
             None => Vec::new(),
         }
     };
     let (a, b) = tokio::join!(v4_fut, v6_fut);
-    identify_responders(a.into_iter().chain(b), budget, cancel).await
+    let ctx = FetchCtx::run(budget, cancel, v6_index.unwrap_or(0));
+    identify_responders(a.into_iter().chain(b), ctx).await
 }
 
 /// Unicast WS-Discovery probe of one host (`Probe` straight to `ip:3702`), for the drawer.
@@ -394,18 +432,28 @@ pub async fn probe_wsd_host(
 ) -> Option<OnvifInfo> {
     let payloads = vec![build_probe(&message_id())];
     let t = DiscoveryTarget::Unicast(ip);
-    let replies = exchange_udp(t, WSD_PORT, WSD_MCAST_V4, &payloads, window, budget, cancel).await;
-    identify_responders(replies, budget, cancel)
+    let replies = exchange_udp(
+        t,
+        WSD_PORT,
+        WSD_MCAST_V4,
+        &payloads,
+        window,
+        None,
+        budget,
+        cancel,
+    )
+    .await;
+    identify_responders(replies, FetchCtx::run(budget, cancel, 0))
         .await
         .remove(&ip)
 }
 
 /// Parse reply datagrams into per-responder matches and build [`OnvifInfo`] for each, querying
-/// cameras for their identity and (unauthenticated) stream URL.
-async fn identify_responders(
+/// cameras for their identity and (unauthenticated) stream URL within `ctx`'s deadline (and
+/// the per-responder budget).
+pub(crate) async fn identify_responders(
     replies: impl IntoIterator<Item = (IpAddr, Vec<u8>)>,
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> HashMap<IpAddr, OnvifInfo> {
     let mut matches: HashMap<IpAddr, WsdMatch> = HashMap::new();
     for (ip, datagram) in replies {
@@ -414,7 +462,7 @@ async fn identify_responders(
         }
     }
     futures::stream::iter(matches)
-        .map(|(ip, m)| async move { (ip, identify_one(ip, m, budget, cancel).await) })
+        .map(|(ip, m)| async move { (ip, identify_one(ip, m, ctx.responder()).await) })
         .buffer_unordered(CONCURRENT_FETCHES)
         .collect()
         .await
@@ -422,13 +470,9 @@ async fn identify_responders(
 
 /// Build the [`OnvifInfo`] of one responder: cameras get `GetDeviceInformation` and a stream
 /// URI attempt; other WSD devices (Windows hosts, printers) get a WS-Transfer metadata `Get`
-/// for their name / model. All requests go to the responder's own address, unauthenticated.
-async fn identify_one(
-    ip: IpAddr,
-    m: WsdMatch,
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
-) -> OnvifInfo {
+/// for their name / model. All requests go to the responder's own address, unauthenticated,
+/// and stop at `ctx.deadline` (what was learned until then is kept).
+async fn identify_one(ip: IpAddr, m: WsdMatch, ctx: FetchCtx<'_>) -> OnvifInfo {
     let (is_camera, is_windows) = classify_wsd(m.types.as_deref(), &m.scopes);
     let (name, location, hardware) = onvif_from_scopes(&m.scopes);
     let mut info = OnvifInfo {
@@ -442,18 +486,18 @@ async fn identify_one(
         is_windows,
         ..OnvifInfo::default()
     };
-    if cancel.is_cancelled() {
+    if ctx.cancel.is_cancelled() {
         return info;
     }
     if is_camera {
-        if let Some(di) = query_device_information(ip, &m.xaddrs, budget, cancel).await {
+        if let Some(di) = query_device_information(ip, &m.xaddrs, ctx).await {
             info.manufacturer = di.manufacturer.or(info.manufacturer);
             info.model = di.model.or(info.model);
             info.firmware_version = di.firmware_version;
             info.serial_number = di.serial_number;
             info.hardware_id = di.hardware_id.or(info.hardware_id);
         }
-        info.rtsp_url = query_stream_uri(ip, &m.xaddrs, budget, cancel).await;
+        info.rtsp_url = query_stream_uri(ip, &m.xaddrs, ctx).await;
         // Templates only when the device did not report its own stream URL.
         if info.rtsp_url.is_none() {
             info.rtsp_hints = rtsp_hints(
@@ -463,7 +507,7 @@ async fn identify_one(
             );
         }
     } else if let Some(endpoint) = m.endpoint.as_deref().filter(|e| valid_endpoint(e)) {
-        if let Some(meta) = query_metadata(ip, endpoint, &m.xaddrs, budget, cancel).await {
+        if let Some(meta) = query_metadata(ip, endpoint, &m.xaddrs, ctx).await {
             info.name = meta.computer.or(meta.friendly_name).or(info.name);
             info.manufacturer = meta.manufacturer.or(info.manufacturer);
             info.model = meta.model.or(info.model);
@@ -523,9 +567,9 @@ pub fn parse_metadata(xml: &[u8]) -> WsdMetadata {
         let slot = match path.last().map(String::as_str) {
             Some("computer") => {
                 if meta.computer.is_none() {
-                    let name = value.split('/').next().unwrap_or(value).trim();
+                    let name = sanitize_text(value.split('/').next().unwrap_or(value));
                     if !name.is_empty() {
-                        meta.computer = Some(name.to_string());
+                        meta.computer = Some(name);
                     }
                 }
                 return;
@@ -538,7 +582,10 @@ pub fn parse_metadata(xml: &[u8]) -> WsdMetadata {
             _ => return,
         };
         if slot.is_none() {
-            *slot = Some(value.to_string());
+            let v = sanitize_text(value);
+            if !v.is_empty() {
+                *slot = Some(v);
+            }
         }
     });
     meta
@@ -549,13 +596,12 @@ async fn query_metadata(
     responder: IpAddr,
     endpoint: &str,
     xaddrs: &[String],
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> Option<WsdMetadata> {
     let request = build_metadata_get(endpoint, &message_id());
     for url in own_xaddrs(responder, xaddrs) {
         let action = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get";
-        if let Some(body) = soap_call(responder, &url, &request, action, budget, cancel).await {
+        if let Some(body) = soap_call(responder, &url, &request, action, ctx).await {
             let meta = parse_metadata(&body);
             if meta != WsdMetadata::default() {
                 return Some(meta);
@@ -570,13 +616,12 @@ async fn query_metadata(
 async fn query_device_information(
     responder: IpAddr,
     xaddrs: &[String],
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> Option<OnvifDeviceInformation> {
     let request = build_get_device_information();
     for url in own_xaddrs(responder, xaddrs) {
         let action = "http://www.onvif.org/ver10/device/wsdl/GetDeviceInformation";
-        if let Some(body) = soap_call(responder, &url, &request, action, budget, cancel).await {
+        if let Some(body) = soap_call(responder, &url, &request, action, ctx).await {
             let di = parse_get_device_information(&body);
             if !di.is_empty() {
                 return Some(di);
@@ -586,13 +631,23 @@ async fn query_device_information(
     None
 }
 
-/// The device's `XAddrs` that point at the responder itself (SSRF guard), parsed.
+/// The device's `XAddrs` that point at the responder itself (SSRF guard), parsed,
+/// de-duplicated and limited to [`MAX_XADDRS_TRIED`].
 fn own_xaddrs(responder: IpAddr, xaddrs: &[String]) -> Vec<HttpUrl> {
-    xaddrs
+    let mut out: Vec<HttpUrl> = Vec::new();
+    for u in xaddrs
         .iter()
         .filter_map(|x| parse_http_url(x))
         .filter(|u| url_host_is(u, responder))
-        .collect()
+    {
+        if out.len() >= MAX_XADDRS_TRIED {
+            break;
+        }
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    }
+    out
 }
 
 /// Ask the camera, unauthenticated, for its RTSP stream URL: `GetCapabilities` (Media XAddr) →
@@ -602,8 +657,7 @@ fn own_xaddrs(responder: IpAddr, xaddrs: &[String]) -> Vec<HttpUrl> {
 async fn query_stream_uri(
     responder: IpAddr,
     xaddrs: &[String],
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> Option<String> {
     let device = own_xaddrs(responder, xaddrs).into_iter().next()?;
     let caps = soap_call(
@@ -611,8 +665,7 @@ async fn query_stream_uri(
         &device,
         &build_get_capabilities(),
         "http://www.onvif.org/ver10/device/wsdl/GetCapabilities",
-        budget,
-        cancel,
+        ctx,
     )
     .await;
     // The Media service XAddr, when reported and on the same host; else the device service.
@@ -627,8 +680,7 @@ async fn query_stream_uri(
         &media,
         &build_get_profiles(),
         "http://www.onvif.org/ver10/media/wsdl/GetProfiles",
-        budget,
-        cancel,
+        ctx,
     )
     .await?;
     let token = first_profile_token(&profiles)?;
@@ -637,82 +689,71 @@ async fn query_stream_uri(
         &media,
         &build_get_stream_uri(&token),
         "http://www.onvif.org/ver10/media/wsdl/GetStreamUri",
-        budget,
-        cancel,
+        ctx,
     )
     .await?;
     parse_stream_uri(&stream)
 }
 
-/// One SOAP request to `url` on `responder`, holding a socket permit, cancellable.
+/// One SOAP request to `url` on `responder`, holding a socket permit, cancellable and bounded
+/// by `ctx`'s deadline.
 async fn soap_call(
     responder: IpAddr,
     url: &HttpUrl,
     body: &[u8],
     action: &str,
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> Option<Vec<u8>> {
-    if !url_host_is(url, responder) {
+    if !url_host_is(url, responder) || tokio::time::Instant::now() >= ctx.deadline {
         return None;
     }
-    let _permit = budget.acquire().await?;
+    let _permit = ctx.budget.acquire().await?;
     tokio::select! {
-        _ = cancel.cancelled() => None,
-        r = soap_post(responder, url, body, action) => r,
+        _ = ctx.cancel.cancelled() => None,
+        r = tokio::time::timeout_at(
+            ctx.request_deadline(),
+            soap_post(responder, url, body, action, ctx.scope_id),
+        ) => r.ok().flatten(),
     }
 }
 
-/// POST a SOAP request to `ip:url.port` for `url.path`, returning the response body (bounded).
-async fn soap_post(ip: IpAddr, url: &HttpUrl, body: &[u8], action: &str) -> Option<Vec<u8>> {
-    let timeout = Duration::from_secs(4);
-    let fut = async {
-        let mut stream = TcpStream::connect(SocketAddr::new(ip, url.port))
-            .await
-            .ok()?;
-        let req = format!(
-            "POST {} HTTP/1.0\r\nHost: {}:{}\r\n\
-             Content-Type: application/soap+xml; charset=utf-8; action=\"{}\"\r\n\
-             Content-Length: {}\r\nUser-Agent: SweepR/1.0\r\nConnection: close\r\n\r\n",
-            url.path,
-            url.host,
-            url.port,
-            action,
-            body.len()
-        );
-        // One write: some embedded HTTP stacks answer after their first read and close, which
-        // would reset a separate body write.
-        let mut request = req.into_bytes();
-        request.extend_from_slice(body);
-        stream.write_all(&request).await.ok()?;
-        let mut raw = Vec::with_capacity(4096);
-        let mut chunk = [0u8; 4096];
-        let cap = MAX_SOAP_BYTES + 8 * 1024;
-        loop {
-            let n = stream.read(&mut chunk).await.ok()?;
-            if n == 0 {
-                break;
-            }
-            raw.extend_from_slice(&chunk[..n]);
-            if raw.len() >= cap {
-                raw.truncate(cap);
-                break;
-            }
-        }
-        Some(raw)
-    };
-    let raw = tokio::time::timeout(timeout, fut).await.ok()??;
-    // Return the body after the header block (status is not checked: some cameras answer 200,
-    // some 400 with a SOAP fault that still names the device).
-    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let mut body = raw[sep + 4..].to_vec();
-    body.truncate(MAX_SOAP_BYTES);
-    Some(body)
+/// POST a SOAP request to `ip:url.port` for `url.path`, returning the response body (bounded;
+/// `Content-Length` and chunked bodies are honoured). The caller bounds the time.
+async fn soap_post(
+    ip: IpAddr,
+    url: &HttpUrl,
+    body: &[u8],
+    action: &str,
+    scope_id: u32,
+) -> Option<Vec<u8>> {
+    let mut stream = TcpStream::connect(connect_addr(ip, url.port, scope_id))
+        .await
+        .ok()?;
+    let req = format!(
+        "POST {} HTTP/1.0\r\nHost: {}\r\n\
+         Content-Type: application/soap+xml; charset=utf-8; action=\"{}\"\r\n\
+         Content-Length: {}\r\nUser-Agent: SweepR/1.0\r\nConnection: close\r\n\r\n",
+        url.path,
+        host_header(&url.host, url.port),
+        action,
+        body.len()
+    );
+    // One write: some embedded HTTP stacks answer after their first read and close, which
+    // would reset a separate body write.
+    let mut request = req.into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).await.ok()?;
+    // The status is not checked: some cameras answer 200, some 400 with a SOAP fault that
+    // still names the device.
+    read_http_response(&mut stream, MAX_SOAP_BYTES)
+        .await
+        .map(|m| m.body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn message_ids_are_unique_and_well_formed() {
@@ -833,11 +874,11 @@ mod tests {
             }
         });
         let xaddr = format!("http://127.0.0.1:{port}/onvif/device_service");
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
         let di = query_device_information(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &[xaddr],
-            &SocketBudget::new(2),
-            &CancellationToken::new(),
+            FetchCtx::run(&budget, &cancel, 0),
         )
         .await
         .expect("device info query should succeed");
@@ -936,11 +977,12 @@ mod tests {
                 WSD_MCAST_V4,
                 &[build_probe(&message_id())],
                 Duration::from_millis(400),
+                None,
                 &budget,
                 &cancel,
             )
             .await;
-            let map = identify_responders(replies, &budget, &cancel).await;
+            let map = identify_responders(replies, FetchCtx::run(&budget, &cancel, 0)).await;
             let info = &map[&IpAddr::V4(Ipv4Addr::LOCALHOST)];
             assert!(info.is_camera && !info.is_windows);
             assert_eq!(info.manufacturer.as_deref(), Some("HIKVISION"));
@@ -1019,13 +1061,102 @@ mod tests {
     #[tokio::test]
     async fn device_query_refuses_foreign_xaddr_host() {
         // XAddr host 10.0.0.1 but responder 127.0.0.1: skipped (no connection).
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
         let di = query_device_information(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &["http://10.0.0.1/onvif/device_service".to_string()],
-            &SocketBudget::new(2),
-            &CancellationToken::new(),
+            FetchCtx::run(&budget, &cancel, 0),
         )
         .await;
         assert!(di.is_none());
+    }
+
+    /// Lists are split before each item is capped, so long XAddrs / ONVIF scopes survive
+    /// (review M5); duplicates are dropped.
+    #[test]
+    fn long_xaddr_and_scope_lists_are_split_before_capping() {
+        let many: String = (0..200)
+            .map(|i| format!("http://10.0.0.5:{}/onvif/device_service ", 1000 + i))
+            .collect();
+        let long_scope = format!("onvif://www.onvif.org/name/{}", "N".repeat(400));
+        let xml = format!(
+            "<a><d:XAddrs>{many} http://10.0.0.5:1000/onvif/device_service</d:XAddrs>\
+             <d:Scopes>{long_scope} onvif://www.onvif.org/location/Lobby</d:Scopes></a>"
+        );
+        let m = parse_wsd_match(xml.as_bytes()).unwrap();
+        assert_eq!(m.xaddrs.len(), MAX_SERVICE_LIST);
+        assert!(m
+            .xaddrs
+            .iter()
+            .all(|x| x.ends_with("/onvif/device_service")));
+        assert_eq!(m.scopes.len(), 2);
+        assert_eq!(m.scopes[0], long_scope);
+        let (_, location, _) = onvif_from_scopes(&m.scopes);
+        assert_eq!(location.as_deref(), Some("Lobby"));
+        // At most two distinct own XAddrs are queried.
+        let own = own_xaddrs(
+            "10.0.0.5".parse().unwrap(),
+            &[
+                "http://10.0.0.5/a".to_string(),
+                "http://10.0.0.5/a".to_string(),
+                "http://10.0.0.9/x".to_string(),
+                "http://10.0.0.5/b".to_string(),
+                "http://10.0.0.5/c".to_string(),
+            ],
+        );
+        let paths: Vec<&str> = own.iter().map(|u| u.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn stream_uri_credentials_are_stripped() {
+        let rtsp = b"<e><tt:Uri>rtsp://admin:Secret123@10.0.0.5:554/live?x=1</tt:Uri></e>";
+        let uri = parse_stream_uri(rtsp).unwrap();
+        assert_eq!(uri, "rtsp://10.0.0.5:554/live?x=1");
+        assert!(!uri.contains("Secret123"));
+        assert_eq!(strip_userinfo("rtsp://10.0.0.5/a@b"), "rtsp://10.0.0.5/a@b");
+        // IPv6 hosts are bracketed in the templates.
+        assert!(rtsp_hints(None, None, "fe80::1")[0].starts_with("rtsp://[fe80::1]:554/"));
+    }
+
+    /// A camera that accepts connections on many XAddrs but never answers is bounded by the
+    /// per-responder deadline (review M4).
+    #[tokio::test]
+    async fn stalled_camera_is_bounded() {
+        let http = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = http.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        let stall = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = http.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                held.push(s);
+            }
+        });
+        let xaddrs: String = (0..20)
+            .map(|i| format!("http://127.0.0.1:{port}/onvif/device_service{i} "))
+            .collect();
+        let reply = String::from_utf8_lossy(CAMERA_MATCH)
+            .replace("http://192.168.1.50/onvif/device_service", &xaddrs);
+        let (budget, cancel) = (SocketBudget::new(8), CancellationToken::new());
+        let ctx = FetchCtx {
+            deadline: tokio::time::Instant::now() + Duration::from_millis(1500),
+            ..FetchCtx::run(&budget, &cancel, 0)
+        };
+        let started = std::time::Instant::now();
+        let map = identify_responders(
+            vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), reply.into_bytes())],
+            ctx,
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(4), "took {took:?}");
+        let info = &map[&IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        assert!(info.is_camera && info.manufacturer.is_none());
+        assert!(accepted.load(Ordering::Relaxed) <= MAX_XADDRS_TRIED + 1);
+        stall.abort();
     }
 }

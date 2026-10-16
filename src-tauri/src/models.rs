@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Default TCP ports probed for management-plane fingerprinting.
-pub const DEFAULT_PORTS: &[u16] = &[22, 23, 80, 161, 443, 445, 8291, 8443, 10443];
+/// Includes SIP (5060, so PBXes / phones become SIP OPTIONS candidates) and the common
+/// alternate web ports 8000 / 8080 (web identity, HTTP-only management checks).
+pub const DEFAULT_PORTS: &[u16] = &[
+    22, 23, 80, 161, 443, 445, 5060, 8000, 8080, 8291, 8443, 10443,
+];
 
 /// Highest usable IEEE 802.1Q VLAN ID (4095 is reserved, 0 means "priority tag only").
 pub const MAX_VLAN_ID: u16 = 4094;
@@ -37,6 +41,8 @@ pub enum ModelError {
 
 /// Longest string kept from any network-supplied text field (CDP/LLDP/VTP, names).
 pub const MAX_TEXT_LEN: usize = 256;
+/// Longest URL kept from network-supplied data (SSDP `LOCATION`, WSD `XAddrs`, ONVIF URIs).
+pub const MAX_URL_LEN: usize = 2048;
 
 /// `true` for Unicode bidirectional / zero-width format characters that can make text
 /// display differently from its content ("Trojan Source" style spoofing).
@@ -54,7 +60,13 @@ fn is_bidi_or_invisible(c: char) -> bool {
 /// bidi/zero-width format characters are removed. Leading/trailing whitespace and NULs are
 /// trimmed and the result is capped at [`MAX_TEXT_LEN`] characters.
 pub fn sanitize_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len().min(MAX_TEXT_LEN));
+    sanitize_text_max(s, MAX_TEXT_LEN)
+}
+
+/// [`sanitize_text`] with a custom length cap (in characters), for fields that are
+/// legitimately longer than a name, e.g. URLs (see [`MAX_URL_LEN`]).
+pub fn sanitize_text_max(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_chars));
     let mut chars = 0usize;
     for c in s.chars() {
         let c = match c {
@@ -62,7 +74,7 @@ pub fn sanitize_text(s: &str) -> String {
             c if c.is_control() || is_bidi_or_invisible(c) => continue,
             c => c,
         };
-        if chars == MAX_TEXT_LEN {
+        if chars == max_chars {
             break;
         }
         out.push(c);
@@ -587,6 +599,11 @@ impl CdpLldpNeighbor {
         if has(Capability::WlanAccessPoint) || (ap_keyword && !not_ap) {
             return DeviceRole::AccessPoint;
         }
+        // IP phones with a PC port advertise Bridge (+ Telephone): they are endpoints, not
+        // switches. Telephone together with Router is a voice gateway / router.
+        if has(Capability::Telephone) && !has(Capability::Router) {
+            return DeviceRole::Host;
+        }
         // L3 switches advertise Router + Switch: treat them as switches.
         if has(Capability::Switch)
             || any(&[
@@ -749,9 +766,11 @@ pub struct PoeInfo {
     pub max_watts: Option<f32>,
     /// IEEE PoE class (0-4, or 5-8 for 802.3bt).
     pub class: Option<u8>,
-    /// `delivering` / `searching` / `disabled` / `fault` / `other`.
+    /// `delivering` / `searching` / `disabled` / `fault` / `test` (POWER-ETHERNET-MIB
+    /// detection status).
     pub status: Option<String>,
-    /// PSE power source (`primary` / `backup` / `pse` …) from LLDP-MED / CDP.
+    /// Power source from the PD's point of view (`pse` / `local` / `pse+local`), from the
+    /// LLDP-MED / 802.3at power TLVs.
     pub source: Option<String>,
     /// Power priority (`critical` / `high` / `low`) from LLDP-MED / CDP.
     pub priority: Option<String>,
@@ -817,6 +836,25 @@ pub struct DhcpFingerprint {
 // ---------------------------------------------------------------------------------------------
 // Device
 // ---------------------------------------------------------------------------------------------
+
+impl DhcpFingerprint {
+    /// How much a fingerprint says: confidence of the OS match first, then the raw evidence.
+    pub fn evidence_rank(&self) -> (u8, bool, usize, bool, bool) {
+        let confidence = match self.confidence.as_deref() {
+            Some("high") => 3,
+            Some("medium") => 2,
+            Some("low") => 1,
+            _ => 0,
+        };
+        (
+            confidence,
+            self.os.is_some(),
+            self.param_list.len(),
+            self.vendor_class.is_some(),
+            self.hostname.is_some(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -886,6 +924,14 @@ pub struct Device {
     /// Problems worth flagging (expired / expiring / self-signed certificates, ...).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// `true` when the passive DHCP capture saw this host answer as a DHCP server
+    /// (OFFER / ACK). Feeds the rogue-DHCP audit rule. Additive.
+    #[serde(default)]
+    pub dhcp_server: Option<bool>,
+    /// `true` when this host sent an IPv6 router advertisement during the scan. Feeds the
+    /// rogue-RA audit rule. Additive.
+    #[serde(default)]
+    pub ipv6_router: Option<bool>,
 }
 
 /// Most warnings kept on one device (hostile-input bound).
@@ -928,6 +974,8 @@ impl Device {
             tls_cert: None,
             web_identity: None,
             warnings: Vec::new(),
+            dhcp_server: None,
+            ipv6_router: None,
         }
     }
 
@@ -996,9 +1044,28 @@ impl Device {
             ssdp,
             onvif,
             sip,
-            poe,
-            dhcp_fingerprint
+            poe
         );
+        // Role observations: once seen, they stick.
+        for (mine, theirs) in [
+            (&mut self.dhcp_server, other.dhcp_server),
+            (&mut self.ipv6_router, other.ipv6_router),
+        ] {
+            if theirs == Some(true) || mine.is_none() {
+                *mine = mine.filter(|v| *v).or(theirs);
+            }
+        }
+        // DHCP fingerprint: the observation with more evidence wins (an early DISCOVER with
+        // nothing matched must not shadow a later, identified REQUEST).
+        if let Some(o) = &other.dhcp_fingerprint {
+            if self
+                .dhcp_fingerprint
+                .as_ref()
+                .is_none_or(|s| o.evidence_rank() > s.evidence_rank())
+            {
+                self.dhcp_fingerprint = Some(o.clone());
+            }
+        }
         // Live statistics: the newest snapshot wins.
         match (&mut self.latency, &other.latency) {
             (None, Some(o)) => self.latency = Some(o.clone()),
@@ -1698,7 +1765,7 @@ pub enum LogLevel {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanSummary {
     pub devices: u64,
@@ -1706,6 +1773,76 @@ pub struct ScanSummary {
     pub neighbors: u64,
     pub elapsed_ms: u64,
     pub cancelled: bool,
+    /// Interface the scan ran on (full scans only; additive, for report metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// The scanning host's IPv4 default gateway, when known (full scans only; additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<IpAddr>,
+    /// The scanning host's name (full scans only; additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanner_host: Option<String>,
+}
+
+/// This machine's host name (sanitized), for report metadata.
+pub fn local_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for `buf.len()` bytes; gethostname NUL-terminates on success
+    // (or truncates; we stop at the first NUL or the end of the buffer).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = sanitize_text(&String::from_utf8_lossy(&buf[..end]));
+    (!name.is_empty()).then_some(name)
+}
+
+/// The outcome of polling one SNMP agent during a scan (`snmp_agent` event). Carries the
+/// community *class* only (`public` / `private` / `custom` / `none`, or `v3`), never the
+/// community or SNMPv3 credentials. Additive: consumers that do not know the event ignore it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SnmpAgentStatus {
+    pub ip: Option<IpAddr>,
+    /// `v1`, `v2c` or `v3`.
+    pub version: String,
+    /// `public`, `private`, `custom`, `none` (v1/v2c) or `v3`.
+    pub community_class: String,
+    /// The agent returned data.
+    pub answered: bool,
+    /// Some table walks failed or were cut short.
+    pub partial: bool,
+    pub sys_name: Option<String>,
+    pub sys_descr: Option<String>,
+    pub role: Option<DeviceRole>,
+    /// Switch-wide PoE budget, when the agent answered POWER-ETHERNET-MIB.
+    pub poe_budget: Option<PoeBudget>,
+    /// Why the result is partial (at most a few lines).
+    pub warnings: Vec<String>,
+}
+
+impl SnmpConfig {
+    /// The community class of this configuration (never the community itself).
+    pub fn community_class(&self) -> &'static str {
+        if self.version == SnmpVersion::V3 {
+            return "v3";
+        }
+        match self.community.trim() {
+            "" => "none",
+            "public" => "public",
+            "private" => "private",
+            _ => "custom",
+        }
+    }
+
+    pub fn version_label(&self) -> &'static str {
+        match self.version {
+            SnmpVersion::V1 => "v1",
+            SnmpVersion::V2c => "v2c",
+            SnmpVersion::V3 => "v3",
+        }
+    }
 }
 
 /// Messages streamed while a scan runs. Serialized as `{ "type": "...", "data": ... }`.
@@ -1717,6 +1854,9 @@ pub enum ScanEvent {
     Vlan(VlanInfo),
     Neighbor(CdpLldpNeighbor),
     PortMapping(SwitchPortMapping),
+    /// One SNMP agent polled (answered or not), with its PoE budget. Added in the roadmap
+    /// review; older consumers ignore it.
+    SnmpAgent(Box<SnmpAgentStatus>),
     Progress(ScanProgress),
     Log {
         level: LogLevel,
@@ -1806,8 +1946,16 @@ pub struct LatencySample {
     pub jitter_ms: Option<f64>,
     pub sent: u32,
     pub received: u32,
-    /// The window, oldest first (`null` = lost), for sparklines.
-    pub history: Vec<Option<f64>>,
+    /// The whole window, oldest first (`null` = lost), for sparklines. In `latency-update`
+    /// events it is sent on a host's first update and then at most every
+    /// `latency::HISTORY_RESEND` (absent in between; consumers keep their own history from
+    /// `newSamples`). Always present in final / CLI results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<Option<f64>>>,
+    /// Live updates only: every sample taken since the host's previous update, oldest first
+    /// (`null` = lost; usually one).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_samples: Vec<Option<f64>>,
 }
 
 impl LatencySample {
@@ -2136,6 +2284,10 @@ pub struct WakeResult {
     /// Interface the packets were sent from (when one was chosen).
     pub interface: Option<String>,
     pub source_ip: Option<IpAddr>,
+    /// Destinations that could not be sent to, as `addr:port: error` (additive; empty when
+    /// every send succeeded).
+    #[serde(default)]
+    pub failures: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2145,6 +2297,34 @@ pub struct WakeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An early, unmatched DHCP fingerprint must not shadow a later identified one (review
+    /// M2), whichever order they merge in.
+    #[test]
+    fn merge_prefers_the_dhcp_fingerprint_with_more_evidence() {
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut early = Device::new(ip);
+        early.dhcp_fingerprint = Some(DhcpFingerprint::default());
+        let mut later = Device::new(ip);
+        later.dhcp_fingerprint = Some(DhcpFingerprint {
+            os: Some("Windows".into()),
+            confidence: Some("high".into()),
+            param_list: vec![1, 3, 6],
+            ..Default::default()
+        });
+        let mut a = early.clone();
+        a.merge(&later);
+        assert_eq!(
+            a.dhcp_fingerprint.as_ref().unwrap().os.as_deref(),
+            Some("Windows")
+        );
+        let mut b = later.clone();
+        b.merge(&early);
+        assert_eq!(
+            b.dhcp_fingerprint.as_ref().unwrap().os.as_deref(),
+            Some("Windows")
+        );
+    }
 
     fn ip4(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
@@ -2804,7 +2984,8 @@ mod tests {
             jitter_ms: None,
             sent: 2,
             received: 1,
-            history: vec![Some(1.0), None],
+            history: Some(vec![Some(1.0), None]),
+            new_samples: vec![None],
         };
         let v = serde_json::to_value(LatencyUpdate {
             monitor_id: 3,
@@ -2815,6 +2996,12 @@ mod tests {
         assert_eq!(v["samples"][0]["rttMs"], serde_json::Value::Null);
         assert_eq!(v["samples"][0]["method"], "tcp");
         assert_eq!(v["samples"][0]["history"][1], serde_json::Value::Null);
+        assert_eq!(v["samples"][0]["newSamples"][0], serde_json::Value::Null);
+        // Without a history (live update in between resends) the key is absent.
+        let mut delta = sample.clone();
+        delta.history = None;
+        let v = serde_json::to_value(&delta).unwrap();
+        assert!(v.get("history").is_none());
         let stats = sample.stats();
         assert_eq!((stats.updated_ms, stats.sent, stats.last_ms), (5, 2, None));
     }

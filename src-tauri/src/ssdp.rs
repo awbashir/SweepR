@@ -1,10 +1,12 @@
 //! SSDP / UPnP discovery (UDP 1900).
 //!
 //! Sends SSDP `M-SEARCH` requests to the `239.255.255.250:1900` multicast group (and the IPv6
-//! groups when enabled), collects the responders for a bounded window, then fetches each
-//! device's description XML — but **only** when the `LOCATION` URL's host is the IP that
-//! answered, over plain HTTP, with a size cap, a timeout and same-origin redirects only. This
-//! closes the obvious SSRF: a hostile responder cannot point `LOCATION` at an internal service.
+//! groups when enabled), collects the responders for a bounded window, keeps only responders
+//! whose address belongs to a device the scan discovered (the scan scope), then fetches each
+//! one's description XML — but **only** when the `LOCATION` URL's host is the IP that
+//! answered, over plain HTTP, with a size cap, per-request / per-responder / per-run
+//! deadlines and same-origin redirects only. A hostile responder cannot point `LOCATION` at
+//! an internal service, and out-of-scope (or spoofed out-of-scope) responders get no request.
 //!
 //! The XML is parsed with a hardened `quick-xml` pull reader (no DTD / entity expansion, so a
 //! "billion laughs" description cannot blow up memory) into model / serial / service data, and
@@ -12,7 +14,7 @@
 //! SSRF-guarded fetch is tested against a local HTTP responder.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     time::Duration,
 };
@@ -20,15 +22,79 @@ use std::{
 use futures::StreamExt;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     limits::SocketBudget,
-    models::{sanitize_text, SsdpInfo, MAX_SERVICE_LIST},
+    models::{sanitize_text, sanitize_text_max, SsdpInfo, MAX_SERVICE_LIST, MAX_URL_LEN},
 };
+
+/// Time one responder's follow-up requests (description fetch, SOAP calls) may take in total.
+pub(crate) const PER_RESPONDER_BUDGET: Duration = Duration::from_secs(6);
+/// Time all follow-up requests of one discovery run may take after the listen window.
+pub(crate) const PER_RUN_BUDGET: Duration = Duration::from_secs(12);
+/// Timeout of one HTTP request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// What follow-up HTTP requests of a discovery run may do: the socket budget, cancellation,
+/// the deadline they must finish by, and the interface index used as the scope of IPv6
+/// link-local addresses.
+#[derive(Clone, Copy)]
+pub(crate) struct FetchCtx<'a> {
+    pub budget: &'a SocketBudget,
+    pub cancel: &'a CancellationToken,
+    pub deadline: Instant,
+    pub scope_id: u32,
+}
+
+impl<'a> FetchCtx<'a> {
+    /// A run context whose deadline is [`PER_RUN_BUDGET`] from now.
+    pub fn run(budget: &'a SocketBudget, cancel: &'a CancellationToken, scope_id: u32) -> Self {
+        FetchCtx {
+            budget,
+            cancel,
+            deadline: Instant::now() + PER_RUN_BUDGET,
+            scope_id,
+        }
+    }
+
+    /// The context of one responder: [`PER_RESPONDER_BUDGET`] from now, never past the run
+    /// deadline.
+    pub fn responder(self) -> Self {
+        FetchCtx {
+            deadline: self.deadline.min(Instant::now() + PER_RESPONDER_BUDGET),
+            ..self
+        }
+    }
+
+    /// The deadline of one request started now.
+    pub fn request_deadline(&self) -> Instant {
+        self.deadline.min(Instant::now() + REQUEST_TIMEOUT)
+    }
+}
+
+/// Socket address for `ip:port`, giving IPv6 link-local addresses the interface scope.
+pub(crate) fn connect_addr(ip: IpAddr, port: u16, scope_id: u32) -> SocketAddr {
+    match ip {
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => {
+            SocketAddrV6::new(v6, port, 0, scope_id).into()
+        }
+        _ => SocketAddr::new(ip, port),
+    }
+}
+
+/// `host:port` for a `Host` header, bracketing IPv6 literals.
+pub(crate) fn host_header(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 /// IPv4 SSDP multicast group.
 const SSDP_MCAST_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -39,6 +105,10 @@ const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
 const MAX_DATAGRAM: usize = 64 * 1024;
 /// Responders processed per discovery run (bounds work on a hostile segment).
 const MAX_RESPONDERS: usize = 512;
+/// Datagrams kept per responder (only the first headers / match of each are used).
+const MAX_DATAGRAMS_PER_RESPONDER: usize = 32;
+/// Reply bytes kept per discovery exchange (hostile-input memory bound).
+const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 /// Redirects followed while fetching a description (same-origin only).
 const MAX_REDIRECTS: u8 = 3;
 
@@ -70,11 +140,14 @@ pub struct SsdpHeaders {
 /// Parse an SSDP response / NOTIFY (an HTTP-style message) into its headers. Header names are
 /// matched case-insensitively; values are sanitized and length-capped.
 pub fn parse_ssdp_response(buf: &[u8]) -> Option<SsdpHeaders> {
-    let text = std::str::from_utf8(buf).ok()?;
-    let mut lines = text.split("\r\n");
+    // Non-UTF-8 bytes (Latin-1 server strings) are tolerated.
+    let text = String::from_utf8_lossy(buf);
+    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     let start = lines.next()?;
-    // Accept either an M-SEARCH response (`HTTP/1.1 200 OK`) or a NOTIFY advertisement.
-    let ok = start.starts_with("HTTP/1.1 200") || start.starts_with("NOTIFY");
+    // Accept an M-SEARCH response (`HTTP/1.1 200 OK`, also HTTP/1.0) or a NOTIFY advert.
+    let ok = start.starts_with("HTTP/1.1 200")
+        || start.starts_with("HTTP/1.0 200")
+        || start.starts_with("NOTIFY");
     if !ok {
         return None;
     }
@@ -83,14 +156,20 @@ pub fn parse_ssdp_response(buf: &[u8]) -> Option<SsdpHeaders> {
         if line.is_empty() {
             break;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        let Some((name, raw)) = line.split_once(':') else {
             continue;
         };
-        let value = sanitize_text(value.trim());
+        let name = name.trim().to_ascii_uppercase();
+        // URLs keep their full length; other values are names.
+        let value = if name == "LOCATION" {
+            sanitize_text_max(raw.trim(), MAX_URL_LEN)
+        } else {
+            sanitize_text(raw.trim())
+        };
         if value.is_empty() {
             continue;
         }
-        match name.trim().to_ascii_uppercase().as_str() {
+        match name.as_str() {
             "LOCATION" => h.location = Some(value),
             "SERVER" => h.server = Some(value),
             "ST" | "NT" => {
@@ -150,11 +229,116 @@ pub fn url_host_is(url: &HttpUrl, responder: IpAddr) -> bool {
         .unwrap_or(false)
 }
 
-/// Classify the device kind from the parsed description (deviceType URN plus model / server
-/// text). Returns a coarse `device_kind` label, or `None` when nothing matches.
+/// Lowercase alphanumeric words of `text` (word-boundary matching: "panasonic" is not "nas",
+/// "duplex" is not "plex").
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// `true` when the word sequence of `needle` occurs in `hay` (whole words, in order).
+fn has_phrase(hay: &[String], needle: &str) -> bool {
+    let n = words(needle);
+    !n.is_empty() && hay.windows(n.len()).any(|w| w == n.as_slice())
+}
+
+/// The UPnP device type name of a `urn:<domain>:device:<Type>:<version>` URN, lowercased.
+fn upnp_device_type(urn: &str) -> Option<String> {
+    let mut parts = urn.split(':');
+    while let Some(p) = parts.next() {
+        if p.eq_ignore_ascii_case("device") {
+            return parts
+                .next()
+                .filter(|t| !t.is_empty())
+                .map(str::to_ascii_lowercase);
+        }
+    }
+    None
+}
+
+/// Text keywords per kind, most specific first (whole-word phrases).
+const KIND_WORDS: &[(&str, &[&str])] = &[
+    (
+        "camera",
+        &[
+            "network camera",
+            "ip camera",
+            "ipcamera",
+            "network video",
+            "hikvision",
+            "dahua",
+            "axis",
+            "onvif",
+            "nvr",
+        ],
+    ),
+    (
+        "printer",
+        &[
+            "printer",
+            "multi function printer",
+            "mfp",
+            "laserjet",
+            "officejet",
+            "deskjet",
+            "jetdirect",
+            "ipp",
+            "printbasic",
+        ],
+    ),
+    ("scanner", &["scanner"]),
+    (
+        "tv",
+        &[
+            "tv",
+            "smart tv",
+            "television",
+            "bravia",
+            "aquos",
+            "webos",
+            "tizen",
+            "android tv",
+            "roku",
+            "appletv",
+            "apple tv",
+            "chromecast",
+            "shield",
+        ],
+    ),
+    (
+        "nas",
+        &[
+            "nas",
+            "synology",
+            "qnap",
+            "diskstation",
+            "readynas",
+            "wd my cloud",
+            "truenas",
+            "terramaster",
+        ],
+    ),
+    (
+        "media_server",
+        &[
+            "media server",
+            "plex",
+            "jellyfin",
+            "emby",
+            "minidlna",
+            "dlna server",
+        ],
+    ),
+];
+
+/// Classify the device kind from the parsed description: the UPnP device type URN first
+/// (`InternetGatewayDevice`, `MediaServer`, `MediaRenderer`, `Printer`, ...), refined by the
+/// identity text, then the identity text alone. Keywords match whole words only. Returns a
+/// coarse `device_kind` label, or `None` when nothing matches.
 pub fn classify_ssdp_kind(info: &SsdpInfo) -> Option<String> {
-    let hay = [
-        info.device_type.as_deref(),
+    let text = [
         info.model_name.as_deref(),
         info.model_description.as_deref(),
         info.friendly_name.as_deref(),
@@ -164,82 +348,49 @@ pub fn classify_ssdp_kind(info: &SsdpInfo) -> Option<String> {
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
-    .join(" ")
-    .to_ascii_lowercase();
-    let any = |ns: &[&str]| ns.iter().any(|n| hay.contains(n));
-
-    let kind = if any(&["internetgatewaydevice", "wandevice", "wanconnectiondevice"]) {
-        "igd_router"
-    } else if any(&[
-        "mediaserver",
-        "contentdirectory",
-        "mediarenderer",
-        "dlna",
-        "plex",
-        "jellyfin",
-        "emby",
-    ]) {
-        "media_server"
-    } else if any(&[
-        "printer",
-        "printbasic",
-        "ipp",
-        "jetdirect",
-        "laserjet",
-        "officejet",
-    ]) {
-        "printer"
-    } else if any(&["scanner", "scan:"]) {
-        "scanner"
-    } else if any(&[
-        "tvdevice",
-        " tv ",
-        "smart tv",
-        "bravia",
-        "aquos",
-        "webos",
-        "tizen",
-        "android tv",
-        "roku",
-        "appletv",
-        "apple tv",
-        "chromecast",
-        "shield",
-    ]) {
-        "tv"
-    } else if any(&[
-        "synology",
-        "qnap",
-        "diskstation",
-        "nas",
-        "readynas",
-        "western digital",
-        "wd my cloud",
-        "truenas",
-    ]) {
-        "nas"
-    } else if any(&[
-        "camera",
-        "ipcamera",
-        "network video",
-        "hikvision",
-        "dahua",
-        "axis",
-        "onvif",
-    ]) {
-        "camera"
-    } else {
-        return None;
+    .join(" ");
+    let hay = words(&text);
+    let is = |kind: &str| {
+        KIND_WORDS
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .is_some_and(|(_, ws)| ws.iter().any(|w| has_phrase(&hay, w)))
     };
-    Some(kind.to_string())
+    let urn_type = info
+        .device_type
+        .as_deref()
+        .or(info.search_target.as_deref())
+        .and_then(upnp_device_type);
+    let by_type = match urn_type.as_deref() {
+        Some("internetgatewaydevice" | "wandevice" | "wanconnectiondevice") => Some("igd_router"),
+        Some("printer") => Some("printer"),
+        Some("scanner") => Some("scanner"),
+        Some("digitalsecuritycamera") => Some("camera"),
+        // A NAS or TV that also shares media is a NAS / TV.
+        Some("mediaserver") if is("nas") => Some("nas"),
+        Some("mediaserver") if is("tv") => Some("tv"),
+        Some("mediaserver") => Some("media_server"),
+        // Renderers play media: TVs, speakers (Sonos), receivers; not media servers.
+        Some("mediarenderer") if is("tv") => Some("tv"),
+        Some("mediarenderer" | "zoneplayer") => Some("media_player"),
+        _ => None,
+    };
+    if let Some(kind) = by_type {
+        return Some(kind.to_string());
+    }
+    KIND_WORDS
+        .iter()
+        .find(|(_, ws)| ws.iter().any(|w| has_phrase(&hay, w)))
+        .map(|(k, _)| (*k).to_string())
 }
 
 /// Deepest element nesting the XML walker follows (hostile-input bound).
 const MAX_XML_DEPTH: usize = 64;
 /// Events processed per document (hostile-input bound; documents are also size-capped).
 const MAX_XML_EVENTS: usize = 100_000;
-/// Text accumulated for one element before further text is dropped.
-const MAX_XML_TEXT: usize = 4096;
+/// Text accumulated for one element before further text is dropped (an element may hold a
+/// list of URLs, e.g. WS-Discovery `XAddrs`).
+pub(crate) const MAX_XML_TEXT: usize = 16 * 1024;
 
 /// Resolve an entity reference the hardened walker allows: the five XML predefined entities
 /// and numeric character references. Everything else (entities a DTD would define) is dropped,
@@ -270,11 +421,21 @@ pub(crate) fn local_name(name: &str) -> String {
 /// Walk an XML document with a hardened pull reader and call `f(path, text)` for each run of
 /// text directly inside an element (`path` = lowercase local names from the root). DTDs are
 /// ignored, only predefined / numeric entity references are resolved, and depth, event count
-/// and per-element text are bounded. Text is sanitized before `f` sees it. Malformed input
-/// simply ends the walk.
+/// and per-element text are bounded. Control characters are removed before `f` sees the text,
+/// but it is only capped at [`MAX_XML_TEXT`]: callers split lists first and then cap each
+/// value ([`sanitize_text`] for names, [`MAX_URL_LEN`] for URLs). Non-UTF-8 documents are
+/// decoded lossily. Malformed input simply ends the walk.
 pub(crate) fn for_each_xml_text(xml: &[u8], mut f: impl FnMut(&[String], &str)) {
     use quick_xml::{events::Event, Reader};
 
+    let lossy;
+    let xml = match std::str::from_utf8(xml) {
+        Ok(_) => xml,
+        Err(_) => {
+            lossy = String::from_utf8_lossy(xml).into_owned();
+            lossy.as_bytes()
+        }
+    };
     let mut reader = Reader::from_reader(xml);
     // No per-event trimming: text split around entity references must keep its spaces (the
     // accumulated text is trimmed once, in `flush`).
@@ -285,7 +446,7 @@ pub(crate) fn for_each_xml_text(xml: &[u8], mut f: impl FnMut(&[String], &str)) 
     let mut buf = Vec::new();
     let mut flush = |path: &[String], text: &mut String| {
         if !text.trim().is_empty() {
-            let value = sanitize_text(text);
+            let value = sanitize_text_max(text, MAX_XML_TEXT);
             if !value.is_empty() {
                 f(path, &value);
             }
@@ -333,7 +494,14 @@ pub fn parse_device_description(xml: &[u8]) -> SsdpInfo {
         let Some(tag) = path.last() else { return };
         let set = |slot: &mut Option<String>| {
             if slot.is_none() {
-                *slot = Some(value.to_string());
+                let v = if tag == "presentationurl" {
+                    sanitize_text_max(value, MAX_URL_LEN)
+                } else {
+                    sanitize_text(value)
+                };
+                if !v.is_empty() {
+                    *slot = Some(v);
+                }
             }
         };
         match tag.as_str() {
@@ -346,11 +514,11 @@ pub fn parse_device_description(xml: &[u8]) -> SsdpInfo {
             "devicetype" if in_device => set(&mut info.device_type),
             "udn" if in_device => set(&mut info.udn),
             "presentationurl" if in_device => set(&mut info.presentation_url),
-            "servicetype"
-                if info.services.len() < MAX_SERVICE_LIST
-                    && !info.services.iter().any(|s| s == value) =>
-            {
-                info.services.push(value.to_string());
+            "servicetype" if info.services.len() < MAX_SERVICE_LIST => {
+                let v = sanitize_text(value);
+                if !v.is_empty() && !info.services.contains(&v) {
+                    info.services.push(v);
+                }
             }
             _ => {}
         }
@@ -407,14 +575,18 @@ fn discovery_socket(target: DiscoveryTarget) -> std::io::Result<UdpSocket> {
 }
 
 /// Send each of `payloads` to `port` on `target` (both IPv6 groups for `MulticastV6`), then
-/// collect reply datagrams for `window`: at most `max_sources` distinct responders, and for a
-/// unicast target only datagrams from that host. Holds one socket permit for the exchange.
+/// collect reply datagrams for `window`: at most [`MAX_RESPONDERS`] distinct responders,
+/// [`MAX_DATAGRAMS_PER_RESPONDER`] datagrams each and [`MAX_REPLY_BYTES`] in total. For a
+/// unicast target only datagrams from that host count; with `scope`, only datagrams from
+/// those addresses (the devices the scan discovered). Holds one socket permit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn exchange_udp(
     target: DiscoveryTarget,
     port: u16,
     group_v4: Ipv4Addr,
     payloads: &[Vec<u8>],
     window: Duration,
+    scope: Option<&HashSet<IpAddr>>,
     budget: &SocketBudget,
     cancel: &CancellationToken,
 ) -> Vec<(IpAddr, Vec<u8>)> {
@@ -449,7 +621,8 @@ pub(crate) async fn exchange_udp(
         _ => None,
     };
     let deadline = tokio::time::Instant::now() + window;
-    let mut sources: std::collections::HashSet<IpAddr> = std::collections::HashSet::new();
+    let mut per_source: HashMap<IpAddr, usize> = HashMap::new();
+    let mut kept_bytes = 0usize;
     let mut buf = vec![0u8; MAX_DATAGRAM];
     while !cancel.is_cancelled() {
         let recv = tokio::select! {
@@ -458,29 +631,39 @@ pub(crate) async fn exchange_udp(
         };
         let Ok(Ok((n, from))) = recv else { break };
         let ip = from.ip();
-        if only.is_some_and(|o| o != ip) {
+        if only.is_some_and(|o| o != ip) || scope.is_some_and(|s| !s.contains(&ip)) {
             continue;
         }
-        if !sources.contains(&ip) && sources.len() >= MAX_RESPONDERS {
+        if !per_source.contains_key(&ip) && per_source.len() >= MAX_RESPONDERS {
             continue;
         }
-        sources.insert(ip);
-        // Bound the total retained datagrams too (a responder may repeat itself).
-        if out.len() < MAX_RESPONDERS * 8 {
+        let count = per_source.entry(ip).or_default();
+        // Bound what is retained (a responder may repeat itself or flood).
+        if *count < MAX_DATAGRAMS_PER_RESPONDER && kept_bytes + n <= MAX_REPLY_BYTES {
+            *count += 1;
+            kept_bytes += n;
             out.push((ip, buf[..n].to_vec()));
         }
     }
     out
 }
 
+/// Every address of the scan's devices: the only responders follow-up requests may go to.
+pub fn scope_of<'a>(ips: impl IntoIterator<Item = &'a IpAddr>) -> HashSet<IpAddr> {
+    ips.into_iter().copied().collect()
+}
+
 /// Discover UPnP devices for `window` over IPv4 multicast from the interface address `v4`
 /// and, when `v6_index` is given, IPv6 multicast (`ff02::c` / `ff05::c`) on that interface.
-/// Returns responder IP → [`SsdpInfo`] (headers plus the description fetched from the
-/// responder itself).
+/// Only replies from `scope` (the addresses of the devices the scan discovered) are kept, so
+/// descriptions are fetched from in-scope devices only, never from arbitrary multicast
+/// responders. Fetches are bounded per responder and per run ([`FetchCtx`]). Returns responder
+/// IP → [`SsdpInfo`] (headers plus the description fetched from the responder itself).
 pub async fn discover_ssdp(
     v4: Option<Ipv4Addr>,
     v6_index: Option<u32>,
     window: Duration,
+    scope: &HashSet<IpAddr>,
     budget: &SocketBudget,
     cancel: &CancellationToken,
 ) -> HashMap<IpAddr, SsdpInfo> {
@@ -488,47 +671,37 @@ pub async fn discover_ssdp(
         .iter()
         .map(|st| build_msearch(st, 2))
         .collect();
+    let exchange = |t: DiscoveryTarget| {
+        exchange_udp(
+            t,
+            SSDP_PORT,
+            SSDP_MCAST_V4,
+            &payloads,
+            window,
+            Some(scope),
+            budget,
+            cancel,
+        )
+    };
     let v4_fut = async {
         match v4 {
-            Some(ip) => {
-                let t = DiscoveryTarget::MulticastV4(ip);
-                exchange_udp(
-                    t,
-                    SSDP_PORT,
-                    SSDP_MCAST_V4,
-                    &payloads,
-                    window,
-                    budget,
-                    cancel,
-                )
-                .await
-            }
+            Some(ip) => exchange(DiscoveryTarget::MulticastV4(ip)).await,
             None => Vec::new(),
         }
     };
     let v6_fut = async {
         match v6_index {
-            Some(index) => {
-                let t = DiscoveryTarget::MulticastV6(index);
-                exchange_udp(
-                    t,
-                    SSDP_PORT,
-                    SSDP_MCAST_V4,
-                    &payloads,
-                    window,
-                    budget,
-                    cancel,
-                )
-                .await
-            }
+            Some(index) => exchange(DiscoveryTarget::MulticastV6(index)).await,
             None => Vec::new(),
         }
     };
     let (a, b) = tokio::join!(v4_fut, v6_fut);
-    describe_responders(a.into_iter().chain(b), budget, cancel).await
+    let ctx = FetchCtx::run(budget, cancel, v6_index.unwrap_or(0));
+    describe_responders(a.into_iter().chain(b), ctx).await
 }
 
 /// Unicast SSDP probe of one host (`M-SEARCH` straight to `ip:1900`), for the details drawer.
+/// The description fetch is bounded like a discovery run.
 pub async fn probe_ssdp_host(
     ip: IpAddr,
     window: Duration,
@@ -546,21 +719,22 @@ pub async fn probe_ssdp_host(
         SSDP_MCAST_V4,
         &payloads,
         window,
+        None,
         budget,
         cancel,
     )
     .await;
-    describe_responders(replies, budget, cancel)
+    describe_responders(replies, FetchCtx::run(budget, cancel, 0))
         .await
         .remove(&ip)
 }
 
 /// Fold reply datagrams into per-responder headers, then fetch each responder's description
-/// (SSRF-guarded) and build the result map.
-async fn describe_responders(
+/// (SSRF-guarded, within `ctx`'s deadline and [`PER_RESPONDER_BUDGET`] each) and build the
+/// result map. A responder whose fetch runs out of time keeps its headers.
+pub(crate) async fn describe_responders(
     replies: impl IntoIterator<Item = (IpAddr, Vec<u8>)>,
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> HashMap<IpAddr, SsdpInfo> {
     let mut headers: HashMap<IpAddr, SsdpHeaders> = HashMap::new();
     for (ip, datagram) in replies {
@@ -574,7 +748,7 @@ async fn describe_responders(
         entry.usn = entry.usn.take().or(h.usn);
         entry.search_target = entry.search_target.take().or(h.search_target);
     }
-    // Fetch descriptions concurrently (bounded; every socket also draws from `budget`).
+    // Fetch descriptions concurrently (bounded; every socket also draws from the budget).
     futures::stream::iter(headers)
         .map(|(ip, h)| async move {
             let mut info = SsdpInfo {
@@ -586,8 +760,8 @@ async fn describe_responders(
             };
             let url = h.location.as_deref().and_then(parse_http_url);
             if let Some(url) = url.filter(|u| url_host_is(u, ip)) {
-                if !cancel.is_cancelled() {
-                    if let Some(body) = fetch_description(ip, &url, budget, cancel).await {
+                if !ctx.cancel.is_cancelled() {
+                    if let Some(body) = fetch_description(ip, &url, ctx.responder()).await {
                         merge_description(&mut info, parse_device_description(&body));
                     }
                 }
@@ -617,12 +791,12 @@ fn merge_description(info: &mut SsdpInfo, desc: SsdpInfo) {
 }
 
 /// Fetch `url` from `responder` over HTTP with a size cap, timeout and same-origin redirects
-/// only. Returns the body bytes, or `None` on any error / policy violation.
-pub async fn fetch_description(
+/// only, finishing by `ctx.deadline`. Returns the body bytes, or `None` on any error / policy
+/// violation.
+pub(crate) async fn fetch_description(
     responder: IpAddr,
     url: &HttpUrl,
-    budget: &SocketBudget,
-    cancel: &CancellationToken,
+    ctx: FetchCtx<'_>,
 ) -> Option<Vec<u8>> {
     let mut url = url.clone();
     for _ in 0..=MAX_REDIRECTS {
@@ -630,17 +804,17 @@ pub async fn fetch_description(
         if !url_host_is(&url, responder) {
             return None;
         }
-        let _permit = budget.acquire().await?;
+        let _permit = ctx.budget.acquire().await?;
         let resp = tokio::select! {
-            _ = cancel.cancelled() => return None,
-            r = http_get(responder, &url) => r,
+            _ = ctx.cancel.cancelled() => return None,
+            r = tokio::time::timeout_at(ctx.request_deadline(), http_get(responder, &url, ctx.scope_id)) => r.ok()?,
         }?;
         drop(_permit);
         match resp.status {
             200 => return Some(resp.body),
             301 | 302 | 303 | 307 | 308 => {
-                let next = resp.location?;
-                let next = parse_http_url(&next)?;
+                let next = resp.header("location")?;
+                let next = parse_http_url(next)?;
                 // Same-origin only.
                 if !url_host_is(&next, responder) {
                     return None;
@@ -653,76 +827,168 @@ pub async fn fetch_description(
     None
 }
 
-/// A minimal HTTP response (status code, `Location` for redirects, body up to the cap).
-struct HttpResponse {
-    status: u16,
-    location: Option<String>,
-    body: Vec<u8>,
+/// A parsed HTTP response: status, headers (bounded) and body (bounded).
+pub(crate) struct HttpMessage {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpMessage {
+    /// The first header named `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Longest HTTP header block read.
+const MAX_HTTP_HEAD: usize = 16 * 1024;
+/// Most response headers kept.
+const MAX_HTTP_HEADERS: usize = 100;
+
+/// Read one HTTP/1.x response from `r`: the header block, then a body framed by
+/// `Content-Length`, the chunked transfer coding, or the end of the connection, keeping at most
+/// `max_body` bytes. Returns early once a `Content-Length` body is complete (keep-alive peers
+/// need not close). Returns `None` for anything that is not an HTTP response.
+pub(crate) async fn read_http_response<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max_body: usize,
+) -> Option<HttpMessage> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let (head_len, sep_len) = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break (i, 4);
+        }
+        if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
+            break (i, 2);
+        }
+        if buf.len() > MAX_HTTP_HEAD {
+            return None;
+        }
+        let n = r.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_len]).into_owned();
+    let mut rest = buf.split_off(head_len + sep_len);
+    let mut lines = head.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
+    let status_line = lines.next()?;
+    if !status_line.starts_with("HTTP/") {
+        return None;
+    }
+    let status: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .take(MAX_HTTP_HEADERS)
+        .map(|(n, v)| (n.trim().to_string(), v.trim().to_string()))
+        .collect();
+    let msg = |body: Vec<u8>| HttpMessage {
+        status,
+        headers: headers.clone(),
+        body,
+    };
+    let find = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.to_ascii_lowercase())
+    };
+    if find("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        return Some(msg(read_chunked(r, rest, max_body).await));
+    }
+    let length = find("content-length").and_then(|v| v.trim().parse::<usize>().ok());
+    let want = length.map_or(max_body, |l| l.min(max_body));
+    while rest.len() < want {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => rest.extend_from_slice(&chunk[..n]),
+        }
+    }
+    rest.truncate(want);
+    Some(msg(rest))
+}
+
+/// Decode a chunked body (`rest` holds bytes already read), keeping at most `max_body` bytes.
+/// A truncated stream yields what arrived.
+async fn read_chunked<R: AsyncRead + Unpin>(
+    r: &mut R,
+    mut rest: Vec<u8>,
+    max_body: usize,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Make sure `rest` holds at least `n` bytes (or the stream ended).
+    async fn fill<R: AsyncRead + Unpin>(
+        r: &mut R,
+        rest: &mut Vec<u8>,
+        chunk: &mut [u8],
+        n: usize,
+    ) -> bool {
+        while rest.len() < n {
+            match r.read(chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(k) => rest.extend_from_slice(&chunk[..k]),
+            }
+        }
+        true
+    }
+    loop {
+        // Chunk-size line.
+        let line_end = loop {
+            if let Some(i) = rest.iter().position(|b| *b == b'\n') {
+                break i;
+            }
+            let want = rest.len() + 1;
+            if want > 1024 || !fill(r, &mut rest, &mut chunk, want).await {
+                return out;
+            }
+        };
+        let line = String::from_utf8_lossy(&rest[..line_end]).into_owned();
+        rest.drain(..=line_end);
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            return out;
+        };
+        if size == 0 {
+            return out;
+        }
+        let complete = fill(r, &mut rest, &mut chunk, size.saturating_add(2)).await;
+        let take = size.min(rest.len());
+        let room = max_body.saturating_sub(out.len());
+        out.extend_from_slice(&rest[..take.min(room)]);
+        if !complete || out.len() >= max_body {
+            return out;
+        }
+        rest.drain(..(size + 2).min(rest.len()));
+    }
 }
 
 /// Perform one HTTP/1.0 GET to `ip:url.port` for `url.path`, reading at most
-/// [`MAX_DESCRIPTION_BYTES`] of body, under a short timeout.
-async fn http_get(ip: IpAddr, url: &HttpUrl) -> Option<HttpResponse> {
-    let timeout = Duration::from_secs(4);
-    let fut = async {
-        let mut stream = TcpStream::connect(SocketAddr::new(ip, url.port))
-            .await
-            .ok()?;
-        let req = format!(
-            "GET {} HTTP/1.0\r\nHost: {}:{}\r\nUser-Agent: SweepR/1.0\r\nAccept: */*\r\n\
-             Connection: close\r\n\r\n",
-            url.path, url.host, url.port
-        );
-        stream.write_all(req.as_bytes()).await.ok()?;
-        let mut raw = Vec::with_capacity(4096);
-        let mut chunk = [0u8; 4096];
-        // Read headers + body, capped (leave room for a header block).
-        let cap = MAX_DESCRIPTION_BYTES + 8 * 1024;
-        loop {
-            let n = stream.read(&mut chunk).await.ok()?;
-            if n == 0 {
-                break;
-            }
-            raw.extend_from_slice(&chunk[..n]);
-            if raw.len() >= cap {
-                raw.truncate(cap);
-                break;
-            }
-        }
-        Some(raw)
-    };
-    let raw = tokio::time::timeout(timeout, fut).await.ok()??;
-    parse_http_response(&raw)
-}
-
-/// Split an HTTP response into status / Location / body (bounded).
-fn parse_http_response(raw: &[u8]) -> Option<HttpResponse> {
-    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = std::str::from_utf8(&raw[..sep]).ok()?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next()?;
-    // `HTTP/1.x <code> <reason>`
-    let status: u16 = status_line.split_whitespace().nth(1)?.parse().ok()?;
-    let mut location = None;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("location") {
-                location = Some(value.trim().to_string());
-            }
-        }
-    }
-    let mut body = raw[sep + 4..].to_vec();
-    body.truncate(MAX_DESCRIPTION_BYTES);
-    Some(HttpResponse {
-        status,
-        location,
-        body,
-    })
+/// [`MAX_DESCRIPTION_BYTES`] of body. The caller bounds the time.
+async fn http_get(ip: IpAddr, url: &HttpUrl, scope_id: u32) -> Option<HttpMessage> {
+    let mut stream = TcpStream::connect(connect_addr(ip, url.port, scope_id))
+        .await
+        .ok()?;
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: SweepR/1.0\r\nAccept: */*\r\n\
+         Connection: close\r\n\r\n",
+        url.path,
+        host_header(&url.host, url.port)
+    );
+    stream.write_all(req.as_bytes()).await.ok()?;
+    read_http_response(&mut stream, MAX_DESCRIPTION_BYTES).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn msearch_is_well_formed() {
@@ -891,11 +1157,11 @@ mod tests {
             port,
             path: "/desc.xml".into(),
         };
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
         let body = fetch_description(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &url,
-            &SocketBudget::new(2),
-            &CancellationToken::new(),
+            FetchCtx::run(&budget, &cancel, 0),
         )
         .await
         .expect("fetch should succeed against the local responder");
@@ -947,17 +1213,19 @@ mod tests {
             SSDP_MCAST_V4,
             &[build_msearch("ssdp:all", 1)],
             Duration::from_millis(400),
+            None,
             &budget,
             &cancel,
         )
         .await;
         assert_eq!(replies.len(), 1);
-        let map = describe_responders(replies, &budget, &cancel).await;
+        let map = describe_responders(replies, FetchCtx::run(&budget, &cancel, 0)).await;
         let info = &map[&IpAddr::V4(Ipv4Addr::LOCALHOST)];
         assert_eq!(info.model_name.as_deref(), Some("DS220+"));
         assert_eq!(info.serial_number.as_deref(), Some("2010ABCDEF"));
         assert!(info.server.as_deref().unwrap().contains("Synology"));
-        assert_eq!(classify_ssdp_kind(info).as_deref(), Some("media_server"));
+        // A Synology serving DLNA is a NAS, not a media server.
+        assert_eq!(classify_ssdp_kind(info).as_deref(), Some("nas"));
         let _ = (udp_task.await, http_task.await);
 
         // A reply naming a foreign LOCATION host keeps its headers but fetches nothing.
@@ -966,7 +1234,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nLOCATION: http://169.254.169.254/latest\r\nSERVER: x\r\n\r\n"
                 .to_vec(),
         )];
-        let map = describe_responders(foreign, &budget, &cancel).await;
+        let map = describe_responders(foreign, FetchCtx::run(&budget, &cancel, 0)).await;
         let info = &map[&IpAddr::V4(Ipv4Addr::LOCALHOST)];
         assert!(info.model_name.is_none());
         assert_eq!(
@@ -1002,11 +1270,11 @@ mod tests {
             }
         });
         let url = parse_http_url(&format!("http://127.0.0.1:{port}/desc.xml")).unwrap();
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
         let body = fetch_description(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &url,
-            &SocketBudget::new(2),
-            &CancellationToken::new(),
+            FetchCtx::run(&budget, &cancel, 0),
         )
         .await
         .expect("same-origin redirect is followed");
@@ -1027,11 +1295,11 @@ mod tests {
             }
         });
         let url = parse_http_url(&format!("http://127.0.0.1:{port}/desc.xml")).unwrap();
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
         let res = fetch_description(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &url,
-            &SocketBudget::new(2),
-            &CancellationToken::new(),
+            FetchCtx::run(&budget, &cancel, 0),
         )
         .await;
         assert!(res.is_none());
@@ -1056,13 +1324,311 @@ mod tests {
             port: 80,
             path: "/x".into(),
         };
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
         let res = fetch_description(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             &url,
-            &SocketBudget::new(2),
-            &CancellationToken::new(),
+            FetchCtx::run(&budget, &cancel, 0),
         )
         .await;
         assert!(res.is_none());
+    }
+
+    /// Description fetches stop at the context deadline even when the device accepts the
+    /// connection and never answers (review M4); the responder keeps its headers.
+    #[tokio::test]
+    async fn stalled_description_server_is_bounded_by_the_deadline() {
+        let http = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = http.local_addr().unwrap().port();
+        let stall = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = http.accept().await {
+                held.push(s); // accept, never answer
+            }
+        });
+        let (budget, cancel) = (SocketBudget::new(4), CancellationToken::new());
+        let ctx = FetchCtx {
+            deadline: Instant::now() + Duration::from_millis(800),
+            ..FetchCtx::run(&budget, &cancel, 0)
+        };
+        // The per-responder context never extends the run deadline.
+        assert!(ctx.responder().deadline <= ctx.deadline);
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:{port}/d.xml\r\nSERVER: x\r\n\r\n"
+        );
+        let started = std::time::Instant::now();
+        let map = describe_responders(
+            vec![(IpAddr::V4(Ipv4Addr::LOCALHOST), reply.into_bytes())],
+            ctx,
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(3000), "took {took:?}");
+        let info = &map[&IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        assert_eq!(info.server.as_deref(), Some("x"));
+        assert!(info.model_name.is_none());
+        stall.abort();
+    }
+
+    /// Only datagrams from in-scope addresses are kept (review M1), and a flooding responder
+    /// is capped per source.
+    #[tokio::test]
+    async fn exchange_keeps_only_in_scope_responders_and_caps_floods() {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            if let Ok((_, from)) = udp.recv_from(&mut b).await {
+                for _ in 0..100 {
+                    let _ = udp
+                        .send_to(b"HTTP/1.1 200 OK\r\nSERVER: x\r\n\r\n", from)
+                        .await;
+                }
+            }
+        });
+        let (budget, cancel) = (SocketBudget::new(2), CancellationToken::new());
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let replies = exchange_udp(
+            DiscoveryTarget::Unicast(lo),
+            port,
+            SSDP_MCAST_V4,
+            &[build_msearch("ssdp:all", 1)],
+            Duration::from_millis(400),
+            None,
+            &budget,
+            &cancel,
+        )
+        .await;
+        assert_eq!(replies.len(), MAX_DATAGRAMS_PER_RESPONDER);
+        let _ = task.await;
+        // Out of scope: nothing kept.
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = udp.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            if let Ok((_, from)) = udp.recv_from(&mut b).await {
+                let _ = udp
+                    .send_to(b"HTTP/1.1 200 OK\r\nSERVER: x\r\n\r\n", from)
+                    .await;
+            }
+        });
+        let scope = scope_of(&["10.0.0.1".parse::<IpAddr>().unwrap()]);
+        let replies = exchange_udp(
+            DiscoveryTarget::Unicast(lo),
+            port,
+            SSDP_MCAST_V4,
+            &[build_msearch("ssdp:all", 1)],
+            Duration::from_millis(300),
+            Some(&scope),
+            &budget,
+            &cancel,
+        )
+        .await;
+        assert!(replies.is_empty());
+        let _ = task.await;
+    }
+
+    /// Bodies framed by Content-Length (keep-alive peers) and chunked bodies are read
+    /// correctly.
+    #[tokio::test]
+    async fn http_reader_handles_content_length_and_chunked() {
+        let keep_alive = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA".to_vec();
+        let m = read_http_response(&mut keep_alive.as_slice(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(m.body, b"hello");
+        let chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x=y\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                .to_vec();
+        let m = read_http_response(&mut chunked.as_slice(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(m.body, b"hello world");
+        // Body cap applies to chunked data too.
+        let m = read_http_response(&mut chunked.as_slice(), 7)
+            .await
+            .unwrap();
+        assert_eq!(m.body, b"hello w");
+        assert!(read_http_response(&mut &b"garbage"[..], 10).await.is_none());
+        // A keep-alive server that does not close: the read completes without waiting.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        a.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let m = tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut b, 100))
+            .await
+            .expect("must not wait for close")
+            .unwrap();
+        assert_eq!(m.body, b"ok");
+        drop(a);
+    }
+
+    #[test]
+    fn ssdp_response_variants_and_long_location() {
+        for r in [
+            "HTTP/1.0 200 OK\r\nLOCATION: http://1.2.3.4/x\r\n\r\n",
+            "HTTP/1.1 200 OK\nLOCATION: http://1.2.3.4/x\nSERVER: a\n\n",
+            "HTTP/1.1 200 OK\r\nlocation: http://1.2.3.4/x\r\n\r\n",
+        ] {
+            let h = parse_ssdp_response(r.as_bytes()).unwrap();
+            assert_eq!(h.location.as_deref(), Some("http://1.2.3.4/x"), "{r:?}");
+        }
+        // A long LOCATION is kept whole (not cut at the 256-character name cap).
+        let long = format!("http://1.2.3.4/{}", "a".repeat(600));
+        let mut bytes = format!("HTTP/1.1 200 OK\r\nLOCATION: {long}\r\nSERVER: Caf").into_bytes();
+        // Non-UTF-8 (Latin-1) server text is tolerated.
+        bytes.extend_from_slice(b"\xe9\r\n\r\n");
+        let h = parse_ssdp_response(&bytes).unwrap();
+        assert_eq!(h.location.as_deref(), Some(long.as_str()));
+        assert!(h.server.unwrap().starts_with("Caf"));
+    }
+
+    #[test]
+    fn latin1_description_is_decoded_lossily() {
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root><device><friendlyName>Caf\xe9</friendlyName><manufacturer>Acme</manufacturer></device></root>";
+        let i = parse_device_description(latin1);
+        assert!(i.friendly_name.unwrap().starts_with("Caf"));
+        assert_eq!(i.manufacturer.as_deref(), Some("Acme"));
+    }
+
+    /// Table-driven classification: URN first, whole-word keywords (review M6).
+    #[test]
+    fn classification_table() {
+        let s = |dt: &str, fname: &str, manu: &str, model: &str, desc: &str| SsdpInfo {
+            device_type: (!dt.is_empty()).then(|| dt.into()),
+            friendly_name: (!fname.is_empty()).then(|| fname.into()),
+            manufacturer: (!manu.is_empty()).then(|| manu.into()),
+            model_name: (!model.is_empty()).then(|| model.into()),
+            model_description: (!desc.is_empty()).then(|| desc.into()),
+            ..SsdpInfo::default()
+        };
+        let urn = |t: &str| format!("urn:schemas-upnp-org:device:{t}:1");
+        let cases: Vec<(&str, SsdpInfo, Option<&str>)> = vec![
+            (
+                "LG webOS TV",
+                s(
+                    &urn("MediaRenderer"),
+                    "[LG] webOS TV OLED55C1PUB",
+                    "LG Electronics",
+                    "LG TV",
+                    "",
+                ),
+                Some("tv"),
+            ),
+            (
+                "Sony Bravia",
+                s(
+                    &urn("MediaRenderer"),
+                    "BRAVIA KD-55X85J",
+                    "Sony Corporation",
+                    "KD-55X85J",
+                    "",
+                ),
+                Some("tv"),
+            ),
+            (
+                "Samsung TV",
+                s(
+                    &urn("MediaRenderer"),
+                    "[TV] Samsung Q60 Series (55)",
+                    "Samsung Electronics",
+                    "QN55Q60RAFXZA",
+                    "Samsung TV DMR",
+                ),
+                Some("tv"),
+            ),
+            (
+                "Synology DLNA",
+                s(
+                    &urn("MediaServer"),
+                    "DS220+",
+                    "Synology",
+                    "DS220+",
+                    "Synology DLNA/UPnP Media Server",
+                ),
+                Some("nas"),
+            ),
+            (
+                "Panasonic camera",
+                s(
+                    &urn("Basic"),
+                    "WV-S1131",
+                    "Panasonic",
+                    "WV-S1131",
+                    "Network Camera",
+                ),
+                Some("camera"),
+            ),
+            (
+                "Panasonic printer",
+                s(
+                    &urn("Basic"),
+                    "KX-MB2120",
+                    "Panasonic",
+                    "KX-MB2120",
+                    "Multi-Function Printer",
+                ),
+                Some("printer"),
+            ),
+            (
+                "Printer w/ duplex",
+                s(
+                    &urn("Printer"),
+                    "Office MFP",
+                    "Brother",
+                    "MFC-L2750DW",
+                    "Monochrome laser, automatic duplex",
+                ),
+                Some("printer"),
+            ),
+            (
+                "Windows WMP",
+                s(
+                    &urn("MediaServer"),
+                    "DESKTOP-1: user:",
+                    "Microsoft Corporation",
+                    "Windows Media Player Sharing",
+                    "Media Server",
+                ),
+                Some("media_server"),
+            ),
+            (
+                "Sonos",
+                s(
+                    "urn:schemas-upnp-org:device:ZonePlayer:1",
+                    "Sonos One",
+                    "Sonos, Inc.",
+                    "Sonos One",
+                    "",
+                ),
+                Some("media_player"),
+            ),
+            (
+                "Hue bridge",
+                s(
+                    &urn("Basic"),
+                    "Hue Bridge",
+                    "Signify",
+                    "Philips hue bridge 2015",
+                    "Philips hue Personal Wireless Lighting",
+                ),
+                None,
+            ),
+            (
+                "IGD",
+                s(&urn("InternetGatewayDevice"), "", "", "", ""),
+                Some("igd_router"),
+            ),
+            (
+                "Plex",
+                s("", "Plex Media Server", "Plex, Inc.", "", ""),
+                Some("media_server"),
+            ),
+        ];
+        for (label, info, want) in cases {
+            assert_eq!(classify_ssdp_kind(&info).as_deref(), want, "{label}");
+        }
     }
 }

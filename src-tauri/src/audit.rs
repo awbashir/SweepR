@@ -21,8 +21,9 @@ use serde_json::{Map, Value};
 
 use crate::models::{normalize_mac, parse_mac, parse_ports, sanitize_text, DeviceRole};
 
-/// Most affected entries kept per finding (the true count is in `affected_count`).
-pub const MAX_AFFECTED: usize = 500;
+/// Most affected entries kept per finding (the true count is in `affected_count`; the JSON
+/// export carries every kept entry, renderers show fewer).
+pub const MAX_AFFECTED: usize = 100_000;
 /// Most records of one kind accepted from an input file (bounds memory and report size).
 pub const MAX_INPUT_RECORDS: usize = 250_000;
 
@@ -34,6 +35,46 @@ pub const MAX_INPUT_RECORDS: usize = 250_000;
 fn de_role<'de, D: Deserializer<'de>>(d: D) -> Result<DeviceRole, D::Error> {
     let v = Value::deserialize(d)?;
     Ok(serde_json::from_value(v).unwrap_or_default())
+}
+
+/// Read an optional field leniently: a value of the wrong shape becomes `None` instead of
+/// failing the whole record.
+fn de_lenient<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
+}
+
+/// A JSON value that carries no information: `null`, `""`, `[]`, `{}` (after pruning).
+fn is_blank(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+/// Drop `null` members (recursively) and members that end up blank, so that a key that is
+/// present but empty (every `Device` serializes `"sip": null`, `"warnings": []`, ...) reads
+/// exactly like an absent key. Returns `true` when `v` itself is blank afterwards.
+fn prune_blank(v: &mut Value, depth: usize) -> bool {
+    if depth < 16 {
+        match v {
+            Value::Object(o) => o.retain(|_, x| !prune_blank(x, depth + 1)),
+            Value::Array(a) => {
+                // Elements keep their positions; only `null` entries are dropped.
+                a.iter_mut().for_each(|x| {
+                    prune_blank(x, depth + 1);
+                });
+                a.retain(|x| !x.is_null());
+            }
+            _ => {}
+        }
+    }
+    is_blank(v)
 }
 
 /// One discovered device. Mirrors `models::Device` (camelCase) with every field optional;
@@ -67,7 +108,7 @@ pub struct AuditDevice {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AuditPortMapping {
     pub switch_name: String,
@@ -76,6 +117,83 @@ pub struct AuditPortMapping {
     pub port_index: Option<u32>,
     pub vlan_id: Option<u16>,
     pub mac: String,
+    /// PoE delivered on the port (`SwitchPortMapping::poe`).
+    #[serde(
+        deserialize_with = "de_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub poe: Option<AuditPoe>,
+    /// Voice VLAN configured on the port (`SwitchPortMapping::voice_vlan`).
+    #[serde(
+        deserialize_with = "de_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub voice_vlan: Option<u16>,
+}
+
+/// PoE delivery to one port / endpoint (`models::PoeInfo`, read leniently).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuditPoe {
+    #[serde(deserialize_with = "de_lenient")]
+    pub watts: Option<f64>,
+    #[serde(deserialize_with = "de_lenient")]
+    pub max_watts: Option<f64>,
+    #[serde(deserialize_with = "de_lenient")]
+    pub class: Option<u8>,
+    #[serde(deserialize_with = "de_lenient")]
+    pub status: Option<String>,
+}
+
+impl AuditPoe {
+    fn normalize(&mut self) {
+        clean_opt(&mut self.status);
+        if let Some(s) = &mut self.status {
+            *s = s.to_ascii_lowercase();
+        }
+        for w in [&mut self.watts, &mut self.max_watts] {
+            if w.is_some_and(|x| !x.is_finite() || !(0.0..=10_000.0).contains(&x)) {
+                *w = None;
+            }
+        }
+    }
+
+    /// Power is (or was measured to be) flowing to the port.
+    pub fn delivering(&self) -> bool {
+        self.status.as_deref() == Some("delivering") || self.watts.is_some_and(|w| w > 0.0)
+    }
+}
+
+/// Switch-wide PoE budget (`models::PoeBudget`, read leniently).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuditPoeBudget {
+    #[serde(deserialize_with = "de_lenient")]
+    pub nominal_watts: Option<f64>,
+    #[serde(deserialize_with = "de_lenient")]
+    pub consumed_watts: Option<f64>,
+    #[serde(deserialize_with = "de_lenient")]
+    pub usage_threshold_pct: Option<u8>,
+    #[serde(deserialize_with = "de_lenient")]
+    pub ports_delivering: Option<u32>,
+}
+
+impl AuditPoeBudget {
+    fn normalize(&mut self) {
+        for w in [&mut self.nominal_watts, &mut self.consumed_watts] {
+            if w.is_some_and(|x| !x.is_finite() || !(0.0..=1_000_000.0).contains(&x)) {
+                *w = None;
+            }
+        }
+    }
+
+    /// Fraction of the nominal budget in use, when both values are known.
+    pub fn used_fraction(&self) -> Option<f64> {
+        match (self.nominal_watts, self.consumed_watts) {
+            (Some(n), Some(c)) if n > 0.0 => Some(c / n),
+            _ => None,
+        }
+    }
 }
 
 impl AuditPortMapping {
@@ -88,6 +206,15 @@ impl AuditPortMapping {
         self.port_name = sanitize_text(&self.port_name);
         self.switch_ip = clean_ip_opt(self.switch_ip.take());
         self.mac = normalize_mac(&self.mac).unwrap_or_else(|| sanitize_text(&self.mac));
+        if let Some(p) = &mut self.poe {
+            p.normalize();
+        }
+        if self.vlan_id.is_some_and(|v| !(1..=4094).contains(&v)) {
+            self.vlan_id = None;
+        }
+        if self.voice_vlan.is_some_and(|v| !(1..=4094).contains(&v)) {
+            self.voice_vlan = None;
+        }
     }
 }
 
@@ -126,15 +253,21 @@ impl AuditNeighbor {
             .any(|c| c.eq_ignore_ascii_case(cap))
     }
 
-    /// Network gear (switch, router, firewall, access point) rather than an endpoint.
+    /// Network gear (switch, router, firewall, access point) rather than an endpoint. An IP
+    /// phone advertising Bridge + Telephone (its PC port) is an endpoint.
     pub fn is_infrastructure(&self) -> bool {
+        if self.has_cap("telephone") && !self.has_cap("router") {
+            return false;
+        }
         ["switch", "router", "firewall", "wlan_access_point"]
             .iter()
             .any(|c| self.has_cap(c))
     }
 
+    /// An IP phone advertising itself. Phones with a PC port also advertise Bridge, so a
+    /// Telephone capability counts unless the device also routes.
     pub fn is_phone(&self) -> bool {
-        self.has_cap("telephone")
+        (self.has_cap("telephone") && !self.has_cap("router"))
             || self.device_id.starts_with("SEP")
             || contains_ci(self.platform.as_deref().unwrap_or(""), "phone")
     }
@@ -157,6 +290,8 @@ impl AuditNeighbor {
             clean_opt(s);
         }
         self.management_addrs = clean_ips(std::mem::take(&mut self.management_addrs));
+        self.native_vlan = self.native_vlan.filter(|v| (1..=4094).contains(v));
+        self.voice_vlan = self.voice_vlan.filter(|v| (1..=4094).contains(v));
         self.capabilities = self
             .capabilities
             .iter()
@@ -216,6 +351,12 @@ pub struct AuditSnmpInfo {
     pub warnings: Vec<String>,
     /// Optional total physical port count (e.g. from a future ifTable walk).
     pub total_ports: Option<u32>,
+    /// Switch-wide PoE budget (`SnmpDeviceInfo::poe_budget`).
+    #[serde(
+        deserialize_with = "de_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub poe_budget: Option<AuditPoeBudget>,
 }
 
 impl AuditSnmpInfo {
@@ -236,6 +377,7 @@ impl AuditSnmpInfo {
             clean_opt(s);
         }
         self.vlans.iter_mut().for_each(AuditVlan::normalize);
+        self.vlans.retain(|v| (1..=4094).contains(&v.id));
         self.port_mappings
             .iter_mut()
             .for_each(AuditPortMapping::normalize);
@@ -243,7 +385,24 @@ impl AuditSnmpInfo {
             c.port_name = sanitize_text(&c.port_name);
         }
         self.warnings = self.warnings.iter().map(|w| sanitize_text(w)).collect();
+        if let Some(b) = &mut self.poe_budget {
+            b.normalize();
+        }
     }
+}
+
+/// One SNMP agent the scan polled (`ScanEvent::SnmpAgent`, collected into
+/// `meta.snmpAgents`). Never carries the community itself, only its class.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SnmpAgentMeta {
+    pub ip: String,
+    /// `v1`, `v2c` or `v3`.
+    pub version: Option<String>,
+    /// `public`, `private`, `custom`, `none` (v1/v2c) or `v3`.
+    pub community_class: Option<String>,
+    /// The agent returned data.
+    pub answered: bool,
 }
 
 /// SNMP settings of the scan, with the community string reduced to a classification.
@@ -274,15 +433,36 @@ impl SnmpMeta {
         clean_opt(&mut self.version);
         clean_opt(&mut self.community_kind);
         if let Some(v) = &mut self.version {
-            *v = v.to_ascii_lowercase();
+            *v = canonical_snmp_version(v);
+        }
+        if let Some(k) = &mut self.community_kind {
+            *k = k.to_ascii_lowercase();
         }
     }
 
-    pub fn uses_community(&self) -> bool {
-        matches!(
-            self.version.as_deref(),
-            Some("v1" | "v2c" | "1" | "2c") | None
-        )
+    /// `Some(true)` for SNMPv1/v2c (community based, also the default when no version is
+    /// recorded), `Some(false)` for SNMPv3, `None` for a version string that is not
+    /// recognized (rules depending on it are then not evaluated).
+    pub fn uses_community(&self) -> Option<bool> {
+        match self.version.as_deref() {
+            Some("v1" | "v2c") | None => Some(true),
+            Some("v3") => Some(false),
+            Some(_) => None,
+        }
+    }
+}
+
+/// `1`, `SNMPv1` -> `v1`; `2`, `2c`, `v2` -> `v2c`; `3`, `SNMPv3` -> `v3`; anything else is
+/// kept (lower-cased) and treated as unknown.
+fn canonical_snmp_version(v: &str) -> String {
+    let l = v.trim().to_ascii_lowercase();
+    let bare = l.strip_prefix("snmp").unwrap_or(&l);
+    let bare = bare.strip_prefix('v').unwrap_or(bare);
+    match bare {
+        "1" => "v1".into(),
+        "2" | "2c" => "v2c".into(),
+        "3" => "v3".into(),
+        _ => l,
     }
 }
 
@@ -314,6 +494,9 @@ pub struct ReportMeta {
     pub ipv6_routers: Vec<String>,
     /// Scanning host name.
     pub scanner_host: Option<String>,
+    /// Every SNMP agent the scan polled and whether it answered (additive; empty when the
+    /// input predates it).
+    pub snmp_agents: Vec<SnmpAgentMeta>,
 }
 
 impl ReportMeta {
@@ -341,6 +524,50 @@ impl ReportMeta {
         self.ipv6_routers = clean_ips(std::mem::take(&mut self.ipv6_routers));
         if let Some(s) = &mut self.snmp {
             s.redact();
+        }
+        self.snmp_agents.retain_mut(|a| {
+            let Some(ip) = clean_ip_opt(Some(std::mem::take(&mut a.ip))) else {
+                return false;
+            };
+            a.ip = ip;
+            clean_opt(&mut a.version);
+            if let Some(v) = &mut a.version {
+                *v = canonical_snmp_version(v);
+            }
+            clean_opt(&mut a.community_class);
+            if let Some(c) = &mut a.community_class {
+                *c = c.to_ascii_lowercase();
+            }
+            true
+        });
+        self.snmp_agents.truncate(MAX_INPUT_RECORDS);
+    }
+
+    /// Lenient parse: `null` is an absent meta; a field of the wrong type is dropped (and
+    /// counted in `skipped`) without losing the other fields.
+    fn from_value_lenient(v: Value, skipped: &mut usize) -> Self {
+        match v {
+            Value::Null => ReportMeta::default(),
+            Value::Object(obj) => {
+                if let Ok(m) = serde_json::from_value(Value::Object(obj.clone())) {
+                    return m;
+                }
+                let mut good = Map::new();
+                for (k, v) in obj {
+                    let mut one = Map::new();
+                    one.insert(k.clone(), v.clone());
+                    if serde_json::from_value::<ReportMeta>(Value::Object(one)).is_ok() {
+                        good.insert(k, v);
+                    } else {
+                        *skipped += 1;
+                    }
+                }
+                serde_json::from_value(Value::Object(good)).unwrap_or_default()
+            }
+            _ => {
+                *skipped += 1;
+                ReportMeta::default()
+            }
         }
     }
 }
@@ -382,6 +609,9 @@ pub struct AuditInput {
     /// Records that could not be read (wrong types, bad IP addresses) and were skipped.
     #[serde(skip_deserializing)]
     pub skipped_records: usize,
+    /// Problems with the input that change how it is read (e.g. an unparsable `portSpec`).
+    #[serde(skip_deserializing)]
+    pub warnings: Vec<String>,
 }
 
 fn clean_opt(s: &mut Option<String>) {
@@ -439,10 +669,7 @@ impl AuditInput {
                 // `sweepr snmp -o json` output: a single SnmpDeviceInfo.
                 let take = |obj: &mut Map<String, Value>, k: &str| obj.remove(k);
                 let meta = match take(&mut obj, "meta") {
-                    Some(m) => serde_json::from_value(m).unwrap_or_else(|_| {
-                        skipped += 1;
-                        ReportMeta::default()
-                    }),
+                    Some(m) => ReportMeta::from_value_lenient(m, &mut skipped),
                     None => ReportMeta::default(),
                 };
                 AuditInput {
@@ -453,6 +680,7 @@ impl AuditInput {
                     snmp_infos: lenient_list(take(&mut obj, "snmpInfos"), &mut skipped),
                     meta,
                     skipped_records: 0,
+                    warnings: Vec::new(),
                 }
             }
             _ => anyhow::bail!("report input must be a JSON object or an array of devices"),
@@ -478,6 +706,18 @@ impl AuditInput {
             .iter_mut()
             .for_each(AuditSnmpInfo::normalize);
         self.meta.normalize();
+        if let Some(spec) = self.meta.port_spec.as_deref() {
+            if parse_ports(spec).is_err() {
+                let w = format!(
+                    "the scanned port list (portSpec \"{}\") could not be parsed; port rules \
+                     only use ports seen open",
+                    spec.chars().take(60).collect::<String>()
+                );
+                if !self.warnings.contains(&w) {
+                    self.warnings.push(w);
+                }
+            }
+        }
         self.devices.sort_by(|a, b| {
             (a.vlan_id, a.ip_addr())
                 .cmp(&(b.vlan_id, b.ip_addr()))
@@ -525,6 +765,8 @@ impl AuditDevice {
         if self.vlan_id.is_some_and(|v| !(1..=4094).contains(&v)) {
             self.vlan_id = None;
         }
+        // `"sip": null`, `"warnings": []` ... carry no data: treat them as absent everywhere.
+        self.extra.retain(|_, v| !prune_blank(v, 0));
         true
     }
 
@@ -587,23 +829,70 @@ impl AuditDevice {
         out
     }
 
-    /// Voice VLAN reported for the device itself (CDP/LLDP neighbor record or `voiceVlan`).
+    /// Voice VLAN reported for the device itself (CDP/LLDP neighbor record, `voiceVlan`, or
+    /// the voice VLAN of its switch port).
     pub fn voice_vlan(&self) -> Option<u16> {
         self.neighbor
             .as_ref()
             .and_then(|n| n.voice_vlan)
-            .or_else(|| self.extra_f64("voiceVlan").map(|v| v as u16))
+            .or_else(|| {
+                self.extra_f64("voiceVlan")
+                    .filter(|v| (1.0..=4094.0).contains(v))
+                    .map(|v| v as u16)
+            })
+            .or_else(|| self.switch_port.as_ref().and_then(|p| p.voice_vlan))
     }
 
-    /// Looks like an IP phone: SIP data, a phone vendor, or a CDP/LLDP telephone.
+    /// The SIP identity object (`sip`, or the older `sipInfo`), when one is present.
+    fn sip(&self) -> Option<&Map<String, Value>> {
+        ["sip", "sipInfo"]
+            .iter()
+            .find_map(|k| self.extra.get(*k).and_then(Value::as_object))
+    }
+
+    /// Finer device category: `deviceKind`, else the SIP identity's `kind` (lower-cased).
+    pub fn device_kind(&self) -> Option<String> {
+        self.extra_str("deviceKind")
+            .or_else(|| {
+                self.sip()
+                    .and_then(|s| s.get("kind"))
+                    .and_then(Value::as_str)
+                    .map(sanitize_text)
+                    .filter(|s| !s.is_empty())
+            })
+            .map(|k| k.to_ascii_lowercase())
+    }
+
+    /// PoE drawn by the device (`poe`), else the PoE measured on its switch port.
+    pub fn poe(&self) -> Option<AuditPoe> {
+        self.extra
+            .get("poe")
+            .and_then(|v| serde_json::from_value::<AuditPoe>(v.clone()).ok())
+            .map(|mut p| {
+                p.normalize();
+                p
+            })
+            .or_else(|| self.switch_port.as_ref().and_then(|p| p.poe.clone()))
+    }
+
+    /// Looks like an IP phone: a `voip_phone` device kind, a SIP identity (that is not a
+    /// PBX), a CDP/LLDP telephone, or a phone vendor on a non-infrastructure device. Only
+    /// real data counts: `"sip": null` (present on every scanned device) is no SIP data.
     pub fn is_phone(&self) -> bool {
+        match self.device_kind().as_deref() {
+            Some("voip_phone") => return true,
+            Some("pbx") => return false,
+            _ => {}
+        }
+        if self.role.is_infrastructure() {
+            // Network vendors that also sell phones (Avaya, Mitel, Cisco) make switches too.
+            return false;
+        }
         if self.neighbor.as_ref().is_some_and(AuditNeighbor::is_phone) {
             return true;
         }
-        if self.extra.contains_key("sip") || self.extra.contains_key("sipInfo") {
-            return !self
-                .extra_str("sipRole")
-                .is_some_and(|r| r.eq_ignore_ascii_case("pbx"));
+        if self.sip().is_some() {
+            return true;
         }
         let vendor = self.vendor.as_deref().unwrap_or("");
         PHONE_VENDORS.iter().any(|v| contains_ci(vendor, v))
@@ -679,11 +968,22 @@ impl CertView {
         })
     }
 
-    /// Days until expiry relative to `now_ms` (negative when expired).
+    /// Whole days until expiry relative to `now_ms`, truncated toward zero (negative after
+    /// expiry; 0 on the last day and on the day it expired).
     pub fn days_left(&self, now_ms: u64) -> Option<i64> {
         match self.not_after_ms {
-            Some(ms) => Some((ms - now_ms as i64).div_euclid(86_400_000)),
+            Some(ms) => {
+                Some(ms.saturating_sub(i64::try_from(now_ms).unwrap_or(i64::MAX)) / 86_400_000)
+            }
             None => self.days_remaining,
+        }
+    }
+
+    /// Expired at `now_ms` (exact when `notAfterMs` is known).
+    pub fn is_expired(&self, now_ms: u64) -> Option<bool> {
+        match self.not_after_ms {
+            Some(ms) => Some(ms < i64::try_from(now_ms).unwrap_or(i64::MAX)),
+            None => self.expired.or_else(|| self.days_remaining.map(|d| d < 0)),
         }
     }
 
@@ -692,13 +992,16 @@ impl CertView {
         let kt = self.key_type.as_deref().unwrap_or("").to_ascii_lowercase();
         let mut why = Vec::new();
         if let Some(bits) = self.key_bits {
-            if (kt.contains("rsa") || kt.contains("dsa")) && bits < t.min_rsa_bits {
+            let ec = kt.starts_with("ec") || kt.contains("ecdsa") || kt.contains("ecc");
+            if ec {
+                if bits < t.min_ec_bits {
+                    why.push(format!("{bits}-bit EC key"));
+                }
+            } else if (kt.contains("rsa") || kt.contains("dsa")) && bits < t.min_rsa_bits {
                 why.push(format!(
                     "{bits}-bit {} key",
                     self.key_type.as_deref().unwrap_or("")
                 ));
-            } else if (kt.starts_with("ec") || kt.contains("ecdsa")) && bits < t.min_ec_bits {
-                why.push(format!("{bits}-bit EC key"));
             }
         }
         let sig = self
@@ -849,6 +1152,9 @@ pub struct Finding {
     pub affected: Vec<Affected>,
     /// Number of affected entries before truncation to [`MAX_AFFECTED`].
     pub affected_count: usize,
+    /// Entries dropped by that truncation (`affected_count - affected.len()`).
+    #[serde(default)]
+    pub affected_truncated: usize,
     pub evidence: Vec<String>,
     pub remediation: String,
     /// Short CWE / CIS-style reference text (no links).
@@ -922,6 +1228,12 @@ pub struct RiskScore {
     pub counts: SeverityCounts,
     /// Set when a cap lowered the grade (e.g. "critical finding present").
     pub capped_by: Option<String>,
+    /// Checks that could be evaluated on this input ...
+    #[serde(default)]
+    pub evaluated_checks: usize,
+    /// ... out of all checks.
+    #[serde(default)]
+    pub total_checks: usize,
 }
 
 /// Human-readable statement of the scoring algorithm (shown in the report appendix).
@@ -930,7 +1242,11 @@ critical 15, high 8, medium 4, low 1.5, informational 0. Breadth = min(1 + log2(
 devices), 4), so a finding on 1 device counts once and one on 8 or more devices counts at most \
 four times. Score = round(100 x e^(-points/80)); 100 means no weighted risk was found. Grade: \
 A >= 90, B >= 80, C >= 65, D >= 50, otherwise F. Caps: any critical finding limits the grade to \
-D and any high finding limits it to B, regardless of the numeric score.";
+D and any high finding limits it to B, regardless of the numeric score. Coverage: the grade is \
+reported with the number of checks that could be evaluated on the collected data (\"graded on N \
+of M checks\"); a check that could not run neither passes nor fails. When fewer than half of the \
+checks were evaluated the grade is limited to B, and below a quarter to C, because an absence \
+of findings then says little.";
 
 /// Tunable thresholds for the rules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -954,6 +1270,8 @@ pub struct AuditThresholds {
     pub max_dhcp_servers: usize,
     /// More IPv6 routers (RA sources) than this is flagged.
     pub max_ipv6_routers: usize,
+    /// A PoE budget used above this percentage is flagged.
+    pub poe_budget_warn_pct: f64,
 }
 
 impl Default for AuditThresholds {
@@ -969,6 +1287,7 @@ impl Default for AuditThresholds {
             uplink_mac_threshold: crate::engine::MAX_ACCESS_PORT_MACS as u32,
             max_dhcp_servers: 1,
             max_ipv6_routers: 1,
+            poe_budget_warn_pct: 85.0,
         }
     }
 }
@@ -1067,6 +1386,12 @@ rules! {
         ["CIS Controls v8 4.2: Establish and maintain a secure configuration process for network infrastructure"];
     R_HUB_PORT = "SWR-PRT-001", "Switch ports", "Several MACs on an access port (unmanaged switch or hub?)",
         ["CIS Controls v8 1.2: Address unauthorized assets", "Mitigation: port security / 802.1X"];
+    R_POE_BUDGET = "SWR-POE-001", "Power over Ethernet", "PoE power budget nearly exhausted",
+        ["Availability: new or rebooting powered devices may be denied power"];
+    R_POE_VOICE = "SWR-POE-002", "Power over Ethernet", "PoE-powered IP phones on ports without a voice VLAN",
+        ["CIS Controls v8 12.2", "Network segmentation for voice traffic"];
+    R_POE_IDLE = "SWR-POE-003", "Power over Ethernet", "PoE enabled on ports serving non-powered devices",
+        ["CIS Controls v8 4.8: Uninstall or disable unnecessary services"];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1082,7 +1407,10 @@ pub struct Ctx<'a> {
     pub scanned_ports: Option<Vec<u16>>,
     /// Any device has open-port data.
     pub has_port_data: bool,
-    /// IPs of SNMP agents that answered (from snmp infos and port mappings).
+    /// TCP ports some device has open (proof that they were scanned).
+    pub open_anywhere: BTreeSet<u16>,
+    /// IPs of SNMP agents that answered (from `meta.snmpAgents`, snmp infos and port
+    /// mappings).
     pub snmp_agents: BTreeSet<String>,
     /// Native VLAN of the scanning host's access port per local interface (from CDP/LLDP).
     pub native_vlan_by_iface: HashMap<String, u16>,
@@ -1093,10 +1421,13 @@ pub struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     pub fn new(input: &'a AuditInput, t: &'a AuditThresholds, now_ms: u64) -> Self {
         let mut snmp_agents: BTreeSet<String> = input
-            .snmp_infos
+            .meta
+            .snmp_agents
             .iter()
-            .filter_map(|s| s.ip.clone())
+            .filter(|a| a.answered)
+            .map(|a| a.ip.clone())
             .collect();
+        snmp_agents.extend(input.snmp_infos.iter().filter_map(|s| s.ip.clone()));
         snmp_agents.extend(
             input
                 .port_mappings
@@ -1128,6 +1459,11 @@ impl<'a> Ctx<'a> {
             now_ms,
             scanned_ports: input.meta.scanned_ports(),
             has_port_data: input.devices.iter().any(|d| !d.open_ports.is_empty()),
+            open_anywhere: input
+                .devices
+                .iter()
+                .flat_map(|d| d.open_ports.iter().copied())
+                .collect(),
             snmp_agents,
             native_vlan_by_iface,
             infra_macs: input
@@ -1140,35 +1476,47 @@ impl<'a> Ctx<'a> {
     }
 
     /// The VLAN a device sits in: its tag, else the native VLAN advertised to the scanner on
-    /// the interface it was found on (when exactly one is known).
+    /// the local interface it was found on (when exactly one is known). Devices without a
+    /// local interface (routed hosts) are never assigned the scanner's native VLAN.
     pub fn effective_vlan(&self, d: &AuditDevice) -> Option<u16> {
-        d.vlan_id.or_else(|| match d.interface.as_deref() {
-            Some(i) => self.native_vlan_by_iface.get(i).copied(),
-            None if self.native_vlan_by_iface.len() == 1 => {
-                self.native_vlan_by_iface.values().next().copied()
-            }
-            None => None,
+        d.vlan_id.or_else(|| {
+            d.interface
+                .as_deref()
+                .and_then(|i| self.native_vlan_by_iface.get(i).copied())
         })
     }
 
-    /// `Some(note)` when `ports` were not part of the scan (so absence proves nothing).
+    /// Whether TCP `port` was part of the scan: from the scanned port list when it is known,
+    /// otherwise only provable by some device having it open (`None` = unknown).
+    pub fn port_scanned(&self, port: u16) -> Option<bool> {
+        match &self.scanned_ports {
+            Some(s) => Some(s.binary_search(&port).is_ok()),
+            None => self.open_anywhere.contains(&port).then_some(true),
+        }
+    }
+
+    /// `Err(note)` when `ports` were not (provably) part of the scan, so absence proves
+    /// nothing.
     fn port_coverage(&self, ports: &[u16]) -> Result<(), String> {
         if !self.has_port_data && self.scanned_ports.is_none() {
             return Err("no TCP port data in the input".into());
         }
-        if let Some(scanned) = &self.scanned_ports {
-            if !ports.iter().any(|p| scanned.binary_search(p).is_ok()) {
-                return Err(format!(
-                    "port {} was not in the scanned port list",
-                    ports
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join("/")
-                ));
+        let list = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join("/");
+        match &self.scanned_ports {
+            Some(scanned) if !ports.iter().any(|p| scanned.binary_search(p).is_ok()) => {
+                Err(format!("port {list} was not in the scanned port list"))
             }
+            Some(_) => Ok(()),
+            None if ports.iter().any(|p| self.open_anywhere.contains(p)) => Ok(()),
+            None => Err(format!(
+                "the scanned port list is unknown (no portSpec in the input) and no device \
+                 has TCP {list} open"
+            )),
         }
-        Ok(())
     }
 }
 
@@ -1227,6 +1575,7 @@ impl Draft {
         let breadth = (1.0 + (count.max(1) as f64).log2()).min(4.0);
         let mut affected = self.affected;
         affected.truncate(MAX_AFFECTED);
+        let affected_truncated = count - affected.len();
         Finding {
             id: self.rule.id.to_string(),
             severity: self.severity,
@@ -1235,6 +1584,7 @@ impl Draft {
             description: self.description,
             affected,
             affected_count: count,
+            affected_truncated,
             evidence: self.evidence,
             remediation: self.remediation,
             references: self.rule.references.iter().map(|s| s.to_string()).collect(),
@@ -1249,7 +1599,7 @@ type RuleFn = fn(&Ctx) -> RuleOutcome;
 /// Run every rule over `input`. `now_ms` is the reference time for certificate expiry.
 pub fn run_audit(input: &AuditInput, t: &AuditThresholds, now_ms: u64) -> AuditResult {
     let ctx = Ctx::new(input, t, now_ms);
-    let rules: [(&RuleDef, RuleFn); 31] = [
+    let rules: [(&RuleDef, RuleFn); 34] = [
         (&R_TELNET, rule_telnet),
         (&R_FTP, rule_ftp),
         (&R_TFTP, rule_tftp),
@@ -1281,6 +1631,9 @@ pub fn run_audit(input: &AuditInput, t: &AuditThresholds, now_ms: u64) -> AuditR
         (&R_VLAN1_HOSTS, rule_vlan1_hosts),
         (&R_UNUSED_VLAN, rule_unused_vlan),
         (&R_HUB_PORT, rule_hub_port),
+        (&R_POE_BUDGET, rule_poe_budget),
+        (&R_POE_VOICE, rule_poe_voice),
+        (&R_POE_IDLE, rule_poe_idle),
     ];
     debug_assert_eq!(rules.len(), RULES.len());
     let mut findings = Vec::new();
@@ -1306,7 +1659,8 @@ pub fn run_audit(input: &AuditInput, t: &AuditThresholds, now_ms: u64) -> AuditR
             .then(b.points.total_cmp(&a.points))
             .then_with(|| a.id.cmp(&b.id))
     });
-    let score = score_findings(&findings);
+    let evaluated = checks.iter().filter(|c| c.evaluated).count();
+    let score = score_with_coverage(&findings, evaluated, checks.len());
     AuditResult {
         findings,
         checks,
@@ -1316,7 +1670,32 @@ pub fn run_audit(input: &AuditInput, t: &AuditThresholds, now_ms: u64) -> AuditR
     }
 }
 
-/// Apply the documented scoring algorithm ([`SCORING_METHOD`]).
+/// [`score_findings`] plus the coverage cap of [`SCORING_METHOD`]: fewer than half of the
+/// checks evaluated limits the grade to B, fewer than a quarter to C.
+pub fn score_with_coverage(findings: &[Finding], evaluated: usize, total: usize) -> RiskScore {
+    let mut s = score_findings(findings);
+    s.evaluated_checks = evaluated;
+    s.total_checks = total;
+    let cap = if evaluated * 4 < total {
+        'C'
+    } else if evaluated * 2 < total {
+        'B'
+    } else {
+        'A'
+    };
+    let current = s.grade.chars().next().unwrap_or('A');
+    if cap > current {
+        s.grade = cap.to_string();
+        let why = format!("only {evaluated} of {total} checks could be evaluated");
+        s.capped_by = Some(match s.capped_by.take() {
+            Some(prev) => format!("{prev}; {why}"),
+            None => why,
+        });
+    }
+    s
+}
+
+/// Apply the documented scoring algorithm ([`SCORING_METHOD`]) without the coverage cap.
 pub fn score_findings(findings: &[Finding]) -> RiskScore {
     let mut counts = SeverityCounts::default();
     let mut points = 0.0;
@@ -1347,6 +1726,8 @@ pub fn score_findings(findings: &[Finding]) -> RiskScore {
         points: (points * 100.0).round() / 100.0,
         counts,
         capped_by: (grade != numeric).then(|| why.to_string()),
+        evaluated_checks: 0,
+        total_checks: 0,
     }
 }
 
@@ -1609,8 +1990,16 @@ fn rule_vnc(ctx: &Ctx) -> RuleOutcome {
 }
 
 fn rule_http_mgmt(ctx: &Ctx) -> RuleOutcome {
-    ctx.port_coverage(&[80])?;
+    ctx.port_coverage(&[80, 8080])?;
     let tls_ports = [443, 4443, 8443, 10443];
+    // "HTTP only" needs proof that HTTPS ports were looked at.
+    if !tls_ports.iter().any(|p| ctx.port_scanned(*p) == Some(true)) {
+        return Err(
+            "no HTTPS port (443/4443/8443/10443) is known to have been scanned, so HTTP-only \
+             management cannot be told apart"
+                .into(),
+        );
+    }
     let affected: Vec<Affected> = ctx
         .input
         .devices
@@ -1675,28 +2064,75 @@ fn rule_ssh_telnet(ctx: &Ctx) -> RuleOutcome {
 
 // --- SNMP ------------------------------------------------------------------------------------
 
-fn snmp_meta<'a>(ctx: &Ctx<'a>) -> Result<&'a SnmpMeta, String> {
-    ctx.input
-        .meta
-        .snmp
-        .as_ref()
-        .ok_or_else(|| "SNMP polling was not enabled for this scan".to_string())
+/// What is known about one answering (or silent) SNMP agent.
+struct AgentView {
+    ip: String,
+    answered: bool,
+    /// `v1` / `v2c` / `v3` / unrecognized text; `None` when not recorded.
+    version: Option<String>,
+    /// `public` / `private` / `custom` / `none` / `v3`; `None` when not recorded.
+    class: Option<String>,
 }
 
-fn agent_affected(ctx: &Ctx) -> Vec<Affected> {
-    ctx.snmp_agents
-        .iter()
+/// Every SNMP agent the input knows about: `meta.snmpAgents` (with per-agent version and
+/// community class) plus agents that answered according to snmp infos / port mappings
+/// (described by the scan-wide `meta.snmp`). `Err` when nothing is known.
+fn snmp_agent_views(ctx: &Ctx) -> Result<Vec<AgentView>, String> {
+    let meta = &ctx.input.meta;
+    if meta.snmp.is_none() && meta.snmp_agents.is_empty() && ctx.snmp_agents.is_empty() {
+        return Err("SNMP polling was not enabled for this scan".into());
+    }
+    let scan_version = meta
+        .snmp
+        .as_ref()
+        .map(|m| m.version.clone().unwrap_or_else(|| "v2c".into()));
+    let scan_class = meta.snmp.as_ref().and_then(|m| match m.uses_community() {
+        Some(false) => Some("v3".to_string()),
+        _ => m.community_kind.clone(),
+    });
+    let mut out: BTreeMap<String, AgentView> = BTreeMap::new();
+    for a in &meta.snmp_agents {
+        let e = out.entry(a.ip.clone()).or_insert_with(|| AgentView {
+            ip: a.ip.clone(),
+            answered: false,
+            version: a.version.clone().or_else(|| scan_version.clone()),
+            class: a.community_class.clone().or_else(|| scan_class.clone()),
+        });
+        e.answered |= a.answered;
+    }
+    for ip in &ctx.snmp_agents {
+        out.entry(ip.clone())
+            .or_insert_with(|| AgentView {
+                ip: ip.clone(),
+                answered: true,
+                version: scan_version.clone(),
+                class: scan_class.clone(),
+            })
+            .answered = true;
+    }
+    if out.is_empty() {
+        return Err(
+            "no record of which SNMP agents were polled or answered (no snmpAgents, SNMP \
+             results or switch-port mappings in the input)"
+                .into(),
+        );
+    }
+    Ok(out.into_values().collect())
+}
+
+fn agent_affected(ctx: &Ctx, ips: &[&str]) -> Vec<Affected> {
+    ips.iter()
         .map(|ip| {
-            let dev = ctx.input.devices.iter().find(|d| &d.ip == ip);
+            let dev = ctx.input.devices.iter().find(|d| d.ip == *ip);
             let name = ctx
                 .input
                 .snmp_infos
                 .iter()
-                .find(|s| s.ip.as_deref() == Some(ip))
+                .find(|s| s.ip.as_deref() == Some(*ip))
                 .and_then(|s| s.sys_name.clone())
                 .or_else(|| dev.and_then(|d| d.name().map(str::to_string)));
             Affected {
-                ip: Some(ip.clone()),
+                ip: Some(ip.to_string()),
                 name,
                 mac: dev.and_then(|d| d.mac.clone()),
                 vlan: dev.and_then(|d| ctx.effective_vlan(d)),
@@ -1708,80 +2144,112 @@ fn agent_affected(ctx: &Ctx) -> Vec<Affected> {
 }
 
 fn rule_snmp_default(ctx: &Ctx) -> RuleOutcome {
-    let meta = snmp_meta(ctx)?;
-    if !meta.uses_community() {
-        return Ok(Vec::new());
+    let agents = snmp_agent_views(ctx)?;
+    let tested: Vec<&AgentView> = agents
+        .iter()
+        .filter(|a| matches!(a.class.as_deref(), Some("public" | "private")))
+        .collect();
+    if tested.is_empty() {
+        return Err(if agents.iter().all(|a| a.class.is_none()) {
+            "the SNMP community used is not recorded"
+        } else {
+            "the scan used a custom community or SNMPv3, so default communities were not \
+                 tested"
+        }
+        .into());
     }
-    let kind = match meta.community_kind.as_deref() {
-        Some(k @ ("public" | "private")) => k,
-        Some(_) => return Ok(Vec::new()),
-        None => return Err("the SNMP community used is not recorded".into()),
-    };
-    let affected = agent_affected(ctx);
-    if affected.is_empty() {
-        return Ok(Vec::new());
+    let mut out = Vec::new();
+    for kind in ["private", "public"] {
+        let ips: Vec<&str> = tested
+            .iter()
+            .filter(|a| a.answered && a.class.as_deref() == Some(kind))
+            .map(|a| a.ip.as_str())
+            .collect();
+        if ips.is_empty() {
+            continue;
+        }
+        let affected = agent_affected(ctx, &ips);
+        let severity = if kind == "private" {
+            Severity::Critical
+        } else {
+            Severity::High
+        };
+        let mut d = Draft::new(
+            &R_SNMP_DEFAULT,
+            severity,
+            format!(
+                "These agents answered SNMP requests using the factory-default community \
+                 `{kind}`. Anyone on the network can read the full configuration inventory \
+                 (interfaces, ARP / MAC tables, routes){}.",
+                if kind == "private" {
+                    " and the `private` community is commonly read-write, allowing configuration \
+                     changes"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .evidence(format!(
+            "{} agent(s) returned data for community `{kind}`",
+            affected.len()
+        ))
+        .affected(affected)
+        .fix(
+            "Remove the default communities, migrate to SNMPv3 authPriv (SHA-2 + AES), and \
+              restrict SNMP with an ACL to the monitoring servers.",
+        );
+        d.title = Some(format!("SNMP answers the default community \"{kind}\""));
+        out.push(d.finish());
     }
-    let severity = if kind == "private" {
-        Severity::Critical
-    } else {
-        Severity::High
-    };
-    let mut d = Draft::new(
-        &R_SNMP_DEFAULT,
-        severity,
-        format!(
-            "These agents answered SNMP requests using the factory-default community \
-             `{kind}`. Anyone on the network can read the full configuration inventory \
-             (interfaces, ARP / MAC tables, routes){}.",
-            if kind == "private" {
-                " and the `private` community is commonly read-write, allowing configuration \
-                 changes"
-            } else {
-                ""
-            }
-        ),
-    )
-    .evidence(format!(
-        "{} agent(s) returned data for community `{kind}`",
-        affected.len()
-    ))
-    .affected(affected)
-    .fix(
-        "Remove the default communities, migrate to SNMPv3 authPriv (SHA-2 + AES), and \
-          restrict SNMP with an ACL to the monitoring servers.",
-    );
-    d.title = Some(format!("SNMP answers the default community \"{kind}\""));
-    Ok(vec![d.finish()])
+    Ok(out)
 }
 
 fn rule_snmp_v12(ctx: &Ctx) -> RuleOutcome {
-    let meta = snmp_meta(ctx)?;
-    if !meta.uses_community() {
-        return Ok(Vec::new());
+    let agents = snmp_agent_views(ctx)?;
+    let answered: Vec<&AgentView> = agents.iter().filter(|a| a.answered).collect();
+    if answered.is_empty() {
+        return Err("no SNMP agent answered, so the versions in use are unknown".into());
     }
-    let affected = agent_affected(ctx);
-    if affected.is_empty() {
-        return Ok(Vec::new());
+    if answered
+        .iter()
+        .any(|a| !matches!(a.version.as_deref(), Some("v1" | "v2c" | "v3")))
+    {
+        return Err("the SNMP version used is not recorded or not recognized".into());
     }
-    let version = meta.version.clone().unwrap_or_else(|| "v2c".into());
-    Ok(vec![Draft::new(
-        &R_SNMP_V12,
-        Severity::Medium,
-        format!(
-            "Infrastructure is polled with SNMP{version}, whose community string travels in \
-             cleartext and provides no integrity protection."
-        ),
-    )
-    .evidence(format!(
-        "{} agent(s) answered SNMP{version}",
-        affected.len()
-    ))
-    .affected(affected)
-    .fix(
-        "Configure SNMPv3 users with authPriv (SHA-256 / AES-128 or better), disable v1/v2c \
-          communities once monitoring has migrated, and restrict SNMP to the NMS addresses.",
-    )
-    .finish()])
+    let mut out = Vec::new();
+    for version in ["v1", "v2c"] {
+        let ips: Vec<&str> = answered
+            .iter()
+            .filter(|a| a.version.as_deref() == Some(version))
+            .map(|a| a.ip.as_str())
+            .collect();
+        if ips.is_empty() {
+            continue;
+        }
+        let affected = agent_affected(ctx, &ips);
+        out.push(
+            Draft::new(
+                &R_SNMP_V12,
+                Severity::Medium,
+                format!(
+                    "Infrastructure is polled with SNMP{version}, whose community string travels \
+                     in cleartext and provides no integrity protection."
+                ),
+            )
+            .evidence(format!(
+                "{} agent(s) answered SNMP{version}",
+                affected.len()
+            ))
+            .affected(affected)
+            .fix(
+                "Configure SNMPv3 users with authPriv (SHA-256 / AES-128 or better), disable \
+                  v1/v2c communities once monitoring has migrated, and restrict SNMP to the NMS \
+                  addresses.",
+            )
+            .finish(),
+        );
+    }
+    Ok(out)
 }
 
 fn rule_snmp_partial(ctx: &Ctx) -> RuleOutcome {
@@ -1859,14 +2327,16 @@ fn rule_tls_expired(ctx: &Ctx) -> RuleOutcome {
     let now = ctx.now_ms;
     let affected = cert_rule(ctx, |c| {
         let days = c.days_left(now);
-        let expired = days.map(|d| d < 0).or(c.expired).unwrap_or(false);
-        expired.then(|| {
+        c.is_expired(now).unwrap_or(false).then(|| {
             format!(
                 "{} expired {}",
                 cert_name(c),
                 c.not_after
                     .clone()
-                    .or_else(|| days.map(|d| format!("{} days ago", -d)))
+                    .or_else(|| days.map(|d| match d.unsigned_abs() {
+                        0 => "today".to_string(),
+                        n => format!("{n} days ago"),
+                    }))
                     .unwrap_or_default()
             )
         })
@@ -1893,8 +2363,7 @@ fn rule_tls_expiring(ctx: &Ctx) -> RuleOutcome {
     let (now, warn) = (ctx.now_ms, ctx.t.cert_expiry_warn_days);
     let affected = cert_rule(ctx, |c| {
         let days = c.days_left(now)?;
-        (0..=warn)
-            .contains(&days)
+        (c.is_expired(now) != Some(true) && (0..=warn).contains(&days))
             .then(|| format!("{} expires in {days} day(s)", cert_name(c)))
     })?;
     if affected.is_empty() {
@@ -2071,12 +2540,14 @@ fn rule_dup_ip(ctx: &Ctx) -> RuleOutcome {
 }
 
 fn rule_mac_multi(ctx: &Ctx) -> RuleOutcome {
-    let mut map: BTreeMap<(String, Option<u16>), Vec<&AuditDevice>> = BTreeMap::new();
+    // (MAC, VLAN) -> IP -> device: the same IP listed twice is one address, not several.
+    let mut map: BTreeMap<(String, Option<u16>), BTreeMap<String, &AuditDevice>> = BTreeMap::new();
     for d in &ctx.input.devices {
         if let (Some(mac), Some(IpAddr::V4(_))) = (&d.mac, d.ip_addr()) {
             map.entry((mac.clone(), ctx.effective_vlan(d)))
                 .or_default()
-                .push(d);
+                .entry(d.ip.clone())
+                .or_insert(d);
         }
     }
     if map.is_empty() {
@@ -2084,13 +2555,14 @@ fn rule_mac_multi(ctx: &Ctx) -> RuleOutcome {
     }
     let mut hosts = Vec::new();
     let mut gateways = Vec::new();
-    for ((mac, _), devs) in map.iter().filter(|(_, v)| v.len() > 1) {
-        let ips: Vec<&str> = devs.iter().map(|d| d.ip.as_str()).collect();
+    for ((mac, _), by_ip) in map.iter().filter(|(_, v)| v.len() > 1) {
+        let devs: Vec<&AuditDevice> = by_ip.values().copied().collect();
+        let ips: Vec<&str> = by_ip.keys().map(String::as_str).collect();
         let infra = ctx.infra_macs.contains(mac)
             || devs
                 .iter()
                 .any(|d| matches!(d.role, DeviceRole::Router | DeviceRole::Firewall));
-        for d in devs {
+        for d in &devs {
             let a = affected_device(
                 d,
                 ctx,
@@ -2393,18 +2865,31 @@ fn rule_voice_vlan(ctx: &Ctx) -> RuleOutcome {
         .filter_map(|n| n.voice_vlan)
         .chain(ctx.input.devices.iter().filter_map(AuditDevice::voice_vlan))
         .collect();
-    // Data VLANs: where the non-phone hosts live.
+    // Data VLANs: where the non-phone hosts live. A routed host (no local interface, no
+    // tag) is in an unknown VLAN and says nothing either way.
+    let known = |d: &AuditDevice| ctx.effective_vlan(d).is_some() || d.interface.is_some();
     let mut data_vlans: BTreeMap<Option<u16>, usize> = BTreeMap::new();
-    for d in ctx.input.devices.iter().filter(|d| !d.is_phone()) {
+    for d in ctx
+        .input
+        .devices
+        .iter()
+        .filter(|d| !d.is_phone() && known(d))
+    {
         *data_vlans.entry(ctx.effective_vlan(d)).or_default() += 1;
     }
-    let affected: Vec<Affected> = phones
+    let placed: Vec<&AuditDevice> = phones.iter().copied().filter(|p| known(p)).collect();
+    if placed.is_empty() {
+        return Err(format!(
+            "the VLAN of the {} identified phone(s) is unknown (routed scan)",
+            phones.len()
+        ));
+    }
+    let affected: Vec<Affected> = placed
         .iter()
         .filter(|p| {
             let v = ctx.effective_vlan(p);
             let in_voice = v.is_some_and(|v| advertised.contains(&v));
-            !in_voice
-                && (v.is_none() || v == Some(1) || data_vlans.get(&v).copied().unwrap_or(0) > 0)
+            !in_voice && (v == Some(1) || data_vlans.get(&v).copied().unwrap_or(0) > 0)
         })
         .map(|p| {
             let v = ctx.effective_vlan(p);
@@ -2458,18 +2943,25 @@ fn rule_vlan1_hosts(ctx: &Ctx) -> RuleOutcome {
         .iter()
         .filter(|d| ctx.effective_vlan(d) == Some(1))
         .collect();
-    if hosts.is_empty()
-        && !ctx
-            .input
-            .devices
-            .iter()
-            .any(|d| ctx.effective_vlan(d).is_some())
-    {
+    let unknown = ctx
+        .input
+        .devices
+        .iter()
+        .filter(|d| ctx.effective_vlan(d).is_none())
+        .count();
+    if unknown == ctx.input.devices.len() {
         return Err(
             "VLAN membership unknown (no tagged scan and no native VLAN advertised)".into(),
         );
     }
     if hosts.len() < ctx.t.vlan1_max_hosts {
+        if hosts.len() + unknown >= ctx.t.vlan1_max_hosts {
+            return Err(format!(
+                "the VLAN of {unknown} of {} devices is unknown, so the VLAN 1 host count \
+                 could reach the threshold",
+                ctx.input.devices.len()
+            ));
+        }
         return Ok(Vec::new());
     }
     Ok(vec![Draft::new(
@@ -2526,6 +3018,20 @@ fn rule_unused_vlan(ctx: &Ctx) -> RuleOutcome {
     );
     used.extend(ctx.input.neighbors.iter().filter_map(|n| n.native_vlan));
     used.extend(ctx.input.neighbors.iter().filter_map(|n| n.voice_vlan));
+    // A voice VLAN configured on ports is in use even when no phone answered the scan.
+    used.extend(ctx.input.devices.iter().filter_map(AuditDevice::voice_vlan));
+    used.extend(
+        ctx.input
+            .port_mappings
+            .iter()
+            .chain(
+                ctx.input
+                    .snmp_infos
+                    .iter()
+                    .flat_map(|s| s.port_mappings.iter()),
+            )
+            .filter_map(|p| p.voice_vlan),
+    );
     let affected: Vec<Affected> = defined
         .iter()
         .filter(|(id, _)| !used.contains(id) && !(1002..=1005).contains(*id) && **id != 1)
@@ -2677,6 +3183,194 @@ fn rule_hub_port(ctx: &Ctx) -> RuleOutcome {
         "Inspect the ports physically, document legitimate hypervisors / docks, and limit \
           MACs per port with port security or 802.1X multi-auth.",
     )
+    .finish()])
+}
+
+// --- Power over Ethernet ---------------------------------------------------------------------
+
+fn rule_poe_budget(ctx: &Ctx) -> RuleOutcome {
+    let budgets: Vec<(&AuditSnmpInfo, f64)> = ctx
+        .input
+        .snmp_infos
+        .iter()
+        .filter_map(|s| Some((s, s.poe_budget.as_ref()?.used_fraction()?)))
+        .collect();
+    if budgets.is_empty() {
+        return Err("no switch PoE budget data (POWER-ETHERNET-MIB) in the input".into());
+    }
+    let warn = ctx.t.poe_budget_warn_pct / 100.0;
+    let mut out = Vec::new();
+    for (sev, lo, hi) in [
+        (Severity::High, 1.0, f64::INFINITY),
+        (Severity::Medium, warn, 1.0),
+    ] {
+        let affected: Vec<Affected> = budgets
+            .iter()
+            .filter(|(_, f)| *f >= lo && *f < hi)
+            .map(|(s, f)| {
+                let b = s.poe_budget.as_ref();
+                Affected {
+                    ip: s.ip.clone(),
+                    name: Some(s.name()),
+                    detail: Some(format!(
+                        "{:.0}% of {:.0} W in use ({:.0} W)",
+                        f * 100.0,
+                        b.and_then(|b| b.nominal_watts).unwrap_or(0.0),
+                        b.and_then(|b| b.consumed_watts).unwrap_or(0.0)
+                    )),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        if affected.is_empty() {
+            continue;
+        }
+        let mut d = Draft::new(
+            &R_POE_BUDGET,
+            sev,
+            "These switches are close to (or over) their Power-over-Ethernet budget. When the \
+             budget is exhausted, newly connected or rebooting phones, access points and \
+             cameras are denied power or lower-priority ports are shut down.",
+        )
+        .evidence(format!(
+            "warning threshold: {:.0}%",
+            ctx.t.poe_budget_warn_pct
+        ))
+        .affected(affected)
+        .fix(
+            "Review per-port power allocation (static vs. class-based), set port priorities \
+              for critical devices, add a power supply or move powered devices to another \
+              switch.",
+        );
+        if sev == Severity::High {
+            d.title = Some("PoE power budget exhausted".into());
+        }
+        out.push(d.finish());
+    }
+    Ok(out)
+}
+
+/// Every port mapping in the input (top-level and per-switch).
+fn all_port_mappings<'a>(ctx: &Ctx<'a>) -> impl Iterator<Item = &'a AuditPortMapping> {
+    ctx.input.port_mappings.iter().chain(
+        ctx.input
+            .snmp_infos
+            .iter()
+            .flat_map(|s| s.port_mappings.iter()),
+    )
+}
+
+fn rule_poe_voice(ctx: &Ctx) -> RuleOutcome {
+    // Switches that report voice VLAN configuration for at least one port: on them a port
+    // without one is evidence, elsewhere it is just missing data.
+    let reporting: BTreeSet<&str> = all_port_mappings(ctx)
+        .filter(|p| p.voice_vlan.is_some())
+        .map(|p| p.switch_name.as_str())
+        .chain(
+            ctx.input
+                .devices
+                .iter()
+                .filter_map(|d| d.switch_port.as_ref())
+                .filter(|p| p.voice_vlan.is_some())
+                .map(|p| p.switch_name.as_str()),
+        )
+        .collect();
+    let powered: Vec<&AuditDevice> = ctx
+        .input
+        .devices
+        .iter()
+        .filter(|d| d.is_phone() && d.poe().is_some_and(|p| p.delivering()))
+        .collect();
+    if powered.is_empty() {
+        return Err("no PoE-powered IP phones identified".into());
+    }
+    let judged: Vec<&AuditDevice> = powered
+        .iter()
+        .copied()
+        .filter(|d| {
+            d.switch_port
+                .as_ref()
+                .is_some_and(|p| reporting.contains(p.switch_name.as_str()))
+        })
+        .collect();
+    if judged.is_empty() {
+        return Err(
+            "the switches of the PoE-powered phones did not report voice VLAN configuration".into(),
+        );
+    }
+    let affected: Vec<Affected> = judged
+        .iter()
+        .filter(|d| d.voice_vlan().is_none())
+        .map(|d| {
+            affected_device(
+                d,
+                ctx,
+                Some("PoE-powered phone, no voice VLAN on its port".into()),
+            )
+        })
+        .collect();
+    if affected.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![Draft::new(
+        &R_POE_VOICE,
+        Severity::Low,
+        "IP phones draw power from these switch ports, but the ports have no voice VLAN \
+         configured while other ports on the same switches do. The phones share the data VLAN \
+         and lose voice QoS separation.",
+    )
+    .affected(affected)
+    .fix(
+        "Add the voice VLAN to these access ports (`switchport voice vlan <id>`) consistently \
+          with the other phone ports.",
+    )
+    .finish()])
+}
+
+fn rule_poe_idle(ctx: &Ctx) -> RuleOutcome {
+    let mut any = false;
+    let mut idle: BTreeMap<(String, String), (Option<String>, BTreeSet<String>)> = BTreeMap::new();
+    for p in all_port_mappings(ctx) {
+        let Some(poe) = &p.poe else { continue };
+        any = true;
+        // PSE enabled and still searching although a device is linked (its MAC was learned):
+        // the device does not take power.
+        if poe.status.as_deref() == Some("searching") && !poe.delivering() {
+            let e = idle
+                .entry((p.switch_name.clone(), p.port_name.clone()))
+                .or_insert_with(|| (p.switch_ip.clone(), BTreeSet::new()));
+            e.1.insert(p.mac.clone());
+        }
+    }
+    if !any {
+        return Err("no per-port PoE data (POWER-ETHERNET-MIB) in the input".into());
+    }
+    let affected: Vec<Affected> = idle
+        .into_iter()
+        .filter(|((_, port), _)| !is_uplink_name(port))
+        .map(|((switch, port), (ip, macs))| Affected {
+            ip,
+            name: Some(switch),
+            port: Some(port),
+            detail: Some(format!(
+                "PoE searching with {} non-powered device(s) linked",
+                macs.len()
+            )),
+            ..Default::default()
+        })
+        .collect();
+    if affected.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![Draft::new(
+        &R_POE_IDLE,
+        Severity::Info,
+        "PoE is enabled on these ports although the device linked there does not draw power. \
+         Leaving PSE enabled on ports that serve workstations allows anyone to power \
+         unauthorized equipment from the wall jack.",
+    )
+    .affected(affected)
+    .fix("Disable PoE on ports that do not serve powered devices (`power inline never`).")
     .finish()])
 }
 
@@ -3094,7 +3788,17 @@ pub(crate) mod tests {
         assert_eq!(mk(Severity::Medium, 1).points, 4.0);
         assert_eq!(mk(Severity::Medium, 8).points, 16.0);
         assert_eq!(mk(Severity::Medium, 1000).points, 16.0);
-        assert_eq!(mk(Severity::Medium, 1000).affected.len(), MAX_AFFECTED);
+        // Every affected entry is kept (up to MAX_AFFECTED) for the JSON export.
+        assert_eq!(mk(Severity::Medium, 1000).affected.len(), 1000);
+        let big = mk(Severity::Low, MAX_AFFECTED + 7);
+        assert_eq!(
+            (
+                big.affected.len(),
+                big.affected_count,
+                big.affected_truncated
+            ),
+            (MAX_AFFECTED, MAX_AFFECTED + 7, 7)
+        );
         // One high finding: numeric A, capped to B.
         let s = score_findings(&[mk(Severity::High, 1)]);
         assert_eq!(s.score, 90);
@@ -3120,6 +3824,281 @@ pub(crate) mod tests {
         let mut sorted = sevs.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(sevs, sorted);
+    }
+
+    // --- regression tests for the roadmap review -------------------------------------------
+
+    /// A real `Device` as `sweepr scan -o json` writes it (every optional field `null`).
+    fn scanned_device(ip: &str) -> Value {
+        let mut d = crate::models::Device::new(ip.parse().unwrap());
+        d.mac = Some("00:11:22:33:44:55".into());
+        d.vendor = Some("Acme".into());
+        serde_json::to_value(&d).unwrap()
+    }
+
+    #[test]
+    fn null_sip_is_not_a_phone() {
+        let v = scanned_device("10.0.0.5");
+        assert!(v.get("sip").is_some_and(Value::is_null), "fixture: {v}");
+        let i = input(json!([v, scanned_device("10.0.0.6")]));
+        assert!(i.devices.iter().all(|d| !d.is_phone()));
+        assert!(
+            !i.devices[0].extra.contains_key("sip"),
+            "null fields are pruned"
+        );
+        let r = run_audit(&i, &AuditThresholds::default(), NOW);
+        assert!(find(&r, "SWR-VLN-003").is_empty());
+        assert!(!check(&r, "SWR-VLN-003").evaluated);
+    }
+
+    #[test]
+    fn phone_identification_uses_real_sip_data_and_device_kind() {
+        let mut phone = scanned_device("10.0.0.7");
+        phone["sip"] = json!({ "userAgent": "Yealink SIP-T46S", "kind": "voip_phone" });
+        let mut pbx = scanned_device("10.0.0.8");
+        pbx["sip"] = json!({ "server": "Asterisk PBX 18", "kind": "pbx" });
+        pbx["deviceKind"] = json!("pbx");
+        let mut kind_only = scanned_device("10.0.0.9");
+        kind_only["deviceKind"] = json!("voip_phone");
+        let mut avaya_switch = scanned_device("10.0.0.10");
+        avaya_switch["vendor"] = json!("Avaya Inc");
+        avaya_switch["role"] = json!("switch");
+        let mut avaya_phone = scanned_device("10.0.0.11");
+        avaya_phone["vendor"] = json!("Avaya Inc");
+        let i = input(json!([phone, pbx, kind_only, avaya_switch, avaya_phone]));
+        let by_ip = |ip: &str| i.devices.iter().find(|d| d.ip == ip).unwrap().is_phone();
+        assert!(by_ip("10.0.0.7"));
+        assert!(!by_ip("10.0.0.8"), "a PBX is not a phone");
+        assert!(by_ip("10.0.0.9"));
+        assert!(!by_ip("10.0.0.10"), "an Avaya switch is not a phone");
+        assert!(by_ip("10.0.0.11"));
+        // LLDP Bridge+Telephone (phone with a PC port) is a phone; Router+Telephone is not.
+        let n = |caps: &[&str]| -> AuditNeighbor {
+            serde_json::from_value(json!({ "deviceId": "x", "capabilities": caps })).unwrap()
+        };
+        assert!(n(&["bridge", "telephone"]).is_phone());
+        assert!(!n(&["router", "telephone"]).is_phone());
+    }
+
+    #[test]
+    fn routed_hosts_never_inherit_the_scanner_native_vlan() {
+        let devices: Vec<Value> = (1..=12)
+            .map(|i| json!({ "ip": format!("10.9.0.{i}") }))
+            .collect();
+        let r = run(
+            json!({ "devices": devices, "neighbors": [nb("sw1", "en0", Some(1), &["switch"])] }),
+        );
+        assert!(find(&r, "SWR-VLN-004").is_empty());
+        assert!(!check(&r, "SWR-VLN-004").evaluated);
+        let i = input(
+            json!({ "devices": [{ "ip": "10.9.0.1" }, { "ip": "10.0.0.2", "interface": "en0" }],
+                              "neighbors": [nb("sw1", "en0", Some(1), &["switch"])] }),
+        );
+        let t = AuditThresholds::default();
+        let ctx = Ctx::new(&i, &t, NOW);
+        let v: Vec<Option<u16>> = i.devices.iter().map(|d| ctx.effective_vlan(d)).collect();
+        assert!(v.contains(&None) && v.contains(&Some(1)), "{v:?}");
+    }
+
+    #[test]
+    fn vlan1_rule_not_evaluated_when_unknown_vlans_could_reach_threshold() {
+        let mut devices: Vec<Value> = (1..=5)
+            .map(|i| json!({ "ip": format!("10.0.0.{i}"), "vlanId": 1 }))
+            .collect();
+        devices.extend((1..=8).map(|i| json!({ "ip": format!("10.8.0.{i}") })));
+        let r = run(json!({ "devices": devices }));
+        assert!(!check(&r, "SWR-VLN-004").evaluated);
+        // Few unknowns: evaluated, passes.
+        let devices: Vec<Value> = (1..=5)
+            .map(|i| json!({ "ip": format!("10.0.0.{i}"), "vlanId": 1 }))
+            .collect();
+        assert!(check(&run(json!({ "devices": devices })), "SWR-VLN-004").evaluated);
+    }
+
+    #[test]
+    fn snmp_rules_need_agent_and_community_evidence() {
+        let switch = dev("10.0.0.1", "00:11:22:00:00:01", "switch", &[]);
+        // SNMP enabled with the default community but no record of any agent: not evaluated.
+        let r = run(
+            json!({ "meta": { "snmp": { "version": "v2c", "communityKind": "public" } },
+                            "devices": [switch.clone()] }),
+        );
+        assert!(!check(&r, "SWR-SNP-001").evaluated);
+        assert!(!check(&r, "SWR-SNP-002").evaluated);
+        // Agents recorded by the scan (`meta.snmpAgents`).
+        let agents = |class: &str, version: &str, answered: bool| {
+            json!({ "meta": { "snmp": { "version": version, "communityKind": class },
+                              "snmpAgents": [{ "ip": "10.0.0.1", "version": version,
+                                               "communityClass": class, "answered": answered }] },
+                    "devices": [switch.clone()] })
+        };
+        let r = run(agents("public", "v2c", true));
+        assert_eq!(find(&r, "SWR-SNP-001")[0].severity, Severity::High);
+        assert_eq!(find(&r, "SWR-SNP-002").len(), 1);
+        // Polled with `public`, no answer: the default was tested and refused.
+        let r = run(agents("public", "v2c", false));
+        assert!(check(&r, "SWR-SNP-001").evaluated);
+        assert!(find(&r, "SWR-SNP-001").is_empty());
+        // Custom community / v3: defaults were never tried, so no "pass".
+        let r = run(agents("custom", "v2c", true));
+        assert!(!check(&r, "SWR-SNP-001").evaluated);
+        assert_eq!(find(&r, "SWR-SNP-002").len(), 1);
+        let r = run(agents("v3", "v3", true));
+        assert!(!check(&r, "SWR-SNP-001").evaluated);
+        assert!(check(&r, "SWR-SNP-002").evaluated);
+        assert!(find(&r, "SWR-SNP-002").is_empty());
+        // An unrecognized version string is not SNMPv3.
+        let r = run(agents("public", "v4", true));
+        assert!(!check(&r, "SWR-SNP-002").evaluated);
+        let i = input(json!({ "meta": { "snmp": { "version": "SNMPv2c" } } }));
+        assert_eq!(i.meta.snmp.unwrap().version.as_deref(), Some("v2c"));
+        // Agent records without a valid IP are dropped.
+        let i =
+            input(json!({ "meta": { "snmpAgents": [{ "ip": "bogus" }, { "ip": "10.0.0.1" }] } }));
+        assert_eq!(i.meta.snmp_agents.len(), 1);
+    }
+
+    #[test]
+    fn port_rules_without_port_spec_need_proof_of_scanning() {
+        // `scan -o json` has no portSpec: TCP 23 never seen open proves nothing.
+        let r = run(json!([dev("10.0.0.1", "00:11:22:00:00:01", "host", &[22])]));
+        assert!(!check(&r, "SWR-SVC-001").evaluated);
+        assert!(check(&r, "SWR-SVC-001")
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("portSpec"));
+        let r = run(json!([dev("10.0.0.1", "00:11:22:00:00:01", "host", &[23])]));
+        assert_eq!(find(&r, "SWR-SVC-001").len(), 1);
+        // An unparsable portSpec is reported, not silently ignored.
+        let i = input(json!({ "meta": { "portSpec": "22,abc" } }));
+        assert_eq!(i.warnings.len(), 1);
+        assert!(i.meta.scanned_ports().is_none());
+    }
+
+    #[test]
+    fn http_only_needs_https_ports_scanned() {
+        let r = run(json!({ "meta": { "portSpec": "22,80" }, "devices": [
+            dev("10.0.0.1", "00:11:22:00:00:01", "switch", &[80]),
+        ]}));
+        assert!(find(&r, "SWR-MGT-001").is_empty());
+        assert!(!check(&r, "SWR-MGT-001").evaluated);
+    }
+
+    #[test]
+    fn same_ip_listed_twice_is_not_one_mac_on_many_ips() {
+        let r = run(json!({ "devices": [
+            { "ip": "10.0.0.5", "mac": "00:11:22:00:00:01" },
+            { "ip": "10.0.0.5", "mac": "00:11:22:00:00:01", "hostname": "dup" },
+        ]}));
+        assert!(find(&r, "SWR-L2-002").is_empty());
+    }
+
+    #[test]
+    fn coverage_is_reported_and_caps_the_grade() {
+        let r = run(json!({ "devices": [] }));
+        assert_eq!(r.score.total_checks, RULES.len());
+        assert!(r.score.evaluated_checks * 4 < r.score.total_checks);
+        assert_eq!(r.score.grade, "C");
+        assert!(r
+            .score
+            .capped_by
+            .as_deref()
+            .unwrap()
+            .contains("checks could be evaluated"));
+        let s = score_with_coverage(&[], 30, 34);
+        assert_eq!(s.grade, "A");
+        assert!(s.capped_by.is_none());
+        assert_eq!(score_with_coverage(&[], 16, 34).grade, "B");
+    }
+
+    #[test]
+    fn meta_null_and_one_bad_field() {
+        let i = input(json!({ "meta": null, "devices": [] }));
+        assert_eq!(i.skipped_records, 0);
+        let i = input(
+            json!({ "meta": { "interface": "en0", "startedMs": "yesterday", "portSpec": "22" } }),
+        );
+        assert_eq!(i.meta.interface.as_deref(), Some("en0"));
+        assert_eq!(i.meta.port_spec.as_deref(), Some("22"));
+        assert_eq!(i.skipped_records, 1);
+    }
+
+    #[test]
+    fn crafted_extreme_dates_do_not_overflow() {
+        let r = run(json!({ "devices": [
+            cert_dev("10.0.0.1", json!({ "subjectCn": "a", "notAfterMs": i64::MIN })),
+            cert_dev("10.0.0.2", json!({ "subjectCn": "b", "daysRemaining": i64::MIN })),
+            cert_dev("10.0.0.3", json!({ "subjectCn": "c", "notAfterMs": i64::MAX })),
+        ]}));
+        assert_eq!(find(&r, "SWR-TLS-001")[0].affected_count, 2);
+    }
+
+    #[test]
+    fn ecdsa_is_not_weak_dsa() {
+        let c = |kt: &str, bits: u32| CertView {
+            key_type: Some(kt.into()),
+            key_bits: Some(bits),
+            ..Default::default()
+        };
+        let t = AuditThresholds::default();
+        assert!(c("ECDSA", 256).weakness(&t).is_none());
+        assert!(c("ECDSA P-384", 384).weakness(&t).is_none());
+        assert!(c("ECDSA", 160).weakness(&t).is_some());
+        assert!(c("DSA", 1024).weakness(&t).is_some());
+        assert!(c("RSA", 1024).weakness(&t).is_some());
+    }
+
+    #[test]
+    fn unused_vlans_skip_voice_vlans_and_bad_ids() {
+        let r = run(json!({
+            "devices": [{ "ip": "10.0.10.5", "vlanId": 10 }],
+            "portMappings": [{ "switchName": "sw", "portName": "Gi1/0/1", "mac": "00:11:22:00:00:01", "vlanId": 10, "voiceVlan": 110 }],
+            "snmpInfos": [{ "ip": "10.0.0.2", "role": "switch", "vlans": [
+                { "id": 10, "sources": ["snmp"] }, { "id": 110, "sources": ["snmp"] },
+                { "id": 5000, "sources": ["snmp"] }, { "id": 30, "sources": ["snmp"] }
+            ]}]
+        }));
+        let f = find(&r, "SWR-VLN-005");
+        let ids: Vec<Option<u16>> = f[0].affected.iter().map(|a| a.vlan).collect();
+        assert_eq!(ids, vec![Some(30)]);
+    }
+
+    #[test]
+    fn poe_rules() {
+        // No PoE data at all: none of the PoE rules pass silently.
+        let r = run(json!({ "devices": [dev("10.0.0.1", "00:11:22:00:00:01", "host", &[])] }));
+        for id in ["SWR-POE-001", "SWR-POE-002", "SWR-POE-003"] {
+            assert!(!check(&r, id).evaluated, "{id}");
+        }
+        let poe = json!({ "watts": 6.1, "status": "delivering" });
+        let r = run(json!({
+            "devices": [
+                { "ip": "10.0.110.5", "mac": "80:5e:c0:00:00:01", "vendor": "Yealink", "vlanId": 10,
+                  "switchPort": { "switchName": "acc", "portName": "Gi1/0/5", "mac": "80:5e:c0:00:00:01", "poe": poe } },
+                { "ip": "10.0.110.6", "mac": "80:5e:c0:00:00:02", "vendor": "Yealink", "vlanId": 110,
+                  "switchPort": { "switchName": "acc", "portName": "Gi1/0/6", "mac": "80:5e:c0:00:00:02", "poe": poe, "voiceVlan": 110 } },
+            ],
+            "portMappings": [
+                { "switchName": "acc", "portName": "Gi1/0/9", "mac": "00:11:22:00:00:09", "poe": { "status": "searching" } },
+                { "switchName": "acc", "portName": "Gi1/0/10", "mac": "00:11:22:00:00:0a", "poe": { "status": "delivering", "watts": 4.0 } },
+                { "switchName": "acc", "portName": "Gi1/0/11", "mac": "00:11:22:00:00:0b", "poe": "garbage" },
+            ],
+            "snmpInfos": [
+                { "ip": "10.0.0.2", "sysName": "acc", "poeBudget": { "nominalWatts": 370.0, "consumedWatts": 340.0 } },
+                { "ip": "10.0.0.3", "sysName": "acc2", "poeBudget": { "nominalWatts": 370.0, "consumedWatts": 100.0 } },
+            ]
+        }));
+        let b = find(&r, "SWR-POE-001");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].severity, Severity::Medium);
+        assert_eq!(b[0].affected[0].name.as_deref(), Some("acc"));
+        let v = find(&r, "SWR-POE-002");
+        assert_eq!(v[0].affected_count, 1);
+        assert_eq!(v[0].affected[0].ip.as_deref(), Some("10.0.110.5"));
+        let idle = find(&r, "SWR-POE-003");
+        assert_eq!(idle[0].affected_count, 1);
+        assert_eq!(idle[0].affected[0].port.as_deref(), Some("Gi1/0/9"));
     }
 
     #[test]

@@ -47,7 +47,12 @@ pub const METHODOLOGY: &[&str] = &[
     "Port utilization counts ports that learned at least one MAC address in the switch's \
      forwarding table at poll time; ports learning more MACs than the uplink threshold, \
      aggregate interfaces and ports leading to other switches, routers or firewalls are \
-     treated as uplinks / trunks.",
+     treated as uplinks / trunks. When the switch does not report its port count, it is \
+     estimated from the highest port number per module (uplinks included).",
+    "Grading: each check either runs on the collected data or is reported as 'not \
+     evaluated'; checks that did not run neither pass nor fail. The grade states how many \
+     checks it rests on, and is limited to B when fewer than half and to C when fewer than a \
+     quarter of the checks could be evaluated.",
 ];
 
 /// What the report cannot tell (appendix).
@@ -135,15 +140,16 @@ impl Logo {
         Ok(Logo { bytes, mime })
     }
 
+    /// Read a logo file: it must be a regular file (a FIFO or device cannot hang or flood
+    /// the read) and at most [`MAX_LOGO_BYTES`], enforced while reading.
     pub fn load(path: &Path) -> Result<Self> {
-        let meta =
-            std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
-        if meta.len() > MAX_LOGO_BYTES as u64 {
-            bail!("logo is larger than {} KiB", MAX_LOGO_BYTES / 1024);
-        }
-        Self::from_bytes(
-            std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?,
-        )
+        use std::io::Read;
+        let file = open_regular_read(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_LOGO_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        Self::from_bytes(bytes)
     }
 }
 
@@ -257,6 +263,12 @@ pub struct SwitchUtil {
     pub vlans: Vec<u16>,
     pub partial: bool,
     pub warnings: Vec<String>,
+    /// Switch-wide PoE budget (POWER-ETHERNET-MIB), when reported.
+    pub poe_budget: Option<audit::AuditPoeBudget>,
+    /// Ports with PoE delivery data that are delivering power.
+    pub poe_ports_delivering: usize,
+    /// Power drawn on those ports (sum of the per-port measurements), W.
+    pub poe_watts: Option<f64>,
 }
 
 impl SwitchUtil {
@@ -345,7 +357,7 @@ fn is_risky_port(port: u16) -> bool {
     )
 }
 
-/// Estimate a switch's port count from access-port names: per module / stack member prefix
+/// Estimate a switch's port count from its port names: per module / stack member prefix
 /// (`Gi2/0/`), the highest port number rounded up to a common size (`Gi1/0/45` -> 48), summed.
 fn estimate_port_count<'a>(names: impl Iterator<Item = &'a str>) -> Option<u32> {
     let mut per_prefix: BTreeMap<String, u32> = BTreeMap::new();
@@ -570,6 +582,20 @@ fn switch_utilization(input: &AuditInput, t: &AuditThresholds) -> Vec<SwitchUtil
             m
         });
 
+    // Ports delivering PoE per switch (port -> watts), from the per-port PoE data.
+    let mut poe_by_switch: HashMap<&str, BTreeMap<&str, Option<f64>>> = HashMap::new();
+    for pm in input
+        .port_mappings
+        .iter()
+        .chain(input.snmp_infos.iter().flat_map(|s| s.port_mappings.iter()))
+    {
+        if let Some(poe) = pm.poe.as_ref().filter(|p| p.delivering()) {
+            poe_by_switch
+                .entry(pm.switch_name.as_str())
+                .or_default()
+                .insert(pm.port_name.as_str(), poe.watts);
+        }
+    }
     let mut by_switch: BTreeMap<String, Vec<(String, &audit::PortStat)>> = BTreeMap::new();
     for ((sw, port), stat) in &table {
         by_switch
@@ -619,8 +645,9 @@ fn switch_utilization(input: &AuditInput, t: &AuditThresholds) -> Vec<SwitchUtil
         let (total_ports, total_estimated) = match info.and_then(|i| i.total_ports) {
             Some(n) => (Some(n), false),
             None => {
-                let est =
-                    estimate_port_count(rows.iter().filter(|r| !r.trunk).map(|r| r.port.as_str()));
+                // Every physical port name counts (uplinks are ports too, and they are counted
+                // as active); aggregates are skipped by the estimator.
+                let est = estimate_port_count(rows.iter().map(|r| r.port.as_str()));
                 (est.filter(|e| *e as usize >= active_ports), est.is_some())
             }
         };
@@ -631,6 +658,7 @@ fn switch_utilization(input: &AuditInput, t: &AuditThresholds) -> Vec<SwitchUtil
         if let Some(i) = info {
             vlans.extend(i.vlans.iter().map(|v| v.id));
         }
+        let poe = poe_by_switch.get(name.as_str());
         out.push(SwitchUtil {
             model: info.and_then(|i| i.sys_descr.as_deref().map(first_line)),
             ip,
@@ -651,10 +679,16 @@ fn switch_utilization(input: &AuditInput, t: &AuditThresholds) -> Vec<SwitchUtil
             vlans: vlans.into_iter().collect(),
             partial: info.is_some_and(|i| i.partial),
             warnings: info.map(|i| i.warnings.clone()).unwrap_or_default(),
+            poe_budget: info.and_then(|i| i.poe_budget.clone()),
+            poe_ports_delivering: poe.map_or(0, |p| p.len()),
+            poe_watts: poe
+                .map(|p| p.values().flatten().sum::<f64>())
+                .filter(|w| *w > 0.0),
             name,
         });
     }
     // Switches known from discovery but without SNMP data: shown as "not available".
+    let mut seen_names: HashSet<String> = out.iter().map(|s| s.name.clone()).collect();
     for d in input
         .devices
         .iter()
@@ -664,7 +698,7 @@ fn switch_utilization(input: &AuditInput, t: &AuditThresholds) -> Vec<SwitchUtil
             continue;
         }
         let name = d.name().unwrap_or(&d.ip).to_string();
-        if out.iter().any(|s| s.name == name) {
+        if !seen_names.insert(name.clone()) {
             continue;
         }
         out.push(SwitchUtil {
@@ -687,6 +721,9 @@ fn switch_utilization(input: &AuditInput, t: &AuditThresholds) -> Vec<SwitchUtil
             vlans: Vec::new(),
             partial: false,
             warnings: Vec::new(),
+            poe_budget: None,
+            poe_ports_delivering: 0,
+            poe_watts: None,
         });
     }
     out
@@ -800,6 +837,7 @@ impl<'a> Report<'a> {
             "thresholds": self.audit.thresholds,
             "stats": self.stats,
             "skippedRecords": self.input.skipped_records,
+            "inputWarnings": self.input.warnings,
             "devices": self.input.devices,
             "vlans": self.input.vlans,
             "neighbors": self.input.neighbors,
@@ -912,6 +950,7 @@ pub struct ScanCollector {
     neighbors: HashMap<String, CdpLldpNeighbor>,
     mappings: Vec<SwitchPortMapping>,
     mapping_keys: HashSet<(String, String, String, Option<u16>)>,
+    snmp_agents: BTreeMap<std::net::IpAddr, crate::models::SnmpAgentStatus>,
 }
 
 impl ScanCollector {
@@ -937,21 +976,65 @@ impl ScanCollector {
             {
                 self.mappings.push(pm.clone());
             }
+            ScanEvent::SnmpAgent(a) => {
+                if let Some(ip) = a.ip {
+                    if self.snmp_agents.len() < audit::MAX_INPUT_RECORDS
+                        || self.snmp_agents.contains_key(&ip)
+                    {
+                        // An agent that answered once stays answered.
+                        let keep = self.snmp_agents.get(&ip).is_some_and(|o| o.answered);
+                        if !keep || a.answered {
+                            self.snmp_agents.insert(ip, (**a).clone());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     /// Build the report input. `devices` (if given) replaces the collected device list, e.g.
     /// with the CLI's final, override-applied snapshot.
-    pub fn finish(self, devices: Option<Vec<Device>>, meta: ReportMeta) -> Result<AuditInput> {
+    ///
+    /// Every polled SNMP agent becomes a `meta.snmpAgents` record (community class only),
+    /// and every agent that answered an `snmpInfos` entry (system identity, PoE budget,
+    /// partial-result warnings), so the SNMP and PoE rules can run on `scan --report`.
+    pub fn finish(self, devices: Option<Vec<Device>>, mut meta: ReportMeta) -> Result<AuditInput> {
         let devices = devices.unwrap_or_else(|| self.devices.into_values().collect());
         let mut neighbors: Vec<CdpLldpNeighbor> = self.neighbors.into_values().collect();
         neighbors.sort_by_key(CdpLldpNeighbor::key);
+        meta.snmp_agents = self
+            .snmp_agents
+            .iter()
+            .map(|(ip, a)| audit::SnmpAgentMeta {
+                ip: ip.to_string(),
+                version: Some(a.version.clone()),
+                community_class: Some(a.community_class.clone()),
+                answered: a.answered,
+            })
+            .collect();
+        let snmp_infos: Vec<Value> = self
+            .snmp_agents
+            .iter()
+            .filter(|(_, a)| a.answered)
+            .map(|(ip, a)| {
+                json!({
+                    "ip": ip.to_string(),
+                    "sysName": a.sys_name,
+                    "sysDescr": a.sys_descr,
+                    "role": a.role,
+                    "poeBudget": a.poe_budget,
+                    "partial": a.partial,
+                    "warnings": a.warnings,
+                })
+            })
+            .collect();
         let v = json!({
             "devices": devices,
             "vlans": self.vlans.into_values().collect::<Vec<_>>(),
             "neighbors": neighbors,
             "portMappings": self.mappings,
+            "snmpInfos": snmp_infos,
             "meta": meta,
         });
         AuditInput::from_json_value(v)
@@ -963,29 +1046,99 @@ impl ScanCollector {
 // ---------------------------------------------------------------------------------------------
 
 /// Open `path` for writing without following a symlink at the final component and only if
-/// it is (or will be) a regular file. Used for paths chosen in the GUI dialog.
+/// it is (or will be) a regular file, without races: an existing file is opened with
+/// `O_NOFOLLOW | O_NONBLOCK` (a FIFO cannot block us), checked with `fstat` on the open
+/// descriptor and only then truncated; a new file is created with `O_EXCL | O_NOFOLLOW`. Used
+/// for GUI save-dialog paths and `sweepr scan --report` / `sweepr report -o`.
 fn open_regular_no_follow(path: &Path) -> Result<File> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            bail!(
-                "refusing to write {}: it is a symbolic link",
-                path.display()
-            )
+    for _ in 0..3 {
+        let mut opts = OpenOptions::new();
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        Ok(m) if !m.is_file() => bail!("refusing to write {}: not a regular file", path.display()),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", path.display())),
+        match opts.open(path) {
+            Ok(file) => {
+                let meta = file
+                    .metadata()
+                    .with_context(|| format!("cannot inspect {}", path.display()))?;
+                if !meta.is_file() {
+                    bail!("refusing to write {}: not a regular file", path.display());
+                }
+                file.set_len(0)
+                    .with_context(|| format!("cannot truncate {}", path.display()))?;
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut create = OpenOptions::new();
+                create.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    create.custom_flags(libc::O_NOFOLLOW);
+                }
+                match create.open(path) {
+                    Ok(f) => return Ok(f),
+                    // Created by someone else in between: inspect it again.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("cannot create {}", path.display()))
+                    }
+                }
+            }
+            Err(e) => {
+                let is_link = std::fs::symlink_metadata(path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if is_link {
+                    bail!(
+                        "refusing to write {}: it is a symbolic link",
+                        path.display()
+                    );
+                }
+                #[cfg(unix)]
+                if e.raw_os_error() == Some(libc::ENXIO) {
+                    bail!("refusing to write {}: not a regular file", path.display());
+                }
+                return Err(e).with_context(|| format!("cannot open {}", path.display()));
+            }
+        }
     }
+    bail!("{} keeps changing; not writing it", path.display())
+}
+
+/// Open `path` for reading only if it is a regular file (checked on the open descriptor;
+/// `O_NONBLOCK` so a FIFO cannot block the open).
+fn open_regular_read(path: &Path) -> Result<File> {
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NONBLOCK);
     }
-    opts.open(path)
-        .with_context(|| format!("cannot create {}", path.display()))
+    let file = opts
+        .open(path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(file)
+}
+
+/// Write `bytes` to `path` with the hardened open of [`open_regular_no_follow`] (no symlink
+/// following, regular files only).
+pub fn write_file_no_follow(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = io::BufWriter::new(open_regular_no_follow(path)?);
+    file.write_all(bytes)?;
+    file.flush()
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
 }
 
 /// Final path for a save-dialog choice: a missing extension is added (refusing to replace an
@@ -1025,11 +1178,7 @@ pub fn write_to_chosen_path(bytes: &[u8], format: ReportFormat, path: &Path) -> 
                 .unwrap_or_default()
         );
     }
-    let mut file = io::BufWriter::new(open_regular_no_follow(path)?);
-    file.write_all(bytes)?;
-    file.flush()
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(())
+    write_file_no_follow(path, bytes)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1084,8 +1233,9 @@ mod tests {
         assert_eq!(s.services[0].port, 22);
         let sw = &s.switches[0];
         assert_eq!(sw.name, "core-sw");
+        // 10 access ports + the uplink Gi1/0/48: 11 active of ~48 (the uplink is a port too).
         assert_eq!(sw.active_ports, 11);
-        assert_eq!(sw.total_ports, Some(12));
+        assert_eq!(sw.total_ports, Some(48));
         assert!(sw.total_estimated);
         assert_eq!(sw.trunk_ports.len(), 1);
         assert_eq!(sw.trunk_ports[0].port, "Gi1/0/48");
@@ -1174,6 +1324,7 @@ mod tests {
             neighbors: 0,
             elapsed_ms: 1,
             cancelled: false,
+            ..Default::default()
         }));
         let i = c.finish(None, ReportMeta::default()).unwrap();
         assert_eq!(i.devices.len(), 1);
@@ -1201,6 +1352,54 @@ mod tests {
         for id in ["SWR-TLS-001", "SWR-TLS-003", "SWR-TLS-004"] {
             assert!(r.findings.iter().any(|f| f.id == id), "{id}");
         }
+    }
+
+    /// DHCP-server and IPv6-router observations on devices reach the rogue rules, and every
+    /// polled SNMP agent reaches `meta.snmpAgents` (with PoE budgets in `snmpInfos`).
+    #[test]
+    fn collector_carries_dhcp_ra_and_snmp_agent_observations() {
+        let mut c = ScanCollector::default();
+        for (ip, mac) in [
+            ("10.0.0.1", "00:11:22:00:00:01"),
+            ("10.0.0.66", "00:11:22:00:00:66"),
+        ] {
+            let mut d = Device::new(ip.parse().unwrap());
+            d.mac = Some(mac.into());
+            d.dhcp_server = Some(true);
+            c.observe(&ScanEvent::device(d));
+        }
+        let mut r = Device::new("10.0.0.9".parse().unwrap());
+        r.ipv6_router = Some(true);
+        c.observe(&ScanEvent::device(r));
+        for (ip, answered) in [("10.0.0.2", true), ("10.0.0.3", false)] {
+            c.observe(&ScanEvent::SnmpAgent(Box::new(
+                crate::models::SnmpAgentStatus {
+                    ip: Some(ip.parse().unwrap()),
+                    version: "v2c".into(),
+                    community_class: "public".into(),
+                    answered,
+                    sys_name: Some("acc".into()),
+                    poe_budget: answered.then(|| crate::models::PoeBudget {
+                        nominal_watts: Some(370.0),
+                        consumed_watts: Some(360.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )));
+        }
+        let input = c.finish(None, ReportMeta::default()).unwrap();
+        assert_eq!(input.meta.snmp_agents.len(), 2);
+        assert_eq!(input.snmp_infos.len(), 1);
+        assert!(!serde_json::to_string(&input)
+            .unwrap()
+            .contains("community\""));
+        let r = run_audit(&input, &AuditThresholds::default(), NOW);
+        let ids: Vec<&str> = r.findings.iter().map(|f| f.id.as_str()).collect();
+        for id in ["SWR-L2-003", "SWR-SNP-001", "SWR-SNP-002", "SWR-POE-001"] {
+            assert!(ids.contains(&id), "{id} in {ids:?}");
+        }
+        assert!(r.checks.iter().any(|c| c.id == "SWR-L2-004" && c.evaluated));
     }
 
     #[test]
@@ -1244,7 +1443,25 @@ mod tests {
             std::os::unix::fs::symlink(&ok, &link).unwrap();
             assert!(write_to_chosen_path(b"x", ReportFormat::Html, &link).is_err());
             assert_eq!(std::fs::read(&ok).unwrap(), b"<html>");
+            // A FIFO swapped in for the chosen file neither blocks nor is written.
+            let fifo = dir.join("fifo.html");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let started = std::time::Instant::now();
+            assert!(write_to_chosen_path(b"x", ReportFormat::Html, &fifo).is_err());
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // The logo reader refuses a FIFO without blocking, too.
+            assert!(Logo::load(&fifo).is_err());
+            // A dangling symlink is not followed to create its target.
+            let dangling = dir.join("dangling.html");
+            std::os::unix::fs::symlink(dir.join("target.html"), &dangling).unwrap();
+            assert!(write_file_no_follow(&dangling, b"x").is_err());
+            assert!(!dir.join("target.html").exists());
         }
+        // Overwriting an existing regular file truncates it.
+        write_file_no_follow(&ok, b"<p>").unwrap();
+        assert_eq!(std::fs::read(&ok).unwrap(), b"<p>");
+        assert!(Logo::load(&dir).is_err(), "a directory is no logo");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

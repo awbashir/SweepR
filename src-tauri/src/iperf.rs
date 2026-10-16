@@ -429,6 +429,9 @@ pub async fn run_iperf(
     let mut summary: Option<IperfSummary> = None;
     let mut error: Option<String> = None;
     let mut timed_out = false;
+    // Output that was not valid JSON (older iperf3 prints plain-text errors): reported only
+    // when stderr does not say more.
+    let mut json_error: Option<String> = None;
     let mut reader = BufReader::new(stdout.take(MAX_OUTPUT_BYTES));
     if avail.streaming {
         let mut start: Option<Value> = None;
@@ -466,12 +469,16 @@ pub async fn run_iperf(
         };
         if let Some(Ok(_)) = read {
             if !text.is_empty() {
-                let report = parse_json_report(&String::from_utf8_lossy(&text))?;
-                for i in report.intervals {
-                    let _ = intervals.send(i).await;
+                match parse_json_report(&String::from_utf8_lossy(&text)) {
+                    Ok(report) => {
+                        for i in report.intervals {
+                            let _ = intervals.send(i).await;
+                        }
+                        summary = report.summary;
+                        error = report.error;
+                    }
+                    Err(e) => json_error = Some(format!("{e:#}")),
                 }
-                summary = report.summary;
-                error = report.error;
             }
         }
     }
@@ -499,6 +506,11 @@ pub async fn run_iperf(
         Some(s) => Ok(s),
         None => {
             let msg = sanitize_text(&String::from_utf8_lossy(&stderr));
+            if msg.is_empty() {
+                if let Some(e) = json_error {
+                    bail!("{e}");
+                }
+            }
             let code = match status {
                 Ok(Ok(s)) => s
                     .code()

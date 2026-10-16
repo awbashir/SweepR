@@ -16,7 +16,7 @@
 //! hand-encoded in-process SNMPv2c responder exercises the walk end to end.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -401,28 +401,68 @@ fn port_name_numbers(port_name: &str) -> Vec<u32> {
     nums
 }
 
-/// Best-effort match of a resolved switch port to a collected PoE `(group, port)` entry.
-/// Heuristic (documented as such): the PoE port index equals the last number of the port name,
-/// and either there is only one PSE group or the group equals the name's first number. When
-/// matched, returns a [`PoeInfo`] tagged with the switch and port names.
-pub fn lookup_port_poe(
-    poe: &PoePortMap,
-    port_name: &str,
-    _port_index: Option<u32>,
-    switch_name: &str,
-) -> Option<crate::models::PoeInfo> {
+/// The PoE `(group, port)` index a port name refers to: the name's last number is the PSE
+/// port, its first number the group (stack member / module) when that group exists; with a
+/// single PSE group the port number alone decides. `None` when the name does not fit.
+fn poe_key(groups: &BTreeSet<u32>, port_name: &str) -> Option<(u32, u32)> {
     let nums = port_name_numbers(port_name);
     let last = *nums.last()?;
-    let first = nums.first().copied();
-    let single_group = poe
-        .keys()
-        .map(|(g, _)| *g)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        <= 1;
-    let (_, data) = poe
-        .iter()
-        .find(|((g, p), _)| *p == last && (single_group || Some(*g) == first))?;
+    if nums.len() >= 2 && groups.contains(&nums[0]) {
+        return Some((nums[0], last));
+    }
+    match (groups.len(), groups.iter().next()) {
+        (1, Some(&g)) => Some((g, last)),
+        _ => None,
+    }
+}
+
+/// Assign PoE `(group, port)` indexes to the switch's port names (best effort; no MIB links
+/// PoE ports to ifIndex). A PoE index claimed by several names (e.g. `Gi1/0/1` and the
+/// uplink `Te1/1/1`, or `Fa0/1` and `Gi0/1`) is ambiguous: the copper-style name whose middle
+/// numbers are all zero wins when it is the only one, otherwise none is matched.
+pub fn poe_port_assignments<'a>(
+    poe: &PoePortMap,
+    names: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, (u32, u32)> {
+    let groups: BTreeSet<u32> = poe.keys().map(|(g, _)| *g).collect();
+    let mut by_key: BTreeMap<(u32, u32), BTreeSet<&str>> = BTreeMap::new();
+    for name in names {
+        if let Some(k) = poe_key(&groups, name).filter(|k| poe.contains_key(k)) {
+            by_key.entry(k).or_default().insert(name);
+        }
+    }
+    let mut out = HashMap::new();
+    for (key, names) in by_key {
+        let pick = if names.len() == 1 {
+            names.first().copied()
+        } else {
+            let plain: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|n| {
+                    let nums = port_name_numbers(n);
+                    nums.len() >= 3 && nums[1..nums.len() - 1].iter().all(|x| *x == 0)
+                })
+                .collect();
+            (plain.len() == 1).then(|| plain[0])
+        };
+        if let Some(name) = pick {
+            out.insert(name.to_string(), key);
+        }
+    }
+    out
+}
+
+/// The PoE state of `port_name` given the assignments from [`poe_port_assignments`], tagged
+/// with the switch and port names. `None` when the port has no (unambiguous) PoE entry or the
+/// entry is empty.
+pub fn lookup_port_poe(
+    poe: &PoePortMap,
+    assignments: &HashMap<String, (u32, u32)>,
+    port_name: &str,
+    switch_name: &str,
+) -> Option<crate::models::PoeInfo> {
+    let data = poe.get(assignments.get(port_name)?)?;
     if data.status.is_none() && data.class.is_none() && data.watts.is_none() {
         return None;
     }
@@ -1466,6 +1506,18 @@ impl SnmpClient {
             !base_port_ifindex.is_empty(),
         );
 
+        // PoE indexes per port name, decided over every interface name at once so that
+        // colliding names (ambiguous matches) get no PoE data.
+        let poe_assign = match &poe_ports {
+            Some(p) => {
+                let mut names: BTreeSet<String> = if_names.values().cloned().collect();
+                names.extend(mappings.values().map(|(bridge_port, _)| {
+                    resolve_port_name(*bridge_port, &base_port_ifindex, &if_names).0
+                }));
+                poe_port_assignments(p, names.iter().map(String::as_str))
+            }
+            None => HashMap::new(),
+        };
         // Count MACs per resolved port name, then build the mapping list.
         let mut counts: HashMap<(String, Option<u32>), u32> = HashMap::new();
         let mut port_mappings = Vec::with_capacity(mappings.len());
@@ -1475,7 +1527,7 @@ impl SnmpClient {
             *counts.entry((port_name.clone(), port_index)).or_insert(0) += 1;
             let poe = poe_ports
                 .as_ref()
-                .and_then(|p| lookup_port_poe(p, &port_name, port_index, &switch_name));
+                .and_then(|p| lookup_port_poe(p, &poe_assign, &port_name, &switch_name));
             port_mappings.push(SwitchPortMapping {
                 switch_name: switch_name.clone(),
                 switch_ip: Some(ip),
@@ -1622,6 +1674,7 @@ pub async fn probe_candidates(
     progress: ProgressScope,
 ) -> SnmpPollStats {
     let client = SnmpClient::new(cfg.clone());
+    let (version, class) = (cfg.version_label(), cfg.community_class());
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS));
     let logged = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
@@ -1657,9 +1710,26 @@ pub async fn probe_candidates(
             };
             progress.add(1);
             let may_log = || logged.fetch_add(1, Ordering::Relaxed) < MAX_FAILURE_LOGS;
+            let status = |answered: bool, info: Option<&SnmpDeviceInfo>| {
+                ScanEvent::SnmpAgent(Box::new(crate::models::SnmpAgentStatus {
+                    ip: Some(ip),
+                    version: version.into(),
+                    community_class: class.into(),
+                    answered,
+                    partial: info.is_some_and(|i| i.partial),
+                    sys_name: info.and_then(|i| i.sys_name.clone()),
+                    sys_descr: info.and_then(|i| i.sys_descr.clone()),
+                    role: info.map(|i| i.role),
+                    poe_budget: info.and_then(|i| i.poe_budget.clone()),
+                    warnings: info
+                        .map(|i| i.warnings.iter().take(8).cloned().collect())
+                        .unwrap_or_default(),
+                }))
+            };
             match res {
                 None => PollOutcome::Skipped,
                 Some(Ok(info)) => {
+                    let _ = tx.send(status(true, Some(&info))).await;
                     if info.partial {
                         tracing::info!("SNMP {ip}: partial result: {}", info.warnings.join("; "));
                         if may_log() {
@@ -1677,6 +1747,7 @@ pub async fn probe_candidates(
                     }
                 }
                 Some(Err(e)) => {
+                    let _ = tx.send(status(false, None)).await;
                     let kind = failure_kind(&e);
                     tracing::debug!("SNMP poll of {ip} failed: {e:#}");
                     // Silent hosts are the common case on a mixed network: count them only.
@@ -1987,18 +2058,20 @@ mod tests {
                 ..PoePortData::default()
             },
         );
+        let names = ["Gi1/0/24", "Gi2/0/24", "Gi3/0/24", "Gi1/0/23"];
+        let assign = poe_port_assignments(&map, names);
         // Stack member 1 port 24 ↔ Gi1/0/24; member 2 port 24 ↔ Gi2/0/24.
-        let poe = lookup_port_poe(&map, "Gi1/0/24", Some(10024), "sw1").unwrap();
+        let poe = lookup_port_poe(&map, &assign, "Gi1/0/24", "sw1").unwrap();
         assert_eq!(
             (poe.watts, poe.class, poe.status.as_deref()),
             (Some(6.1), Some(2), Some("delivering"))
         );
         assert_eq!(poe.switch_name.as_deref(), Some("sw1"));
         assert_eq!(poe.port.as_deref(), Some("Gi1/0/24"));
-        let poe = lookup_port_poe(&map, "Gi2/0/24", None, "sw1").unwrap();
+        let poe = lookup_port_poe(&map, &assign, "Gi2/0/24", "sw1").unwrap();
         assert_eq!(poe.status.as_deref(), Some("searching"));
-        assert!(lookup_port_poe(&map, "Gi3/0/24", None, "sw1").is_none());
-        assert!(lookup_port_poe(&map, "Gi1/0/23", None, "sw1").is_none());
+        assert!(lookup_port_poe(&map, &assign, "Gi3/0/24", "sw1").is_none());
+        assert!(lookup_port_poe(&map, &assign, "Gi1/0/23", "sw1").is_none());
         // Single PSE group: the port number alone matches (e.g. "port 24", "ge-0/0/24").
         let mut single = PoePortMap::new();
         single.insert(
@@ -2008,7 +2081,18 @@ mod tests {
                 ..PoePortData::default()
             },
         );
-        assert!(lookup_port_poe(&single, "ge-0/0/24", None, "ex").is_some());
+        let assign = poe_port_assignments(&single, ["ge-0/0/24"]);
+        assert!(lookup_port_poe(&single, &assign, "ge-0/0/24", "ex").is_some());
+        // Ambiguous: Fa0/24 and Gi0/24 both claim (1, 24) on a single-group switch.
+        let assign = poe_port_assignments(&single, ["Fa0/24", "Gi0/24"]);
+        assert!(assign.is_empty(), "{assign:?}");
+        // The uplink module port Te1/1/24 collides with Gi1/0/24; the copper port wins.
+        let assign = poe_port_assignments(&map, ["Gi1/0/24", "Te1/1/24"]);
+        assert_eq!(assign.get("Gi1/0/24"), Some(&(1, 24)));
+        assert!(!assign.contains_key("Te1/1/24"));
+        // Two groups: a name whose first number is no group does not match by port alone.
+        let assign = poe_port_assignments(&map, ["port 24"]);
+        assert!(assign.is_empty());
     }
 
     #[test]
