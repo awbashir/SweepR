@@ -333,19 +333,24 @@ pub fn write_xlsx(devices: &[Device], path: &Path) -> Result<()> {
 
 /// Write `devices` to `path` in `format`.
 pub fn export_to_path(devices: &[Device], format: ExportFormat, path: &Path) -> Result<()> {
+    let is_new = std::fs::symlink_metadata(path).is_err();
     let create =
         || std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()));
-    match format {
+    let written = match format {
         ExportFormat::Csv => write_csv(devices, std::io::BufWriter::new(create()?)),
         ExportFormat::Json => write_json(devices, std::io::BufWriter::new(create()?)),
         ExportFormat::Xlsx => write_xlsx(devices, path),
+    };
+    if is_new && written.is_ok() {
+        crate::owner::give_back_path(path);
     }
+    written
 }
 
 /// Open `path` for an export without following a symlink at the final component and only
 /// if it is (or will be) a regular file. Used for paths that come from a GUI dialog.
 fn open_regular_no_follow(path: &Path) -> Result<File> {
-    match std::fs::symlink_metadata(path) {
+    let is_new = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => {
             bail!(
                 "refusing to write {}: it is a symbolic link",
@@ -355,10 +360,10 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
         Ok(m) if !m.is_file() => {
             bail!("refusing to write {}: not a regular file", path.display())
         }
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => false,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
         Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", path.display())),
-    }
+    };
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -367,8 +372,13 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
         // Closes the race between the check above and the open.
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    opts.open(path)
-        .with_context(|| format!("cannot create {}", path.display()))
+    let file = opts
+        .open(path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    if is_new {
+        crate::owner::give_back_file(&file);
+    }
+    Ok(file)
 }
 
 /// Export to a path chosen interactively (GUI): the extension must match `format`, and
