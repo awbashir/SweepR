@@ -1067,7 +1067,11 @@ fn write_store(path: &Path, map: &HashMap<String, DeviceOverride>) -> Result<()>
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    let dir_is_new = !dir.exists();
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    if dir_is_new {
+        crate::owner::give_back_path(dir);
+    }
     let json = serde_json::to_vec_pretty(map).context("serialize overrides")?;
     let name = path
         .file_name()
@@ -1084,6 +1088,7 @@ fn write_store(path: &Path, map: &HashMap<String, DeviceOverride>) -> Result<()>
             .create_new(true)
             .open(&tmp)
             .with_context(|| format!("cannot create {}", tmp.display()))?;
+        crate::owner::give_back_file(&f);
         f.write_all(&json)
             .with_context(|| format!("cannot write {}", tmp.display()))?;
         f.sync_all()

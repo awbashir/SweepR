@@ -1,0 +1,68 @@
+name: macOS DMG
+
+# Builds the universal (Apple Silicon + Intel) installer disk image. Pull requests that touch
+# the app or its packaging get the image as a workflow artifact. Pushing a `v*` tag, or running
+# the workflow by hand with a `tag` (e.g. v0.1), also publishes it as a GitHub release; a tag
+# that does not exist yet is created on the commit that was built.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (e.g. v0.1); empty builds the artifact only"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/macos-dmg.yml"
+      - "packaging/macos/**"
+      - "src-tauri/**"
+      - "src/**"
+      - "package.json"
+      - "package-lock.json"
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build the disk image
+        run: packaging/macos/build-dmg.sh
+        env:
+          SWEEPR_TARGET: universal-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweepR-macOS
+          path: src-tauri/target/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: SweepR ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: src-tauri/target/dmg/*.dmg

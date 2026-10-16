@@ -1080,7 +1080,10 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
                     create.custom_flags(libc::O_NOFOLLOW);
                 }
                 match create.open(path) {
-                    Ok(f) => return Ok(f),
+                    Ok(f) => {
+                        crate::owner::give_back_file(&f);
+                        return Ok(f);
+                    }
                     // Created by someone else in between: inspect it again.
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(e) => {
