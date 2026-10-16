@@ -45,6 +45,7 @@ use sweepr_core::{
         MAX_TIMEOUT_MS,
     },
     report::{self, ReportFormat, ReportOptions},
+    save::{self, SaveKind},
     services,
     snmp_infra::SnmpClient,
     trace::{self, TraceOptions},
@@ -2015,15 +2016,59 @@ struct GuiScanEvent<'a> {
     event: &'a ScanEvent,
 }
 
+/// The events that close a job which did not end normally: an error log and a `finished`
+/// event flagged `failed`. `outcome` is the job task's join result, so a panic (or an abort)
+/// is reported like a returned error. `None` when the job succeeded (it sent its own
+/// `finished`).
+fn job_failure_events(
+    outcome: std::result::Result<Result<()>, tokio::task::JoinError>,
+    cancelled: bool,
+    elapsed: Duration,
+) -> Option<[ScanEvent; 2]> {
+    let message = match outcome {
+        Ok(Ok(())) => return None,
+        Ok(Err(e)) => {
+            let hint = if L2Error::is_permission(&e) {
+                format!(" — {ROOT_HINT}")
+            } else {
+                String::new()
+            };
+            format!("{e:#}{hint}")
+        }
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            format!("the job crashed unexpectedly: {}", sanitize_text(&detail))
+        }
+        Err(_) => "the job was aborted".into(),
+    };
+    Some([
+        ScanEvent::error(message),
+        ScanEvent::Finished(ScanSummary {
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            cancelled,
+            failed: true,
+            ..Default::default()
+        }),
+    ])
+}
+
 /// Run `job` in the background, forwarding its events to the frontend tagged with `id`.
-/// Events stop as soon as the job is superseded by a newer one. Failures are reported as an
-/// error log followed by a `finished` event so the UI always leaves its busy state.
+/// Events stop as soon as the job is superseded by a newer one. The job runs on its own task,
+/// so failures *and panics* are reported as an error log followed by a `finished` event and
+/// the UI always leaves its busy state; the manager slot is released even if this task dies.
 fn spawn_job<F, Fut>(app: AppHandle, id: u64, cancel: CancellationToken, job: F)
 where
     F: FnOnce(mpsc::Sender<ScanEvent>, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     tauri::async_runtime::spawn(async move {
+        let end_app = app.clone();
+        let _end = OnDrop::new(move || end_app.state::<ScanManager>().end(id));
         let started = Instant::now();
         let (tx, mut rx) = mpsc::channel::<ScanEvent>(1024);
         let emitter = app.clone();
@@ -2042,27 +2087,19 @@ where
                 );
             }
         });
-        if let Err(e) = job(tx.clone(), cancel.clone()).await {
-            let hint = if L2Error::is_permission(&e) {
-                format!(" — {ROOT_HINT}")
-            } else {
-                String::new()
-            };
-            let _ = tx.send(ScanEvent::error(format!("{e:#}{hint}"))).await;
-            let _ = tx
-                .send(ScanEvent::Finished(ScanSummary {
-                    devices: 0,
-                    vlans: 0,
-                    neighbors: 0,
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    cancelled: cancel.is_cancelled(),
-                    ..Default::default()
-                }))
-                .await;
+        let task = {
+            let (tx, cancel) = (tx.clone(), cancel.clone());
+            tokio::spawn(async move { job(tx, cancel).await })
+        };
+        let outcome = task.await;
+        if let Some(events) = job_failure_events(outcome, cancel.is_cancelled(), started.elapsed())
+        {
+            for ev in events {
+                let _ = tx.send(ev).await;
+            }
         }
         drop(tx);
         let _ = forwarder.await;
-        app.state::<ScanManager>().end(id);
     });
 }
 
@@ -2280,6 +2317,46 @@ fn reveal_report(app: AppHandle, last: State<'_, LastReport>) -> Result<bool, St
         .reveal_item_in_dir(&path)
         .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// Save a file the GUI rendered (the topology map as `svg` text or base64 `png`) to a path the
+/// user picks in a native save dialog opened by the backend; the webview never supplies a
+/// path, only a suggested file name. The content must match `kind` and stay under
+/// [`save::SAVE_FILE_MAX_BYTES`]; symbolic links and non-regular files are refused. Returns the
+/// written path, or `null` when the dialog was cancelled.
+#[tauri::command]
+async fn save_file(
+    app: AppHandle,
+    kind: String,
+    contents: String,
+    suggested_name: Option<String>,
+) -> Result<Option<String>, String> {
+    let kind: SaveKind = kind.parse().map_err(|e: anyhow::Error| e.to_string())?;
+    let bytes =
+        tauri::async_runtime::spawn_blocking(move || save::decode_contents(kind, &contents))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:#}"))?;
+    let (done, chosen) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Save image")
+        .add_filter(kind.label(), &[kind.ext()])
+        .set_file_name(save::suggested_file_name(suggested_name.as_deref(), kind))
+        .save_file(move |path| {
+            let _ = done.send(path);
+        });
+    let Some(chosen) = chosen.await.map_err(|_| "save dialog closed".to_string())? else {
+        return Ok(None);
+    };
+    let path = chosen.into_path().map_err(|e| e.to_string())?;
+    let path = save::resolve_chosen_path(path, kind)?;
+    let written = path.clone();
+    tauri::async_runtime::spawn_blocking(move || save::write_to_chosen_path(&bytes, kind, &path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(Some(written.display().to_string()))
 }
 
 /// Largest port count a single `scan_ports` command accepts (GUI drawer input bound).
@@ -2808,7 +2885,8 @@ fn run_gui() -> ExitCode {
             iperf_available,
             start_iperf,
             stop_iperf,
-            discover_services
+            discover_services,
+            save_file
         ])
         .build(tauri::generate_context!());
     match app {
@@ -2838,6 +2916,77 @@ fn run_gui() -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[tokio::test]
+    async fn a_panicking_job_still_ends_with_an_error_log_and_finished() {
+        let manager = std::sync::Arc::new(ScanManager::default());
+        let (id, cancel) = manager.begin();
+        let (tx, mut rx) = mpsc::channel::<ScanEvent>(16);
+        // The shape of `spawn_job`: the slot guard lives in the outer task, the job in its own.
+        let outer = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                let _end = OnDrop::new(move || manager.end(id));
+                let task = {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(ScanEvent::info("working")).await;
+                        if !tx.is_closed() {
+                            panic!("probe thread exploded");
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    })
+                };
+                let outcome = task.await;
+                if let Some(events) =
+                    job_failure_events(outcome, cancel.is_cancelled(), Duration::from_millis(7))
+                {
+                    for ev in events {
+                        let _ = tx.send(ev).await;
+                    }
+                }
+            })
+        };
+        outer.await.unwrap();
+        assert!(!manager.is_current(id), "the job slot was released");
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert_eq!(events.len(), 3, "{events:?}");
+        match &events[1] {
+            ScanEvent::Log { level, message } => {
+                assert_eq!(*level, LogLevel::Error);
+                assert!(message.contains("crashed unexpectedly"), "{message}");
+                assert!(message.contains("probe thread exploded"), "{message}");
+            }
+            other => panic!("expected an error log, got {other:?}"),
+        }
+        match &events[2] {
+            ScanEvent::Finished(s) => {
+                assert!(s.failed);
+                assert!(!s.cancelled);
+                assert_eq!(s.elapsed_ms, 7);
+            }
+            other => panic!("expected finished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_outcomes_map_to_terminal_events() {
+        assert!(job_failure_events(Ok(Ok(())), false, Duration::ZERO).is_none());
+        let [log, fin] =
+            job_failure_events(Ok(Err(anyhow::anyhow!("no route"))), true, Duration::ZERO).unwrap();
+        assert!(matches!(log, ScanEvent::Log { ref message, .. } if message == "no route"));
+        assert!(matches!(fin, ScanEvent::Finished(ref s) if s.failed && s.cancelled));
+        let aborted = tokio::spawn(std::future::pending::<Result<()>>());
+        aborted.abort();
+        let [log, _] = job_failure_events(aborted.await, false, Duration::ZERO).unwrap();
+        assert!(matches!(log, ScanEvent::Log { ref message, .. } if message.contains("aborted")));
+        // `failed` is additive: absent from a normal summary's JSON.
+        let json = serde_json::to_value(ScanSummary::default()).unwrap();
+        assert!(json.get("failed").is_none(), "{json}");
+    }
 
     #[test]
     fn cli_definition_is_valid() {

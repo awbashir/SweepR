@@ -33,6 +33,7 @@ fn main() {
             "start_iperf",
             "stop_iperf",
             "discover_services",
+            "save_file",
         ]));
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }

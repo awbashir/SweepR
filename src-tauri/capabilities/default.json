@@ -34,6 +34,7 @@
     "allow-iperf-available",
     "allow-start-iperf",
     "allow-stop-iperf",
-    "allow-discover-services"
+    "allow-discover-services",
+    "allow-save-file"
   ]
 }
