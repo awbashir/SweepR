@@ -1,16 +1,100 @@
+<div align="center">
+
 # SweepR
 
-SweepR (`sweepr`) is an IPv4/IPv6 network scanner for macOS and Linux, built for enterprise
-networks. It combines LanScan-style live discovery with IEEE 802.1Q VLAN scanning and
-switch / firewall / access-point discovery over CDP and LLDP.
+**See everything on your network: every host, every VLAN, every switch port.**
+
+A fast IPv4/IPv6 network scanner for macOS and Linux, built for enterprise networks.
+Live discovery, 802.1Q VLAN scanning, CDP/LLDP and SNMP infrastructure mapping, service
+discovery and a one-click security audit report, in a native desktop app and a scriptable CLI.
+
+[Install](#install) · [Features](#features) · [CLI usage](#cli-usage) · [Audit report](#audit-report) · [Building](#building)
+
+<img src="docs/images/devices-dark.png" alt="SweepR main window: 168 discovered devices with role, vendor and DNS name" width="100%">
+
+</div>
+
+## Why SweepR
+
+- **Live results.** Hosts show up the moment they answer, with vendor, host name, open ports
+  and role (switch, router, firewall, access point, host).
+- **VLAN-aware.** Probe tagged VLANs from a trunk port, or listen passively to learn which
+  VLANs, native VLANs and voice VLANs are in use.
+- **Knows your infrastructure.** CDP, LLDP and SNMP (v1/v2c/v3) reveal switches, their models
+  and firmware, PoE budgets and the exact switch port every endpoint is plugged into.
+- **Finds what is behind the IP.** UPnP, ONVIF cameras with their stream URLs, SIP phones and
+  PBXs, web appliances and their TLS certificates, DHCP client fingerprints.
+- **Turns a scan into an audit.** A risk-graded HTML, PDF or JSON report with findings,
+  evidence and remediation (Telnet, default SNMP communities, rogue IPv6 routers, native
+  VLAN 1, expiring certificates, PoE over budget and more).
+- **Network toolbox built in.** Wake-on-LAN, live latency monitor, MTR-style traceroute,
+  web identity grabber and iPerf3 throughput tests, right from a device's details.
+- **Safe on hostile networks.** Bounded walks and parsers, no credentials ever sent to
+  discovered devices, hardened file writes and escaped output everywhere.
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/topology-dark.png" alt="Topology map of firewalls, routers, switches and access points"></td>
+    <td width="50%"><img src="docs/images/details-dark.png" alt="Device details drawer with summary, live latency, web/TLS and services"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Topology map</b>: infrastructure, links and host groups per VLAN</sub></td>
+    <td align="center"><sub><b>Device details</b>: one-click HTTP/SSH, Wake-on-LAN, latency, TLS, services</sub></td>
+  </tr>
+</table>
+
+<sub>Screenshots show the built-in demo network (`npm run dev`).</sub>
+
+## Install
+
+### macOS (disk image)
+
+1. Download `SweepR_<version>_universal.dmg` (Apple Silicon and Intel) from the
+   [Releases](../../releases) page, or build it yourself (see [Building](#building)).
+2. Open the disk image and double-click **Install SweepR.command**. Terminal opens and asks
+   for your administrator password (`sudo`). The installer:
+   - copies **SweepR** and **SweepR (Administrator)** to `/Applications`,
+   - removes the download quarantine flag (the app is ad-hoc signed, not notarized),
+   - links the command-line tool to `/usr/local/bin/sweepr`,
+   - optionally gives your user read/write access to the packet-capture devices
+     (`/dev/bpf*`) at every boot, so passive VLAN / CDP / LLDP / DHCP listening works
+     without `sudo` (the same mechanism as Wireshark's *ChmodBPF*).
+3. Open **SweepR (Administrator)** for full scans. It asks for your password and starts
+   SweepR as root, which raw ARP, 802.1Q and IPv6 neighbor-discovery probes require.
+   Plain **SweepR** runs without root (ICMP sweep and neighbor cache only).
+
+If macOS refuses to open the installer ("cannot be verified"), right-click it and choose
+**Open**, allow it under *System Settings → Privacy & Security*, or run it from Terminal:
+
+```sh
+bash "/Volumes/SweepR 0.1.0/Install SweepR.command"           # asks about packet capture
+bash "/Volumes/SweepR 0.1.0/Install SweepR.command" --bpf     # grant it without asking
+```
+
+You can also drag the apps onto the *Applications* link in the disk image; then clear the
+quarantine flag yourself with `xattr -dr com.apple.quarantine /Applications/SweepR.app`.
+**Uninstall SweepR.command** removes the apps, the CLI link and the boot job (settings and
+hostname overrides are kept).
+
+Files SweepR creates while running as root (exports, reports, the hostname-overrides store)
+are handed back to the user who started it (`SUDO_UID` / `SUDO_GID`), so they never end up
+owned by root in your home folder. This applies to `sudo sweepr ...` on Linux too.
+
+### Linux
+
+Build from source (see [Building](#building)): `npm run tauri:build` produces `.deb` and
+`.AppImage` packages. Run with `sudo`, or grant the binary raw-socket capabilities once:
+`sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/sweepr`.
+
+## How it runs
 
 The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`):
 
-- **CLI**: run it with a subcommand (`sweepr scan ...`). It scans in the terminal and exits.
 - **GUI**: run it with no arguments, with `--gui`, or open the `.app`. This starts the Tauri
   desktop app.
+- **CLI**: run it with a subcommand (`sweepr scan ...`). It scans in the terminal and exits.
 
-## What it does
+## Features
 
 - **Interfaces**: finds every interface and labels it Ethernet, Wi-Fi, 802.1Q
   sub-interface (`vlan0`, `en0.100`, `eth0.10`), VPN, bridge/virtual or loopback. The
@@ -330,11 +414,17 @@ packet access.
 
 - **Linux**: run with `sudo`, or give the binary capabilities:
   `sudo setcap cap_net_raw,cap_net_admin=eip ./sweepr`.
-- **macOS**: run with `sudo`. Giving your user access to `/dev/bpf*` (for example with
-  Wireshark's *ChmodBPF* launch daemon) is enough for passive capture, but recent macOS
-  versions hide interface MAC addresses from unprivileged processes (`sweepr interfaces`
-  then shows no MACs and says so), and active ARP/802.1Q/NDP probes need the real MAC, so
-  active layer-2 scans require `sudo`.
+- **macOS**: open **SweepR (Administrator)** (installed from the disk image; it asks for your
+  password and starts the GUI as root) or run `sudo sweepr ...` in Terminal. Giving your user
+  access to `/dev/bpf*` (the installer's optional packet-capture step, or Wireshark's
+  *ChmodBPF*) is enough for passive capture, but recent macOS versions hide interface MAC
+  addresses from unprivileged processes (`sweepr interfaces` then shows no MACs and says
+  so), and active ARP/802.1Q/NDP probes need the real MAC, so active layer-2 scans require
+  root.
+
+Files created while running as root under `sudo` (or the administrator launcher) are given
+back to the invoking user (`SUDO_UID` / `SUDO_GID`); files that already existed keep their
+owner.
 
 Without these privileges SweepR does not stop. It prints a warning and falls back to an
 unprivileged ICMP sweep plus the OS neighbor cache, so hosts that block ICMP can be missed.
@@ -375,6 +465,25 @@ npm run build
 cd src-tauri && cargo run --features custom-protocol -- --gui
 ```
 
+### macOS installer disk image
+
+On a Mac with the prerequisites above (Xcode command-line tools included):
+
+```sh
+npm install
+npm run dmg              # this Mac's architecture
+npm run dmg:universal    # Apple Silicon + Intel (adds the two Rust targets via rustup)
+# -> src-tauri/target/dmg/SweepR_<version>_<arch>.dmg
+```
+
+`packaging/macos/build-dmg.sh` builds the `.app` with Tauri, compiles the
+**SweepR (Administrator)** launcher (`admin-launcher.applescript`), adds the installer and
+uninstaller scripts and packs everything with `hdiutil`. The *macOS DMG* GitHub Actions
+workflow (`.github/workflows/macos-dmg.yml`) does the same on a macOS runner when started by
+hand or when a `v*` tag is pushed, and attaches the image to the release. The app is ad-hoc
+signed (`signingIdentity: "-"`); set Tauri's `APPLE_SIGNING_IDENTITY` / `APPLE_CERTIFICATE`
+environment variables to sign with a Developer ID instead.
+
 Without `--features custom-protocol`, a debug binary loads `devUrl` (http://localhost:1420) and
 shows a blank window unless `npm run dev` is running. `tauri build` enables the feature for you.
 
@@ -411,8 +520,16 @@ src-tauri/
   src/webid.rs     HTTP title / Server header / TLS certificate grabber, appliance identification
   src/iperf.rs     iperf3 client runner and JSON parsers
   src/jobs.rs      registry of running utility jobs (monitors, traces, iperf3 runs)
+  src/owner.rs     hands files created under sudo back to the invoking user
   data/oui.tsv     embedded IEEE OUI database (generated by scripts/build_oui_db.py)
   data/dhcp_fingerprints.tsv  embedded DHCP signature table (best-effort heuristics)
+packaging/macos/
+  build-dmg.sh     builds the installer disk image (macOS only)
+  install.sh       "Install SweepR.command": sudo installer (apps, CLI link, BPF access)
+  uninstall.sh     "Uninstall SweepR.command"
+  admin-launcher.applescript  "SweepR (Administrator)": starts the GUI as root
+  ReadMe.txt       "Read Me.txt" shown in the disk image
+docs/images/       README screenshots
 ```
 
 ## GUI backend contract
