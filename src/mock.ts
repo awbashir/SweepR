@@ -23,6 +23,8 @@ import { parseRange, type Ipv4Span } from "./lib/parse.ts";
 import { MockNet, macFor } from "./mockTopology.ts";
 import { createMockTools, mockWebIdentity } from "./mockTools.ts";
 import { withWebIdentity } from "./lib/store.ts";
+import { addMockIgd, addMockServices, mockDiscoverServices, mockReportContent, type MockServiceOptions } from "./mockServices.ts";
+import { deviceKindLabel, dhcpOsLabel, modelFirmware } from "./lib/services.ts";
 
 const INTERFACES: InterfaceInfo[] = [
   {
@@ -125,6 +127,7 @@ const HOST_VENDORS = [
   { vendor: "Yealink Network Technology", oui: "80:5e:c0", names: ["SIP-T46U", "SIP-T54W"] },
   { vendor: "Hikvision Digital Technology", oui: "44:19:b6", names: ["CAM", "NVR"] },
   { vendor: "Raspberry Pi Trading", oui: "dc:a6:32", names: ["raspberrypi", "pihole"] },
+  { vendor: "Synology Incorporated", oui: "00:11:32", names: ["NAS", "DS"] },
   { vendor: "VMware, Inc.", oui: "00:50:56", names: ["vm-web", "vm-db", "esx"] },
 ] as const;
 
@@ -173,7 +176,15 @@ function withWeb(dev: Device): Device {
  * One simulated device. Infrastructure lives in the scanned base /24 (see `MockNet`); hosts get
  * their switch port only when SNMP is configured (the real backend reads it from CAM tables).
  */
-function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNames: boolean, net: MockNet, withSnmp: boolean): Device {
+function makeDevice(
+  ipNum: number,
+  vlanId: number | null,
+  iface: string,
+  withNames: boolean,
+  net: MockNet,
+  withSnmp: boolean,
+  svc: MockServiceOptions = { discoverServices: false, dhcpFingerprint: false, snmp: withSnmp, cdpLldp: false },
+): Device {
   const now = Date.now();
   const ip = numberToIpv4(ipNum);
   const r = rng(hash(`${ip}@${vlanId ?? ""}`));
@@ -189,6 +200,7 @@ function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNam
     dev.dnsName = `${infra.name.toLowerCase()}.corp.example`;
     dev.openPorts = withNames ? infra.ports : [];
     dev.sources = withSnmp ? ["arp", "snmp", "dns"] : ["arp", "dns"];
+    if (infra.tier === "router" && svc.discoverServices && withNames) addMockIgd(dev);
     return dev;
   }
   const v = pick(r, HOST_VENDORS);
@@ -213,10 +225,17 @@ function makeDevice(ipNum: number, vlanId: number | null, iface: string, withNam
       portIndex: Number(/(\d+)$/.exec(place.port)?.[1] ?? 0) || null,
       vlanId: vlanId ?? 1,
       mac: dev.mac,
+      poe: null,
+      voiceVlan: null,
     };
   }
   if (r() < 0.15) dev.extraIps = [`fe80::${(ipNum & 0xffff).toString(16)}:${Math.floor(r() * 0xffff).toString(16)}`];
   dev.sources = withNames ? ["arp", "dns"] : ["arp"];
+  if (withNames) {
+    addMockServices(dev, label, svc);
+    // The switch reports the port's PoE and voice VLAN in its CAM entry, too.
+    if (dev.switchPort && (dev.poe || dev.voiceVlan != null)) dev.switchPort = { ...dev.switchPort, poe: dev.poe ?? null, voiceVlan: dev.voiceVlan ?? null };
+  }
   return dev;
 }
 
@@ -275,8 +294,11 @@ export function createMockBackend(): Backend {
   let nextId = 1;
   let job: Job | null = null;
 
+  /** Latest snapshot per IP (discover_services answers from what the host "is"). */
+  const seen = new Map<string, Device>();
   const emit = (j: Job, event: ScanEvent): void => {
     if (job !== j) return; // superseded jobs emit nothing
+    if (event.type === "device" && seen.size < 300_000) seen.set(event.data.ip, event.data);
     for (const l of listeners) l({ scanId: j.id, event });
   };
   const later = (j: Job, ms: number, fn: () => void): void => {
@@ -298,6 +320,8 @@ export function createMockBackend(): Backend {
     return j;
   };
 
+  /** Path of the last mock report (reveal_report). */
+  let lastReport: string | null = null;
   /** Network of the latest scan (SNMP queries answer from it). */
   let lastNet: MockNet | null = null;
   /** CAM entries the latest scan reported, by switch IP. */
@@ -347,6 +371,12 @@ export function createMockBackend(): Backend {
     const tick = big ? 30 : 25;
     const replyRate = big ? 0.8 : 0.6;
     const withSnmp = config.snmp !== null;
+    const svc: MockServiceOptions = {
+      discoverServices: config.discoverServices !== false,
+      dhcpFingerprint: config.dhcpFingerprint === true,
+      snmp: withSnmp,
+      cdpLldp: config.cdpLldp,
+    };
     // The simulated campus: built from the untagged /24s being scanned (or the interface's).
     const untaggedSpans = vlanIds.includes(null) ? spans : [];
     const blocks = blocksOf(untaggedSpans.length > 0 ? untaggedSpans : [{ start: ifaceBlock(iface) + 1, end: ifaceBlock(iface) + 254 }], 1024);
@@ -424,7 +454,7 @@ export function createMockBackend(): Backend {
         const r = rng(hash(`r${ipNum}`))();
         const isInfra = t.vlan === null && net.infraAt(ipNum) !== undefined;
         if (!isInfra && r > replyRate) continue;
-        const dev = makeDevice(ipNum, t.vlan, iface.name, isInfra || !big || r < 0.5, net, withSnmp);
+        const dev = makeDevice(ipNum, t.vlan, iface.name, isInfra || !big || r < 0.5, net, withSnmp, svc);
         if (isInfra && config.cdpLldp && dev.ip === scannerSw.ip) {
           dev.neighbor = scannerAdvert;
           dev.sources = [...dev.sources, scannerAdvert.protocol];
@@ -434,7 +464,9 @@ export function createMockBackend(): Backend {
         emit(j, { type: "device", data: dev });
         if (withSnmp && !isInfra && dev.mac && dev.switchPort) {
           const place = net.place(ipNum, t.vlan);
-          recordCam(net.hostCam(dev.mac, place, t.vlan ?? 1));
+          const cam = net.hostCam(dev.mac, place, t.vlan ?? 1);
+          if (cam[0] && dev.switchPort) cam[0] = { ...cam[0], poe: dev.switchPort.poe ?? null, voiceVlan: dev.switchPort.voiceVlan ?? null };
+          recordCam(cam);
         }
       }
       emit(j, { type: "progress", data: { phase: "discovering", probesSent: sent, probesTotal: total, devicesFound: found } });
@@ -447,11 +479,25 @@ export function createMockBackend(): Backend {
       const sample = discovered.filter((_, i) => i % (big ? 50 : 4) === 0);
       later(j, big ? 100 : 600, () => {
         for (const d of sample) {
-          let named = makeDevice(ipv4ToNumber(d.ip) ?? 0, d.vlanId, iface.name, true, net, withSnmp);
+          let named = makeDevice(ipv4ToNumber(d.ip) ?? 0, d.vlanId, iface.name, true, net, withSnmp, svc);
           if (named.role === "host" && named.openPorts.length === 0) named.openPorts = [443];
           named.neighbor = d.neighbor;
           if (config.webIdentity !== false && config.ports.length > 0) named = withWeb(named);
           emit(j, { type: "device", data: { ...named, sources: [...named.sources, "tcp"], lastSeenMs: Date.now() } });
+        }
+        if (svc.discoverServices) {
+          let up = 0;
+          let ws = 0;
+          let sp = 0;
+          for (const d of discovered) {
+            if (d.ssdp) up++;
+            if (d.onvif) ws++;
+            if (d.sip) sp++;
+          }
+          emit(j, { type: "log", data: { level: "info", message: `services: ${up} SSDP/UPnP, ${ws} WS-Discovery/ONVIF, ${sp} SIP (mock)` } });
+        }
+        if (svc.dhcpFingerprint) {
+          emit(j, { type: "log", data: { level: "warn", message: "DHCP fingerprinting: simulated in mock mode (the real capture needs root / BPF)" } });
         }
         if (config.cdpLldp) {
           emit(j, { type: "progress", data: { phase: "listening", probesSent: sent, probesTotal: total, devicesFound: found } });
@@ -465,7 +511,7 @@ export function createMockBackend(): Backend {
     later(j, 150, step);
   }
 
-  function runVlanDiscovery(j: Job, ifaceName: string | null, timeoutSecs: number): void {
+  function runVlanDiscovery(j: Job, ifaceName: string | null, timeoutSecs: number, dhcpFp: boolean): void {
     const iface = INTERFACES.find((i) => i.name === ifaceName) ?? INTERFACES[0]!;
     const net = netFor(iface);
     const sw = net.scannerSwitch;
@@ -479,6 +525,14 @@ export function createMockBackend(): Backend {
       ),
     );
     later(j, duration / 3, () => emit(j, { type: "neighbor", data: net.neighborOf(sw, iface.name, sw.accessPort?.(12) ?? "Gi1/0/12", 1) }));
+    if (dhcpFp) {
+      later(j, duration / 2, () =>
+        emit(j, {
+          type: "log",
+          data: { level: "info", message: "DHCP: 80:5e:c0:1a:2b:3c requested an address (Yealink IP phone, high; vendor class yealink) (mock)" },
+        }),
+      );
+    }
     later(j, duration, () => finish(j, 0, ids.length, 1));
   }
 
@@ -506,9 +560,9 @@ export function createMockBackend(): Backend {
       window.setTimeout(() => finish(j, 0, 0, 0), 50);
       return true;
     },
-    startVlanDiscovery: async (iface, timeoutSecs) => {
+    startVlanDiscovery: async (iface, timeoutSecs, dhcpFingerprint) => {
       const j = newJob();
-      runVlanDiscovery(j, iface, timeoutSecs ?? 30);
+      runVlanDiscovery(j, iface, timeoutSecs ?? 30, dhcpFingerprint === true);
       return j.id;
     },
     exportDevices: async (devices, format: ExportFormat) => {
@@ -537,6 +591,11 @@ export function createMockBackend(): Backend {
             "Cert Expires",
             (d) => (d.tlsCert?.notAfter ? `${d.tlsCert.notAfter.slice(0, 10)}${d.tlsCert.expired ? " (expired)" : ""}` : ""),
           ],
+          ["Device Kind", (d) => deviceKindLabel(d.deviceKind)],
+          ["Model/Firmware", (d) => modelFirmware(d)],
+          ["PoE (W)", (d) => (d.poe?.watts != null ? d.poe.watts.toFixed(1) : "")],
+          ["Voice VLAN", (d) => d.voiceVlan],
+          ["OS (DHCP)", (d) => dhcpOsLabel(d.dhcpFingerprint)],
           ["Comments", (d) => d.comments],
         ];
         const lines = [cols.map((c) => c[0]).join(",")];
@@ -594,6 +653,23 @@ export function createMockBackend(): Backend {
             c.macCount += 1;
             counts.set(m.portName, c);
           }
+          // PoE budget: the measured draw of known ports plus some unseen load (ACC-SW02 runs hot).
+          const nominal = net.poeNominal(spec);
+          let poeBudget: SnmpDeviceInfo["poeBudget"] = null;
+          if (nominal !== null) {
+            const perPort = new Map<string, number>();
+            for (const m of all) if (m.poe?.watts != null) perPort.set(m.portName, m.poe.watts);
+            const known = [...perPort.values()].reduce((a, b) => a + b, 0);
+            // Ports we have no CAM entry for draw some power too.
+            const consumed = spec.name === "ACC-SW02" ? Math.max(known, 0.84 * nominal) : Math.min(0.6 * nominal, known + ((hash(`budget${spec.ip}`) % 20) / 100) * nominal);
+            const extra = Math.max(0, consumed - known);
+            poeBudget = {
+              nominalWatts: nominal,
+              consumedWatts: Math.round(consumed * 10) / 10,
+              usageThresholdPct: 80,
+              portsDelivering: perPort.size + Math.round(extra / 9),
+            };
+          }
           const info: SnmpDeviceInfo = {
             sysName: spec.name,
             sysDescr: `${spec.platform} — ${spec.software}`,
@@ -603,6 +679,7 @@ export function createMockBackend(): Backend {
             vlans,
             portMappings: all.slice(0, 5000),
             portMacCounts: [...counts].map(([portName, c]) => ({ portName, ...c })),
+            poeBudget,
             partial: all.length > 5000,
             warnings: all.length > 5000 ? [`MAC table truncated to 5,000 of ${all.length.toLocaleString()} entries`] : [],
           };
@@ -618,6 +695,32 @@ export function createMockBackend(): Backend {
         listeners.delete(l);
       };
     },
+    discoverServices: (ip, timeoutMs) =>
+      new Promise((resolve, reject) => {
+        const n = ipv4ToNumber(ip);
+        if (n === null) {
+          reject(`'${ip}' is not an IP address`);
+          return;
+        }
+        const dev = seen.get(ip) ?? makeDevice(n, null, INTERFACES[0]!.name, true, netFor(INTERFACES[0]!), false);
+        const wait = Math.max(500, Math.min(5000, timeoutMs ?? 2500)) / 2;
+        window.setTimeout(() => resolve(mockDiscoverServices(dev, ip)), wait);
+      }),
+    generateReport: async (args) => {
+      if (args.format === "pdf") throw "PDF rendering needs the desktop app (mock mode writes HTML and JSON only)";
+      // Exposed for headless checks (secret stripping, payload size).
+      (window as unknown as { __sweeprLastReport?: unknown }).__sweeprLastReport = args;
+      const { name, mime, text } = mockReportContent(args);
+      download(name, mime, text);
+      lastReport = `~/Downloads/${name}`;
+      return lastReport;
+    },
+    revealReport: async () => {
+      if (!lastReport) return false;
+      console.info(`[mock] would reveal ${lastReport} in Finder`);
+      return true;
+    },
+    appVersion: async () => "0.1.0",
     openUrl: async (url) => {
       if (/^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener,noreferrer");
       else console.info(`[mock] would open ${url}`);

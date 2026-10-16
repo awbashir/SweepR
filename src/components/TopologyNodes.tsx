@@ -14,14 +14,15 @@ import {
   type Node,
   type NodeProps,
 } from "@xyflow/react";
-import { AlertTriangle, ChevronDown, ChevronRight, CircleHelp, Globe, Laptop, ShieldAlert, Users, Wifi } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, CircleHelp, Globe, Laptop, ShieldAlert, Users, Wifi, Zap } from "lucide-react";
 import { formatLoss, formatMs, latencyTone, type Tone } from "../lib/latency.ts";
 import { useLatency } from "../tools.ts";
 import type { DeviceRole } from "../types.ts";
 import { ROLE_LABEL } from "../types.ts";
 import type { TopoEdge, TopoMember, TopoNode } from "../lib/topology.ts";
 import { CARD_GAP, CARD_H, CARD_W, CLUSTER_PAD, STACK_BUS, clusterCols, type LayoutDir } from "../lib/topologyLayout.ts";
-import { ROLE_ICON, cx } from "./ui.tsx";
+import { KIND_ICON, ROLE_ICON, cx } from "./ui.tsx";
+import { deviceKindLabel, formatWatts, poeSummary, poeTone } from "../lib/services.ts";
 
 export interface TopoNodeData extends Record<string, unknown> {
   topo: TopoNode;
@@ -158,11 +159,47 @@ function frameClass(d: TopoNodeData): string {
   );
 }
 
+/** "⚡ 5.2 W" for an endpoint (coloured by load; the number says the same). */
+function PoeBadge({ n }: { n: TopoNode }) {
+  const p = n.poe;
+  if (!p || p.watts === null) return null;
+  const tone = poeTone(p);
+  return (
+    <span className="flex shrink-0 items-center gap-0.5 font-mono text-[9.5px]" style={{ color: TONE_VAR[tone] }} title={`PoE: ${poeSummary(p)}`}>
+      <Zap size={9} aria-hidden />
+      {formatWatts(p.watts)} W
+    </span>
+  );
+}
+
+/** Switch PoE: "PoE 412/740 W" (budget) or "PoE 123 W" (drawn on known ports). */
+function PoeUsageBadge({ n }: { n: TopoNode }) {
+  const u = n.poeUsage;
+  if (!u || u.consumed === null) return null;
+  const text = u.nominal !== null && u.pct !== null ? `${Math.round(u.pct)} %` : `${formatWatts(u.consumed)} W`;
+  const title =
+    u.nominal !== null
+      ? `PoE budget: ${formatWatts(u.consumed)} of ${formatWatts(u.nominal)} W used${u.pct !== null ? ` (${Math.round(u.pct)} %)` : ""}, ${u.ports} port(s) delivering`
+      : `PoE drawn on ${u.ports} known port(s) (no SNMP budget)`;
+  return (
+    <span
+      className="flex shrink-0 items-center gap-0.5 rounded-[3px] border border-line px-1 font-mono text-[9.5px] leading-[13px]"
+      style={{ color: u.nominal !== null ? TONE_VAR[u.tone] : "var(--muted)" }}
+      title={title}
+    >
+      <Zap size={9} aria-hidden />
+      {text}
+    </span>
+  );
+}
+
 /** Switches, firewalls, routers, APs and individual endpoints. */
 export const DeviceNode = memo(function DeviceNode({ data }: NodeProps<TopoRfNode>) {
   const n = data.topo;
   const role = n.role ?? "host";
-  const Icon = ROLE_ICON[role];
+  // Endpoints with a known kind (phone, camera, printer, ...) show it instead of the generic host icon.
+  const KindIcon = n.deviceKind ? KIND_ICON[n.deviceKind] : undefined;
+  const Icon = role === "host" && KindIcon ? KindIcon : ROLE_ICON[role];
   const infra = n.kind === "infra";
   const live = useContext(TopoLiveContext);
   const warnings = n.deviceKey ? live.warnings.get(n.deviceKey) : undefined;
@@ -173,6 +210,7 @@ export const DeviceNode = memo(function DeviceNode({ data }: NodeProps<TopoRfNod
         <div className="flex min-w-0 items-center gap-1.5">
           <Icon size={infra ? 15 : 13} strokeWidth={1.9} aria-hidden className="shrink-0" style={{ color: ROLE_VAR[role] }} />
           <span className={cx("min-w-0 flex-1 truncate font-semibold", infra ? "text-[12.5px]" : "text-[12px]")}>{n.label}</span>
+          {n.deviceKind && <span className="sr-only">{deviceKindLabel(n.deviceKind)}</span>}
           {infra && <span className="topo-detail shrink-0 text-[9.5px] tracking-wide text-muted uppercase">{ROLE_LABEL[role]}</span>}
           {warnings && warnings.length > 0 && (
             <span className="shrink-0 text-warn" title={warnings.join("\n")}>
@@ -185,18 +223,21 @@ export const DeviceNode = memo(function DeviceNode({ data }: NodeProps<TopoRfNod
         <div className="topo-detail flex min-w-0 items-center gap-1 font-mono text-[10.5px] text-muted">
           <span className="truncate">{n.ip ?? n.mac ?? ""}</span>
           {n.port && <span className="shrink-0 truncate">· {n.port}</span>}
-          {live.live && n.ip && (
-            <>
-              <span className="flex-1" />
-              <LatencyAccent ip={n.ip} />
-            </>
-          )}
+          {(live.live && n.ip) || n.poe ? <span className="flex-1" /> : null}
+          {!live.live && <PoeBadge n={n} />}
+          {live.live && n.ip && <LatencyAccent ip={n.ip} />}
         </div>
-        {(n.detail || n.vlans.length > 0) && (
+        {(n.detail || n.vlans.length > 0 || n.poeUsage || n.deviceKind) && (
           <div className="topo-detail flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted">
-            {n.detail && <span className="min-w-0 truncate">{n.detail}</span>}
+            {(n.deviceKind || n.detail) && (
+              <span className="min-w-0 truncate" title={n.deviceKind ? `${deviceKindLabel(n.deviceKind)}${n.detail ? ` · ${n.detail}` : ""}` : undefined}>
+                {n.deviceKind && !infra ? deviceKindLabel(n.deviceKind) + (n.detail ? ` · ${n.detail}` : "") : n.detail}
+              </span>
+            )}
             <span className="flex-1" />
-            <VlanBadges vlans={n.vlans} max={infra ? 4 : 2} />
+            <PoeUsageBadge n={n} />
+            {live.live && <PoeBadge n={n} />}
+            <VlanBadges vlans={n.vlans} max={infra ? (n.poeUsage ? 2 : 4) : 2} />
           </div>
         )}
       </div>
@@ -247,13 +288,30 @@ function MemberCard({ m, selected, match }: { m: TopoMember; selected: boolean; 
         a.deviceMenu(m.key, e.clientX, e.clientY);
       }}
     >
-      <span className="truncate text-[11px] font-medium">{m.label}</span>
-      <span className="truncate font-mono text-[10px] text-muted">
-        {m.ip}
-        {m.port ? ` · ${m.port}` : ""}
+      <span className="flex min-w-0 items-center gap-1">
+        {m.deviceKind && KIND_ICON[m.deviceKind] && <MemberKindIcon kind={m.deviceKind} />}
+        <span className="truncate text-[11px] font-medium">{m.label}</span>
+      </span>
+      <span className="flex min-w-0 items-center gap-1 font-mono text-[10px] text-muted">
+        <span className="truncate">
+          {m.ip}
+          {m.port ? ` · ${m.port}` : ""}
+        </span>
+        {m.poeWatts !== null && (
+          <span className="ml-auto flex shrink-0 items-center" title={`PoE ${formatWatts(m.poeWatts)} W`}>
+            <Zap size={8} aria-hidden />
+            {formatWatts(m.poeWatts)}
+          </span>
+        )}
       </span>
     </button>
   );
+}
+
+function MemberKindIcon({ kind }: { kind: string }) {
+  const Icon = KIND_ICON[kind];
+  if (!Icon) return null;
+  return <Icon size={11} strokeWidth={1.9} aria-label={deviceKindLabel(kind)} className="shrink-0 text-accent" />;
 }
 
 /** Collapsible group of endpoints ("31 hosts on Gi1/0/1-43"). */

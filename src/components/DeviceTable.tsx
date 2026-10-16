@@ -35,7 +35,8 @@ import { completeOrder, effectiveVisibility, type AutoColumns } from "../lib/col
 import { latencyStore, useLatency } from "../tools.ts";
 import { Sparkline } from "./Charts.tsx";
 import { ContextMenu, type MenuItem } from "./Menu.tsx";
-import { RoleIcon, cx } from "./ui.tsx";
+import { KindIcon, RoleIcon, TONE_TEXT_CLASS, cx } from "./ui.tsx";
+import { deviceKindOf, formatWatts, poeSummary, poeTone } from "../lib/services.ts";
 
 export const ROW_H = 22;
 const HEADER_H = 24;
@@ -59,6 +60,11 @@ export type ColId =
   | "webIdentity"
   | "certCn"
   | "certExpires"
+  | "deviceKind"
+  | "modelFw"
+  | "poe"
+  | "voiceVlan"
+  | "dhcpOs"
   | "comments";
 
 export type EditField = "hostname" | "comments";
@@ -90,6 +96,11 @@ export const COL_META: Record<ColId, ColMeta> = {
   webIdentity: { label: "Web Identity", size: 140, align: "left" },
   certCn: { label: "Cert CN", size: 170, align: "left" },
   certExpires: { label: "Cert Expires", size: 130, align: "left" },
+  deviceKind: { label: "Device Kind", size: 124, align: "left" },
+  modelFw: { label: "Model/Firmware", size: 190, align: "left" },
+  poe: { label: "PoE (W)", size: 70, align: "right" },
+  voiceVlan: { label: "Voice VLAN", size: 80, align: "right" },
+  dhcpOs: { label: "OS (DHCP)", size: 150, align: "left" },
   comments: { label: "Comments", size: 200, align: "left" },
 };
 
@@ -154,6 +165,11 @@ const COLUMNS: ColumnDef<DeviceRow>[] = [
   col("webIdentity", (r) => blank(r.device.webIdentity)),
   col("certCn", (r) => blank(r.device.tlsCert?.subjectCn)),
   col("certExpires", (r) => certSortKey(r.device.tlsCert)),
+  col("deviceKind", (r) => blank(r.kind)),
+  col("modelFw", (r) => blank(r.modelFw)),
+  col("poe", (r) => r.device.poe?.watts ?? r.device.poe?.maxWatts ?? undefined),
+  col("voiceVlan", (r) => r.device.voiceVlan ?? undefined),
+  col("dhcpOs", (r) => blank(r.dhcpOs)),
   col("comments", (r) => blank(r.comments)),
 ];
 
@@ -220,10 +236,21 @@ export function DeviceTable(props: DeviceTableProps) {
   const { rows, selectedKey, onSelect, onOpenDetails, editing, onStartEdit, onRowMenu, onDeleteRow, onCopyIp } = props;
   const [prefsRaw, setPrefs] = usePersistentState<ColumnPrefs>("sweepr.columns.v1", DEFAULT_PREFS);
   const prefs = useMemo(() => sanitizePrefs(prefsRaw), [prefsRaw]);
-  const { liveLatency, webTitle: autoTitle, certExpires: autoCert } = props.autoColumns;
+  const { liveLatency, webTitle: autoTitle, certExpires: autoCert, deviceKind: aKind, modelFw: aModel, poe: aPoe, voiceVlan: aVoice, dhcpOs: aDhcp } =
+    props.autoColumns;
   const visibility = useMemo(
-    () => effectiveVisibility(prefs.visibility, { liveLatency, webTitle: autoTitle, certExpires: autoCert }),
-    [prefs.visibility, liveLatency, autoTitle, autoCert],
+    () =>
+      effectiveVisibility(prefs.visibility, {
+        liveLatency,
+        webTitle: autoTitle,
+        certExpires: autoCert,
+        deviceKind: aKind,
+        modelFw: aModel,
+        poe: aPoe,
+        voiceVlan: aVoice,
+        dhcpOs: aDhcp,
+      }),
+    [prefs.visibility, liveLatency, autoTitle, autoCert, aKind, aModel, aPoe, aVoice, aDhcp],
   );
   const [headerMenu, setHeaderMenu] = useState<{ x: number; y: number; colId: ColId | null } | null>(null);
   const [dragOver, setDragOver] = useState<ColId | null>(null);
@@ -738,6 +765,24 @@ function CellContent({ id, row, selected, width }: { id: ColId; row: DeviceRow; 
       return text(d.tlsCert?.subjectCn);
     case "certExpires":
       return <CertExpiresCell row={row} selected={selected} />;
+    case "deviceKind": {
+      const k = deviceKindOf(d);
+      if (!k) return null;
+      return (
+        <span className="flex min-w-0 items-center gap-1.5" title={row.kind}>
+          <KindIcon kind={k} inherit={selected} />
+          <span className="truncate">{row.kind}</span>
+        </span>
+      );
+    }
+    case "modelFw":
+      return text(row.modelFw);
+    case "poe":
+      return <PoeCell row={row} selected={selected} />;
+    case "voiceVlan":
+      return d.voiceVlan != null ? <span className="tabular">{d.voiceVlan}</span> : null;
+    case "dhcpOs":
+      return <DhcpCell row={row} selected={selected} />;
     case "comments":
       return text(row.comments);
   }
@@ -798,6 +843,43 @@ function CertExpiresCell({ row, selected }: { row: DeviceRow; selected: boolean 
           <ShieldAlert size={12} strokeWidth={1.75} aria-label="self-signed" />
         </span>
       )}
+    </span>
+  );
+}
+
+function PoeCell({ row, selected }: { row: DeviceRow; selected: boolean }) {
+  const p = row.device.poe;
+  if (!p) return null;
+  const w = p.watts ?? p.maxWatts;
+  if (w === null) return p.status ? <Faint selected={selected}>{p.status}</Faint> : null;
+  const tone = poeTone(p);
+  return (
+    <span
+      className={cx("font-mono text-[11px] tabular", !selected && (p.watts === null ? "text-muted" : TONE_TEXT_CLASS[tone]))}
+      title={`PoE: ${poeSummary(p)}${p.watts === null ? " (advertised budget)" : ""}`}
+    >
+      {p.watts === null ? "≤" : ""}
+      {formatWatts(w)}
+    </span>
+  );
+}
+
+const CONF_DOT: Record<string, string> = { high: "bg-ok", medium: "bg-warn", low: "bg-faint" };
+
+function DhcpCell({ row, selected }: { row: DeviceRow; selected: boolean }) {
+  const f = row.device.dhcpFingerprint;
+  if (!f?.os) return null;
+  const conf = f.confidence ?? "";
+  return (
+    <span
+      className="flex min-w-0 items-center gap-1.5"
+      title={`${f.os} — ${conf || "unknown"} confidence (DHCP fingerprint, a best-effort guess)${f.vendorClass ? `\nVendor class: ${f.vendorClass}` : ""}`}
+    >
+      <span
+        className={cx("inline-block size-[7px] shrink-0 rounded-full", selected ? "bg-current opacity-70" : (CONF_DOT[conf] ?? "bg-faint"))}
+        aria-label={`${conf || "unknown"} confidence`}
+      />
+      <span className="truncate">{f.os}</span>
     </span>
   );
 }

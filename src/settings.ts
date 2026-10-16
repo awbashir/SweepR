@@ -22,6 +22,12 @@ export interface ScanSettings {
   /** Poll every host over SNMP instead of only likely infrastructure. */
   snmpAll: boolean;
   snmp: SnmpConfig;
+  /** SSDP/UPnP, WS-Discovery/ONVIF and SIP OPTIONS during enrichment. */
+  discoverServices: boolean;
+  /** SIP OPTIONS to every host, not only likely VoIP gear. */
+  sipAll: boolean;
+  /** Passive DHCP fingerprinting (needs root, like the other sniffers). */
+  dhcpFingerprint: boolean;
 }
 
 export const DEFAULT_SNMP: SnmpConfig = {
@@ -46,6 +52,9 @@ export const DEFAULT_SETTINGS: ScanSettings = {
   snmpEnabled: false,
   snmpAll: false,
   snmp: DEFAULT_SNMP,
+  discoverServices: true,
+  sipAll: false,
+  dhcpFingerprint: false,
 };
 
 /** What gets written to localStorage: never SNMP secrets (community / v3 passwords). */
@@ -113,6 +122,9 @@ export function buildScanConfig(s: ScanSettings): Parsed<BuiltConfig> {
     concurrency: 512,
     listenSecs: 10,
     webIdentity: true,
+    discoverServices: s.discoverServices,
+    sipAll: s.discoverServices && s.sipAll,
+    dhcpFingerprint: s.dhcpFingerprint,
   };
   return { ok: true, value: { config, targetCount: range.value.spec === null ? null : range.value.count } };
 }
@@ -180,4 +192,14 @@ export function subnetHint(i: InterfaceInfo | undefined): string | null {
   const size = 2 ** (32 - v4.prefix);
   const net = Math.floor(n / size) * size;
   return `${numberToIpv4(net + 1)} to ${numberToIpv4(net + size - 2)}`;
+}
+
+/** "10.0.0.0/24" for the interface's IPv4 subnet (what an empty range scans). */
+export function interfaceCidr(i: InterfaceInfo | undefined): string | null {
+  const v4 = i ? primaryIpv4(i) : null;
+  if (!v4) return null;
+  const n = ipv4ToNumber(v4.ip);
+  if (n === null || v4.prefix < 0 || v4.prefix > 32) return null;
+  const size = 2 ** (32 - v4.prefix);
+  return `${numberToIpv4(Math.floor(n / size) * size)}/${v4.prefix}`;
 }

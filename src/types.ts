@@ -30,7 +30,11 @@ export type DiscoverySource =
   | "snmp"
   | "dns"
   | "mdns"
-  | "netbios";
+  | "netbios"
+  | "ssdp"
+  | "wsd"
+  | "sip"
+  | "dhcp";
 
 export type VlanSource =
   | "os_interface"
@@ -88,6 +92,10 @@ export interface CdpLldpNeighbor {
   voiceVlan: number | null;
   capabilities: Capability[];
   vtpDomain: string | null;
+  /** Headline PoE power: drawn, else the advertised budget (W). */
+  poeWatts?: number | null;
+  /** PoE detail from the CDP / LLDP power TLVs (`switchName` / `port` are null here). */
+  poeInfo?: PoeInfo | null;
   ttlSecs: number;
   lastSeenMs: number;
 }
@@ -99,6 +107,123 @@ export interface SwitchPortMapping {
   portIndex: number | null;
   vlanId: number | null;
   mac: string;
+  /** PoE on this port (POWER-ETHERNET-MIB). */
+  poe?: PoeInfo | null;
+  /** Voice VLAN of this port (Cisco `vmVoiceVlanId`). */
+  voiceVlan?: number | null;
+}
+
+// --- Deeper discovery (Roadmap 2): SSDP/UPnP, WSD/ONVIF, SIP, PoE, DHCP --------------------------
+// Every field is additive: older backends omit them, so they are optional here.
+
+/** Finer category than `role`. New strings may appear: render unknown ones as-is. */
+export type DeviceKind =
+  | "voip_phone"
+  | "pbx"
+  | "camera"
+  | "computer"
+  | "media_server"
+  | "igd_router"
+  | "printer"
+  | "scanner"
+  | "tv"
+  | "nas"
+  | (string & {});
+
+export interface SsdpInfo {
+  location: string | null;
+  server: string | null;
+  searchTarget: string | null;
+  usn: string | null;
+  friendlyName: string | null;
+  manufacturer: string | null;
+  modelName: string | null;
+  modelNumber: string | null;
+  modelDescription: string | null;
+  serialNumber: string | null;
+  /** e.g. "urn:schemas-upnp-org:device:MediaServer:1" */
+  deviceType: string | null;
+  /** "uuid:..." */
+  udn: string | null;
+  /** Device web UI as advertised by the device (open only http/https via the opener). */
+  presentationUrl: string | null;
+  /** UPnP serviceType URNs (max 64). */
+  services: string[];
+}
+
+export interface OnvifInfo {
+  xaddrs: string[];
+  types: string | null;
+  scopes: string[];
+  name: string | null;
+  location: string | null;
+  manufacturer: string | null;
+  model: string | null;
+  firmwareVersion: string | null;
+  serialNumber: string | null;
+  hardwareId: string | null;
+  isCamera: boolean;
+  isWindows: boolean;
+  /** Only a URL the camera itself returned (unauthenticated GetStreamUri). */
+  rtspUrl: string | null;
+  /** Vendor templates when `rtspUrl` is null; each ends with "(guess, no credentials tried)". */
+  rtspHints: string[];
+}
+
+export interface SipInfo {
+  status: string | null;
+  server: string | null;
+  userAgent: string | null;
+  allow: string | null;
+  supported: string | null;
+  transport: "udp" | "tcp" | (string & {}) | null;
+  vendor: string | null;
+  model: string | null;
+  firmware: string | null;
+  kind: "voip_phone" | "pbx" | (string & {}) | null;
+}
+
+export interface PoeInfo {
+  /** Power drawn / requested, W. */
+  watts: number | null;
+  /** Allocated / available budget, W. */
+  maxWatts: number | null;
+  /** IEEE class 0-8. */
+  class: number | null;
+  status: "delivering" | "searching" | "disabled" | "fault" | "test" | (string & {}) | null;
+  source: "pse" | "local" | "pse+local" | (string & {}) | null;
+  priority: "critical" | "high" | "low" | (string & {}) | null;
+  /** Set for SNMP-derived port data. */
+  switchName: string | null;
+  port: string | null;
+}
+
+export interface PoeBudget {
+  nominalWatts: number | null;
+  consumedWatts: number | null;
+  usageThresholdPct: number | null;
+  portsDelivering: number;
+}
+
+/** Best-effort heuristic, never authoritative. */
+export interface DhcpFingerprint {
+  os: string | null;
+  confidence: "high" | "medium" | "low" | (string & {}) | null;
+  /** Option 60. */
+  vendorClass: string | null;
+  /** Option 12 (client-chosen; not a DNS name). */
+  hostname: string | null;
+  /** Option 55, in the client's order. */
+  paramList: number[];
+}
+
+/** `discover_services()` result. */
+export interface ServiceDiscovery {
+  ip: string | null;
+  deviceKind: DeviceKind | null;
+  ssdp: SsdpInfo | null;
+  onvif: OnvifInfo | null;
+  sip: SipInfo | null;
 }
 
 export interface Device {
@@ -134,6 +259,16 @@ export interface Device {
   webIdentity: string | null;
   /** Problems worth flagging (expired / expiring / self-signed certificates, ...). */
   warnings: string[];
+  /** CDP/LLDP-MED voice VLAN (phones) or the SNMP port's voice VLAN. */
+  voiceVlan?: number | null;
+  /** Finer category than `role` (from service discovery). */
+  deviceKind?: DeviceKind | null;
+  ssdp?: SsdpInfo | null;
+  onvif?: OnvifInfo | null;
+  sip?: SipInfo | null;
+  /** PoE this endpoint draws (its switch port / own advert). */
+  poe?: PoeInfo | null;
+  dhcpFingerprint?: DhcpFingerprint | null;
 }
 
 export type InterfaceKind =
@@ -204,6 +339,12 @@ export interface ScanConfig {
   listenSecs: number;
   /** Read web titles / TLS certificates of devices with web ports open (default true). */
   webIdentity: boolean;
+  /** SSDP/UPnP + WS-Discovery/ONVIF + SIP OPTIONS during enrichment (default true). */
+  discoverServices: boolean;
+  /** SIP OPTIONS to every discovered IPv4 host, not only likely VoIP gear (default false). */
+  sipAll: boolean;
+  /** Passive DHCP fingerprinting (needs root / BPF; default false). */
+  dhcpFingerprint: boolean;
 }
 
 export type ScanPhase = "preparing" | "discovering" | "enriching" | "listening" | "done";
@@ -273,6 +414,8 @@ export interface SnmpDeviceInfo {
   vlans: VlanInfo[];
   portMappings: SwitchPortMapping[];
   portMacCounts: PortMacCount[];
+  /** Switch-wide PoE budget (POWER-ETHERNET-MIB), when the agent answered it. */
+  poeBudget?: PoeBudget | null;
   /** Some table walks failed or were cut short; the data above is what was collected. */
   partial: boolean;
   /** Why the result is partial (one line per failed / truncated walk). */
@@ -495,4 +638,49 @@ export interface IperfUpdate {
   summary: IperfSummary | null;
   done: boolean;
   error: string | null;
+}
+
+// --- Audit report (Roadmap 3) -----------------------------------------------------------------
+
+export type ReportFormat = "html" | "pdf" | "json";
+
+/** Scan metadata for the report. Every field optional. */
+export interface ReportMeta {
+  toolVersion?: string;
+  interface?: string;
+  ranges?: string[];
+  /** e.g. "untagged,10,20" */
+  vlans?: string;
+  /** Scanned TCP ports, e.g. "22,23,80,443,1000-2000". */
+  portSpec?: string;
+  startedMs?: number;
+  finishedMs?: number;
+  cancelled?: boolean;
+  ipv6?: boolean;
+  cdpLldp?: boolean;
+  discoverVlans?: boolean;
+  resolveNames?: boolean;
+  snmpAll?: boolean;
+  /**
+   * The GUI never sends the community itself: it sends the classification the backend would
+   * derive from it (`communityKind`, accepted by `SnmpMeta` in audit.rs).
+   */
+  snmp?: { version?: SnmpVersion; communityKind?: "public" | "private" | "custom" | "none" };
+  gateway?: string;
+  dhcpServers?: string[];
+  ipv6Routers?: string[];
+  scannerHost?: string;
+}
+
+/** `generate_report()` arguments. */
+export interface GenerateReportArgs {
+  devices: Device[];
+  vlans?: VlanInfo[];
+  neighbors?: CdpLldpNeighbor[];
+  portMappings?: SwitchPortMapping[];
+  snmpInfos?: (SnmpDeviceInfo & { ip: string })[];
+  meta?: ReportMeta;
+  format: ReportFormat;
+  title?: string;
+  org?: string;
 }

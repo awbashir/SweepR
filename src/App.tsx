@@ -1,5 +1,7 @@
 import { Suspense, lazy, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
+  Cctv,
+  ClipboardCopy,
   Copy,
   ExternalLink,
   Gauge,
@@ -7,6 +9,7 @@ import {
   MessageSquare,
   Pencil,
   Power,
+  Radar,
   Route,
   ScanLine,
   Server,
@@ -15,7 +18,7 @@ import {
   Trash,
 } from "lucide-react";
 import { backend, errorMessage } from "./api.ts";
-import type { DeviceOverride, ExportFormat, InterfaceInfo, WakeOptions } from "./types.ts";
+import type { DeviceOverride, ExportFormat, InterfaceInfo, ReportFormat, ScanConfig, WakeOptions } from "./types.ts";
 import { clearTools, grabWebIdentity, initTools, latencyCtl, latencyStore, onLatencyError, webStore } from "./tools.ts";
 import { webProbePorts, webTargets } from "./lib/webid.ts";
 import { ScanStore, exportDevice, type DeviceRow } from "./lib/store.ts";
@@ -26,6 +29,7 @@ import {
   DEFAULT_SETTINGS,
   DEFAULT_SNMP,
   buildScanConfig,
+  interfaceCidr,
   persistableSettings,
   snmpForWire,
   subnetHint,
@@ -33,9 +37,13 @@ import {
   type ScanSettings,
 } from "./settings.ts";
 import { usePersistentState } from "./hooks/usePersistentState.ts";
+import { detectAutoColumns } from "./lib/columns.ts";
+import { modelSerialText, rtspCandidates } from "./lib/services.ts";
+import { buildReportArgs, buildReportMeta, leaksSecret, snmpSecrets, yieldToEventLoop } from "./lib/report.ts";
+import type { ServiceQueryState } from "./components/DrawerServices.tsx";
 import { DeviceTable, type EditField } from "./components/DeviceTable.tsx";
 import { DetailsDrawer, type DrawerSection, type PortScanState, type SnmpQueryState } from "./components/DetailsDrawer.tsx";
-import { CustomUrlDialog, SnmpDialog, WakeDialog } from "./components/Dialogs.tsx";
+import { CustomUrlDialog, ReportDialog, SnmpDialog, WakeDialog, type ReportDialogValues } from "./components/Dialogs.tsx";
 import { NeighborView, VlanView } from "./components/InfraViews.tsx";
 import { ContextMenu, type MenuItem, type MenuState } from "./components/Menu.tsx";
 import { LogPanel, StatusBar } from "./components/StatusBar.tsx";
@@ -121,6 +129,14 @@ function Main() {
   const [drawerFocus, setDrawerFocus] = useState<{ section: DrawerSection; token: number } | null>(null);
   const [traceToken, setTraceToken] = useState(0);
   const [iperfToken, setIperfToken] = useState(0);
+  const [serviceQueries, setServiceQueries] = useState<Record<string, ServiceQueryState>>({});
+  const [reportFor, setReportFor] = useState<ReportFormat | null>(null);
+  const [reportBusy, setReportBusy] = useState<string | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [reportPrefs, setReportPrefs] = usePersistentState<{ title: string; org: string }>("sweepr.report.v1", { title: "", org: "" });
+  const [toolVersion, setToolVersion] = useState<string | null>(null);
+  /** The configuration the latest scan from this window ran with (report metadata). */
+  const lastScan = useRef<{ config: ScanConfig; iface: string | null; startedMs: number } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   // --- startup: event subscription, interfaces, overrides ---------------------------------------
@@ -153,6 +169,10 @@ function Main() {
       .loadOverrides()
       .then((o) => store.setOverrides(o))
       .catch((e: unknown) => toast.push("warn", "Could not load saved hostnames and comments", errorMessage(e)));
+    backend
+      .appVersion()
+      .then((v) => setToolVersion(`SweepR ${v}${backend.isMock ? " (mock)" : ""}`))
+      .catch(() => setToolVersion("SweepR"));
     if (backend.isMock && !mockNoticeShown) {
       mockNoticeShown = true;
       store.log("warn", "Running in a browser without the Tauri backend: all data is simulated (mock mode).");
@@ -213,16 +233,8 @@ function Main() {
     [],
   );
 
-  const autoColumns = useMemo(() => {
-    let webTitle = false;
-    let certExpires = false;
-    for (const r of snap.rows) {
-      if (r.device.webTitle) webTitle = true;
-      if (r.device.tlsCert) certExpires = true;
-      if (webTitle && certExpires) break;
-    }
-    return { liveLatency: ui.liveLatency, webTitle, certExpires };
-  }, [snap.rows, ui.liveLatency]);
+  const detected = useMemo(() => detectAutoColumns(snap.rows), [snap.rows]);
+  const autoColumns = useMemo(() => ({ ...detected, liveLatency: ui.liveLatency }), [detected, ui.liveLatency]);
 
   const vlanSel = vlanSelectionFrom(settings);
   const vlanLabel = vlanSel.ok ? vlanSelectionLabel(vlanSel.value) : "Invalid VLANs";
@@ -239,6 +251,8 @@ function Main() {
         return;
       }
       const token = store.beginStart("scan");
+      const defaultIface = interfaces.find((i) => i.isDefault);
+      lastScan.current = { config: built.value.config, iface: built.value.config.interface ?? defaultIface?.name ?? null, startedMs: Date.now() };
       store.log(
         "info",
         `Starting scan on ${built.value.config.interface ?? "default interface"}: ${built.value.config.range ?? "interface subnet"}, ${vlanSelectionLabel(built.value.config.vlans)}`,
@@ -252,7 +266,7 @@ function Main() {
         toast.push("error", "Scan failed to start", msg);
       }
     },
-    [toast],
+    [toast, interfaces],
   );
 
   const start = useCallback(() => void startWith(settings), [startWith, settings]);
@@ -269,14 +283,14 @@ function Main() {
   const passiveDiscovery = useCallback(async () => {
     const token = store.beginStart("vlan_discovery");
     try {
-      const id = await backend.startVlanDiscovery(settings.iface === "" ? null : settings.iface, ui.discoveryTimeout);
+      const id = await backend.startVlanDiscovery(settings.iface === "" ? null : settings.iface, ui.discoveryTimeout, settings.dhcpFingerprint);
       store.startResolved(id, token);
     } catch (e) {
       const msg = errorMessage(e);
       store.startFailed(`VLAN discovery failed to start: ${msg}`, token);
       toast.push("error", "VLAN discovery failed to start", msg);
     }
-  }, [settings.iface, ui.discoveryTimeout, toast]);
+  }, [settings.iface, settings.dhcpFingerprint, ui.discoveryTimeout, toast]);
 
   const scanVlans = useCallback(
     (ids: number[]) => {
@@ -466,6 +480,100 @@ function Main() {
     [toast],
   );
 
+  const discoverServices = useCallback(
+    async (row: DeviceRow) => {
+      const key = row.key;
+      setServiceQueries((s) => ({ ...s, [key]: { status: "running" } }));
+      try {
+        const sd = await backend.discoverServices(row.device.ip);
+        store.setServices(key, sd);
+        const empty = !sd.ssdp && !sd.onvif && !sd.sip;
+        setServiceQueries((s) => ({ ...s, [key]: { status: "done", empty } }));
+        const found = [sd.ssdp && "UPnP", sd.onvif && (sd.onvif.isCamera ? "ONVIF" : "WSD"), sd.sip && "SIP"].filter(Boolean).join(", ");
+        store.log("info", `Services ${row.device.ip}: ${found || "no answer"}`);
+        if (empty) toast.push("info", `No services answered on ${row.device.ip}`, "No UPnP, WS-Discovery/ONVIF or SIP response.");
+      } catch (e) {
+        const msg = errorMessage(e);
+        setServiceQueries((s) => ({ ...s, [key]: { status: "error", error: msg } }));
+        toast.push("error", `Service discovery of ${row.device.ip} failed`, msg);
+      }
+    },
+    [toast],
+  );
+
+  // --- audit report -----------------------------------------------------------------------------
+
+  const openReport = useCallback((format: ReportFormat) => {
+    setReportError(null);
+    setReportFor(format);
+  }, []);
+
+  const generateReport = useCallback(
+    async (format: ReportFormat, v: ReportDialogValues) => {
+      setReportPrefs({ title: v.title, org: v.org });
+      setReportError(null);
+      setReportBusy("Preparing the report data…");
+      try {
+        const rows = v.onlyShown ? filtered : snap.rows;
+        const scan = lastScan.current;
+        const isScan = snap.jobKind === "scan";
+        const meta = buildReportMeta({
+          config: scan?.config ?? null,
+          iface: scan?.iface ?? null,
+          defaultRanges: [interfaceCidr(scan?.config.interface ? interfaces.find((i) => i.name === scan.config.interface) : interfaces.find((i) => i.isDefault))].filter(
+            (x): x is string => x !== null,
+          ),
+          startedMs: isScan ? snap.jobStartedMs : (scan?.startedMs ?? null),
+          finishedMs: isScan ? snap.jobFinishedMs : null,
+          cancelled: isScan && (snap.summary?.cancelled ?? false),
+          toolVersion,
+        });
+        // Defence in depth: the metadata must never carry the community or v3 passwords.
+        if (leaksSecret(meta, [...snmpSecrets(settings.snmp), ...snmpSecrets(scan?.config.snmp)])) {
+          throw "internal error: the report metadata contained an SNMP secret; nothing was sent";
+        }
+        const t0 = performance.now();
+        const args = await buildReportArgs(
+          { rows, latency: (ip) => latencyStore.get(ip)?.stats, vlans: snap.vlans, neighbors: snap.neighbors, portMappings: snap.portMappings, snmp: snap.snmp },
+          meta,
+          { format, title: v.title, org: v.org },
+          async ({ done, total }) => {
+            setReportBusy(`Preparing ${done.toLocaleString()} of ${total.toLocaleString()} devices…`);
+            await yieldToEventLoop();
+          },
+        );
+        const buildMs = performance.now() - t0;
+        if (rows.length >= 5000) store.log("info", `Report input: ${rows.length.toLocaleString()} devices prepared in ${buildMs.toFixed(0)} ms`);
+        setReportBusy(format === "pdf" ? "Rendering the PDF…" : "Building the report…");
+        const path = await backend.generateReport(args);
+        setReportFor(null);
+        if (path === null) {
+          toast.push("info", "Report not saved", "The save dialog was cancelled.");
+          return;
+        }
+        store.log("info", `Audit report saved: ${path}`);
+        toast.push("success", "Audit report saved", path, {
+          label: "Reveal",
+          onClick: () => {
+            backend
+              .revealReport()
+              .then((ok) => {
+                if (!ok) toast.push("info", "No report to reveal", "Save a report first.");
+              })
+              .catch((e: unknown) => toast.push("error", "Could not reveal the report", errorMessage(e)));
+          },
+        });
+      } catch (e) {
+        const msg = errorMessage(e);
+        setReportError(msg);
+        toast.push("error", "Report failed", msg);
+      } finally {
+        setReportBusy(null);
+      }
+    },
+    [filtered, snap, interfaces, toolVersion, settings.snmp, setReportPrefs, toast],
+  );
+
   const togglePin = useCallback(
     (ip: string) =>
       setUi((u) => {
@@ -499,6 +607,7 @@ function Main() {
     setEditing(null);
     setPortScans({});
     setSnmpQueries({});
+    setServiceQueries({});
   }, []);
 
   const openDetails = useCallback(
@@ -531,6 +640,8 @@ function Main() {
       // Detected web UIs (scan / "Grab Web Identity") first, with their real port and scheme.
       const web = webTargets(row.device, webStore.get(row.key)?.result?.services).slice(0, 4);
       const isPinned = pinned.includes(ip);
+      const rtsp = rtspCandidates(row.device.onvif);
+      const modelSerial = modelSerialText(row.device);
       setRowMenu({
         x,
         y,
@@ -592,6 +703,28 @@ function Main() {
             },
           },
           {
+            kind: "item",
+            label: "Discover Services",
+            icon: Radar,
+            title: "Unicast SSDP/UPnP, WS-Discovery/ONVIF and SIP OPTIONS to this host",
+            onSelect: () => {
+              openDetails(row.key);
+              focusDrawer("services");
+              void discoverServices(row);
+            },
+          },
+          ...(rtsp.length > 0
+            ? [
+                {
+                  kind: "item",
+                  label: rtsp[0]!.guess ? "Copy RTSP Stream URL (guess)" : "Copy RTSP Stream URL",
+                  icon: Cctv,
+                  title: rtsp[0]!.guess ? `${rtsp[0]!.url}\nA vendor template, never verified; no credentials were tried.` : rtsp[0]!.url,
+                  onSelect: () => void copy(rtsp[0]!.url, rtsp[0]!.guess ? "RTSP URL (guess)" : "RTSP URL"),
+                } as MenuItem,
+              ]
+            : []),
+          {
             kind: "check",
             label: "Pin Live Latency",
             checked: isPinned,
@@ -631,12 +764,20 @@ function Main() {
             disabled: !row.device.mac,
             onSelect: () => void copy(row.device.mac ?? "", "MAC address"),
           },
+          {
+            kind: "item",
+            label: "Copy Model / Serial",
+            icon: ClipboardCopy,
+            disabled: modelSerial === "",
+            title: modelSerial === "" ? "No model or serial number known (Discover Services may find one)" : modelSerial,
+            onSelect: () => void copy(modelSerial, "model / serial"),
+          },
           { kind: "separator" },
           { kind: "item", label: "Remove from Results", icon: Trash, shortcut: "⌫", onSelect: () => removeRow(row.key) },
         ],
       });
     },
-    [openScheme, openUrl, openDetails, runPortScan, querySnmp, startEdit, copy, removeRow, wakeRow, grabWeb, focusDrawer, togglePin, pinned, ui.liveLatency, toast],
+    [openScheme, openUrl, openDetails, runPortScan, querySnmp, startEdit, copy, removeRow, wakeRow, grabWeb, discoverServices, focusDrawer, togglePin, pinned, ui.liveLatency, toast],
   );
 
   // Topology map callbacks (stable identities keep the map from re-rendering needlessly).
@@ -748,6 +889,9 @@ function Main() {
         latencyIntervalMs={ui.latencyIntervalMs}
         onLatencyInterval={(latencyIntervalMs) => patchUi({ latencyIntervalMs })}
         onWakeByMac={() => setWakeOpen(true)}
+        onReport={openReport}
+        reportCount={snap.rows.length}
+        reportBusy={reportBusy !== null}
       />
       <FilterBar
         ref={searchRef}
@@ -820,6 +964,8 @@ function Main() {
             <VlanView
               vlans={snap.vlans}
               rows={snap.rows}
+              neighbors={snap.neighbors}
+              portMappings={snap.portMappings}
               running={snap.running}
               discoveryTimeout={ui.discoveryTimeout}
               onDiscoveryTimeout={(n) => patchUi({ discoveryTimeout: n })}
@@ -856,6 +1002,8 @@ function Main() {
             onWake={() => selectedRow && wakeRow(selectedRow)}
             onGrabWeb={() => selectedRow && void grabWeb(selectedRow)}
             onOpenWebUrl={(url) => void openUrl(url)}
+            serviceQuery={selectedKey !== null ? serviceQueries[selectedKey] : undefined}
+            onDiscoverServices={() => selectedRow && void discoverServices(selectedRow)}
             traceToken={traceToken}
             iperfToken={iperfToken}
             focus={drawerFocus}
@@ -887,6 +1035,18 @@ function Main() {
           config={settings.snmp}
           onSave={(snmpEnabled, snmpAll, snmp) => patchSettings({ snmpEnabled, snmpAll, snmp })}
           onClose={() => setSnmpOpen(false)}
+        />
+      )}
+      {reportFor && (
+        <ReportDialog
+          format={reportFor}
+          total={snap.rows.length}
+          shown={filtered.length}
+          initial={reportPrefs}
+          busy={reportBusy}
+          error={reportError}
+          onGenerate={(v) => void generateReport(reportFor, v)}
+          onClose={() => setReportFor(null)}
         />
       )}
       {wakeOpen && <WakeDialog interfaces={interfaces} onWake={wake} onClose={() => setWakeOpen(false)} />}

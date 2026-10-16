@@ -2,7 +2,23 @@
 
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from "react";
 import { forwardRef } from "react";
-import { Monitor, Network, Router, Shield, Wifi, type LucideIcon } from "lucide-react";
+import {
+  Cctv,
+  CircleDot,
+  Clapperboard,
+  HardDrive,
+  Monitor,
+  Network,
+  Phone,
+  PhoneForwarded,
+  Printer,
+  Router,
+  ScanText,
+  Shield,
+  Tv,
+  Wifi,
+  type LucideIcon,
+} from "lucide-react";
 import type { DeviceRole } from "../types.ts";
 
 export function cx(...parts: Array<string | false | null | undefined>): string {
@@ -145,3 +161,31 @@ export function SectionTitle({ children, right }: { children: ReactNode; right?:
     </div>
   );
 }
+
+/** Icons for `Device.deviceKind`; unknown kinds get a neutral dot. */
+export const KIND_ICON: Record<string, LucideIcon> = {
+  voip_phone: Phone,
+  pbx: PhoneForwarded,
+  camera: Cctv,
+  computer: Monitor,
+  media_server: Clapperboard,
+  igd_router: Router,
+  printer: Printer,
+  scanner: ScanText,
+  tv: Tv,
+  nas: HardDrive,
+};
+
+export function KindIcon({ kind, size = 13, inherit, className }: { kind: string; size?: number; inherit?: boolean; className?: string }) {
+  const Icon = KIND_ICON[kind] ?? CircleDot;
+  return <Icon size={size} strokeWidth={1.75} aria-hidden className={cx("shrink-0", !inherit && "text-accent", className)} />;
+}
+
+/** Text colour per tone (latency / loss / PoE load); every colour also has a text cue. */
+export const TONE_TEXT_CLASS: Record<"ok" | "warn" | "bad" | "down" | "none", string> = {
+  ok: "text-ok",
+  warn: "text-warn",
+  bad: "text-danger",
+  down: "text-danger font-semibold",
+  none: "text-faint",
+};
