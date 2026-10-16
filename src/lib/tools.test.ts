@@ -119,6 +119,73 @@ test("latency ring: same monitor replaces, new monitor carries the old window, s
   assert.deepEqual(moved?.history.slice(-3), [HISTORY_LEN - 1, 5, 6]);
 });
 
+/** A live update in the delta shape: stats over `window`, `newSamples`, history only when asked. */
+function delta(ip: string, window: (number | null)[], fresh: (number | null)[], ts: number, withHistory = false): LatencySample {
+  const s = sample(ip, window, ts);
+  const out: LatencySample = { ...s, newSamples: fresh };
+  if (!withHistory) delete out.history;
+  return out;
+}
+
+test("latency ring: newSamples append, history replaces, duplicates and stale updates are dropped", () => {
+  let e = applySample(undefined, delta("10.0.0.1", [1, 2], [1, 2], 1000, true), 1);
+  assert.deepEqual(e?.history, [1, 2]);
+  e = applySample(e!, delta("10.0.0.1", [1, 2, 3], [3], 2000), 1);
+  assert.deepEqual(e?.history, [1, 2, 3]);
+  e = applySample(e!, delta("10.0.0.1", [1, 2, 3, null, 5], [null, 5], 3000), 1);
+  assert.deepEqual(e?.history, [1, 2, 3, null, 5]);
+  assert.equal(e?.stats.sent, 5, "stats come from the payload");
+  assert.equal(e?.stats.lossPct, 20);
+  // The same update again (same ts, no history) and an older one are ignored.
+  assert.equal(applySample(e!, delta("10.0.0.1", [1, 2, 3, null, 5], [null, 5], 3000), 1), null);
+  assert.equal(applySample(e!, delta("10.0.0.1", [1, 2, 3], [3], 2000), 1), null);
+  // A history resend replaces the ring wholesale.
+  e = applySample(e!, delta("10.0.0.1", [2, 3, null, 5, 6], [6], 4000, true), 1);
+  assert.deepEqual(e?.history, [2, 3, null, 5, 6]);
+  // The ring stays within HISTORY_LEN and the backend's window size.
+  const win = Array.from({ length: HISTORY_LEN }, (_, i) => i);
+  e = applySample(e!, delta("10.0.0.1", win, [7, 8], 5000), 1);
+  assert.equal(e?.history.length, 7);
+  e = applySample(e!, delta("10.0.0.1", win, win, 6000), 1);
+  assert.equal(e?.history.length, HISTORY_LEN);
+  const capped = applySample(e!, delta("10.0.0.1", [1, 2, 3], [9], 7000), 1);
+  assert.deepEqual(capped?.history, [HISTORY_LEN - 2, HISTORY_LEN - 1, 9], "trimmed to `sent`");
+});
+
+test("latency ring: a dropped update leaves a gap until the next history resend", () => {
+  let e = applySample(undefined, delta("10.0.0.2", [1], [1], 1000, true), 1);
+  // The update carrying 2 never arrived.
+  e = applySample(e!, delta("10.0.0.2", [1, 2, 3], [3], 3000), 1);
+  assert.deepEqual(e?.history, [1, 3]);
+  assert.equal(e?.stats.sent, 3, "stats still describe the backend window");
+  assert.equal(e?.stats.avgMs, 2);
+  e = applySample(e!, delta("10.0.0.2", [1, 2, 3, 4], [4], 4000, true), 1);
+  assert.deepEqual(e?.history, [1, 2, 3, 4], "history resend repairs the ring");
+  // A host first seen without history (its first update was missed) starts from newSamples.
+  const late = applySample(undefined, delta("10.0.0.3", [1, 2, 3], [3], 3000), 1);
+  assert.deepEqual(late?.history, [3]);
+  // A new monitor's delta updates continue after the carried window.
+  const moved = applySample(e!, delta("10.0.0.2", [9], [9], 5000), 2);
+  assert.deepEqual(moved?.history, [1, 2, 3, 4, 9]);
+  const next = applySample(moved!, delta("10.0.0.2", [9, 10], [10], 6000), 2);
+  assert.deepEqual(next?.history, [1, 2, 3, 4, 9, 10]);
+});
+
+test("latency ring: older backends (history every update, or only rttMs) keep working", () => {
+  let e = applySample(undefined, sample("10.0.0.4", [1, 2], 1000), 1);
+  e = applySample(e!, sample("10.0.0.4", [1, 2, 3], 2000), 1);
+  assert.deepEqual(e?.history, [1, 2, 3]);
+  const bare = (rtt: number | null, ts: number, sent: number): LatencySample => {
+    const s = sample("10.0.0.5", [rtt], ts);
+    delete s.history;
+    return { ...s, sent };
+  };
+  let b = applySample(undefined, bare(4, 1000, 1), 1);
+  b = applySample(b!, bare(null, 2000, 2), 1);
+  b = applySample(b!, bare(6, 3000, 3), 1);
+  assert.deepEqual(b?.history, [4, null, 6]);
+});
+
 test("latency store: throttled notifications, monitor filter and bounded size", () => {
   const timers: Array<() => void> = [];
   const store = new LatencyStore({ schedule: (fn) => timers.push(fn), maxEntries: 3 });

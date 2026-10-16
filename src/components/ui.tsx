@@ -15,6 +15,7 @@ import {
   Router,
   ScanText,
   Shield,
+  Speaker,
   Tv,
   Wifi,
   type LucideIcon,
@@ -174,11 +175,27 @@ export const KIND_ICON: Record<string, LucideIcon> = {
   scanner: ScanText,
   tv: Tv,
   nas: HardDrive,
+  media_player: Speaker,
 };
 
 export function KindIcon({ kind, size = 13, inherit, className }: { kind: string; size?: number; inherit?: boolean; className?: string }) {
   const Icon = KIND_ICON[kind] ?? CircleDot;
   return <Icon size={size} strokeWidth={1.75} aria-hidden className={cx("shrink-0", !inherit && "text-accent", className)} />;
+}
+
+/** A small pill next to a role ("DHCP server", "IPv6 RA"). */
+export function MiniBadge({ label, title, inherit }: { label: string; title?: string; inherit?: boolean }) {
+  return (
+    <span
+      className={cx(
+        "shrink-0 rounded-[4px] border px-1 text-[10px] leading-[14px] whitespace-nowrap",
+        inherit ? "border-current opacity-90" : "border-line bg-field text-muted",
+      )}
+      title={title}
+    >
+      {label}
+    </span>
+  );
 }
 
 /** Text colour per tone (latency / loss / PoE load); every colour also has a text cue. */

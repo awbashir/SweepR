@@ -311,6 +311,21 @@ export function addMockServices(dev: Device, label: string, o: MockServiceOption
       });
       dev.deviceKind = "media_server";
       sources.add("ssdp");
+    } else if (o.discoverServices && r() < 0.4) {
+      dev.ssdp = ssdp({
+        location: `http://${dev.ip}:49494/description.xml`,
+        server: "Linux/6.6 UPnP/1.0 Volumio/3.7",
+        friendlyName: `Volumio ${label}`,
+        manufacturer: "Volumio",
+        modelName: "Volumio",
+        modelNumber: "3.7",
+        deviceType: "urn:schemas-upnp-org:device:MediaRenderer:1",
+        udn: uuid(r),
+        presentationUrl: `http://${dev.ip}/`,
+        services: ["urn:schemas-upnp-org:service:AVTransport:1", "urn:schemas-upnp-org:service:RenderingControl:1"],
+      });
+      dev.deviceKind = "media_player";
+      sources.add("ssdp");
     }
     if (o.dhcpFingerprint) dev.dhcpFingerprint = dhcp("Linux (Debian)", "medium", PARAMS.linux, null, label);
   } else if (vendor.startsWith("Apple")) {

@@ -15,13 +15,15 @@ import type {
   ScanProgress,
   ScanSummary,
   ServiceDiscovery,
+  SnmpAgentStatus,
   SnmpDeviceInfo,
   SwitchPortMapping,
   VlanInfo,
   WebIdentity,
 } from "../types.ts";
 import { deviceKey, ipSortKey } from "./ip.ts";
-import { deviceKindLabel, deviceKindOf, dhcpOsLabel, modelFirmware, withServiceDiscovery } from "./services.ts";
+import { deviceKindLabel, deviceKindOf, dhcpOsLabel, modelFirmware, netServiceBadges, withServiceDiscovery } from "./services.ts";
+import { recordAgent, snmpViewFor, type SnmpView } from "./snmpAgents.ts";
 
 export interface DeviceRow {
   key: string;
@@ -57,6 +59,13 @@ export interface LogEntry {
 
 export type JobKind = "scan" | "vlan_discovery";
 
+/** What the `finished` event of the latest full scan said about where it ran (report metadata). */
+export interface ScanSummaryMeta {
+  interface?: string;
+  gateway?: string;
+  scannerHost?: string;
+}
+
 export interface StoreSnapshot {
   rows: DeviceRow[];
   roleCounts: Record<DeviceRole, number>;
@@ -71,7 +80,14 @@ export interface StoreSnapshot {
   jobKind: JobKind | null;
   scanId: number | null;
   overrides: Overrides;
+  /** `query_snmp` results by device key. */
   snmp: Record<string, SnmpDeviceInfo>;
+  /** SNMP agents the latest full scan polled (`snmp_agent` events; community class only). */
+  snmpAgents: SnmpAgentStatus[];
+  /** `snmp` merged with the answered agents (identity / PoE budget without a Query SNMP). */
+  snmpView: Record<string, SnmpView>;
+  /** Interface / gateway / scanner host from the latest full scan's `finished` event. */
+  scanMeta: ScanSummaryMeta | null;
   /** Wall-clock start / end of the latest job (report metadata). */
   jobStartedMs: number | null;
   jobFinishedMs: number | null;
@@ -152,6 +168,7 @@ export function buildRow(key: string, device: Device, override: DeviceOverride |
     device.voiceVlan != null ? `voice ${device.voiceVlan}` : null,
     device.poe ? "poe" : null,
     dhcpOs,
+    ...netServiceBadges(device).map((b) => (b.id === "ipv6_router" ? `${b.label} ipv6 router advertisement` : b.label)),
     fp?.vendorClass,
     fp?.hostname,
   ]
@@ -204,7 +221,7 @@ export function withWebIdentity(dev: Device, wi: WebIdentity): Device {
 }
 
 type Scheduler = (fn: () => void, ms: number) => unknown;
-type DirtyPart = "rows" | "vlans" | "neighbors" | "mappings" | "other";
+type DirtyPart = "rows" | "vlans" | "neighbors" | "mappings" | "snmp" | "other";
 
 export class ScanStore {
   private devices = new Map<string, Device>();
@@ -216,6 +233,8 @@ export class ScanStore {
   private logSeq = 0;
   private overrides: Overrides = {};
   private snmp: Record<string, SnmpDeviceInfo> = {};
+  private agents = new Map<string, SnmpAgentStatus>();
+  private scanMeta: ScanSummaryMeta | null = null;
   private progress: ScanProgress | null = null;
   private summary: ScanSummary | null = null;
   private running = false;
@@ -236,7 +255,7 @@ export class ScanStore {
 
   private listeners = new Set<() => void>();
   private snapshot: StoreSnapshot;
-  private dirty: Record<DirtyPart, boolean> = { rows: false, vlans: false, neighbors: false, mappings: false, other: false };
+  private dirty: Record<DirtyPart, boolean> = { rows: false, vlans: false, neighbors: false, mappings: false, snmp: false, other: false };
   private flushPending = false;
   private readonly schedule: Scheduler;
 
@@ -308,11 +327,40 @@ export class ScanStore {
       scanId: this.scanId,
       overrides: this.overrides,
       snmp: this.snmp,
+      snmpAgents: force || d.snmp || !prev ? [...this.agents.values()] : prev.snmpAgents,
+      snmpView: force || d.snmp || d.rows || !prev ? this.buildSnmpView() : prev.snmpView,
+      scanMeta: this.scanMeta,
       jobStartedMs: this.jobStartedMs,
       jobFinishedMs: this.jobFinishedMs,
     };
-    this.dirty = { rows: false, vlans: false, neighbors: false, mappings: false, other: false };
+    this.dirty = { rows: false, vlans: false, neighbors: false, mappings: false, snmp: false, other: false };
     return snap;
+  }
+
+  private buildSnmpView(): Record<string, SnmpView> {
+    if (this.agents.size === 0) return this.snmp;
+    // Agents are usually untagged infrastructure (key = IP); index VLAN keys only when needed.
+    let byIp: Map<string, string[]> | null = null;
+    const keysOf = (ip: string): string[] => {
+      if (this.devices.has(ip)) return [ip];
+      if (!byIp) {
+        byIp = new Map();
+        for (const [key, dev] of this.devices) {
+          if (key === dev.ip) continue;
+          const l = byIp.get(dev.ip);
+          if (l) l.push(key);
+          else byIp.set(dev.ip, [key]);
+        }
+      }
+      return byIp.get(ip) ?? [];
+    };
+    return snmpViewFor(
+      this.snmp,
+      this.agents,
+      keysOf,
+      (key) => this.devices.get(key)?.role,
+      (key) => this.devices.get(key)?.ip ?? key,
+    );
   }
 
   // --- Job lifecycle ------------------------------------------------------------------------
@@ -334,6 +382,12 @@ export class ScanStore {
     this.summary = null;
     this.jobStartedMs = Date.now();
     this.jobFinishedMs = null;
+    if (kind === "scan") {
+      // Per scan job: a VLAN discovery keeps the latest scan's agents and metadata.
+      this.agents.clear();
+      this.scanMeta = null;
+      this.markDirty("snmp");
+    }
     this.markDirty("other");
     return ++this.startToken;
   }
@@ -410,6 +464,9 @@ export class ScanStore {
       case "port_mapping":
         if (this.addMapping(event.data)) this.markDirty("mappings");
         break;
+      case "snmp_agent":
+        if (recordAgent(this.agents, event.data)) this.markDirty("snmp");
+        break;
       case "progress":
         this.progress = event.data;
         this.markDirty("other");
@@ -419,6 +476,7 @@ export class ScanStore {
         break;
       case "finished":
         this.summary = event.data;
+        if (this.jobKind === "scan") this.scanMeta = summaryMeta(event.data, this.scanMeta);
         this.jobFinishedMs = Date.now();
         this.running = false;
         this.starting = false;
@@ -484,6 +542,7 @@ export class ScanStore {
     for (const m of info.portMappings ?? []) this.addMapping(m);
     this.markDirty("vlans");
     this.markDirty("mappings");
+    this.markDirty("snmp");
   }
 
   /** Merge a port-scan result into the device (local only; it is not a backend snapshot). */
@@ -550,11 +609,24 @@ export class ScanStore {
     this.mappings.clear();
     this.mappingCapWarned = false;
     this.snmp = {};
+    this.agents.clear();
+    this.scanMeta = null;
     this.summary = null;
     if (!this.running) this.progress = null;
     this.markDirty("rows");
     this.markDirty("vlans");
     this.markDirty("neighbors");
     this.markDirty("mappings");
+    this.markDirty("snmp");
   }
+}
+
+/** Interface / gateway / scanner host of a `finished` summary; absent fields keep `prev`'s value. */
+export function summaryMeta(s: ScanSummary, prev: ScanSummaryMeta | null = null): ScanSummaryMeta | null {
+  const out: ScanSummaryMeta = { ...prev };
+  for (const k of ["interface", "gateway", "scannerHost"] as const) {
+    const v = s[k];
+    if (typeof v === "string" && v.trim() !== "") out[k] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }

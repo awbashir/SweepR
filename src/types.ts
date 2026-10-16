@@ -128,6 +128,7 @@ export type DeviceKind =
   | "scanner"
   | "tv"
   | "nas"
+  | "media_player"
   | (string & {});
 
 export interface SsdpInfo {
@@ -269,6 +270,10 @@ export interface Device {
   /** PoE this endpoint draws (its switch port / own advert). */
   poe?: PoeInfo | null;
   dhcpFingerprint?: DhcpFingerprint | null;
+  /** Seen answering as a DHCP server (OFFER / ACK / NAK). */
+  dhcpServer?: boolean | null;
+  /** Sent an IPv6 router advertisement during the scan. */
+  ipv6Router?: boolean | null;
 }
 
 export type InterfaceKind =
@@ -369,6 +374,30 @@ export interface ScanSummary {
   neighbors: number;
   elapsedMs: number;
   cancelled: boolean;
+  /** Interface the scan ran on (full scans only). */
+  interface?: string;
+  /** The scanning host's IPv4 default gateway, when known (full scans only). */
+  gateway?: string;
+  /** This machine's host name (full scans only). */
+  scannerHost?: string;
+}
+
+/** Community class of an SNMP poll: never the community itself. */
+export type SnmpCommunityClass = "public" | "private" | "custom" | "none" | "v3";
+
+/** `snmp_agent` event: one SNMP agent polled during a scan (`SnmpAgentStatus` in models.rs). */
+export interface SnmpAgentStatus {
+  ip: string | null;
+  version: SnmpVersion | (string & {});
+  communityClass: SnmpCommunityClass | (string & {});
+  answered: boolean;
+  partial: boolean;
+  sysName: string | null;
+  sysDescr: string | null;
+  role: DeviceRole | null;
+  poeBudget: PoeBudget | null;
+  /** At most 8. */
+  warnings: string[];
 }
 
 /** `#[serde(tag = "type", content = "data", rename_all = "snake_case")]` */
@@ -377,6 +406,7 @@ export type ScanEvent =
   | { type: "vlan"; data: VlanInfo }
   | { type: "neighbor"; data: CdpLldpNeighbor }
   | { type: "port_mapping"; data: SwitchPortMapping }
+  | { type: "snmp_agent"; data: SnmpAgentStatus }
   | { type: "progress"; data: ScanProgress }
   | { type: "log"; data: LogMessage }
   | { type: "finished"; data: ScanSummary };
@@ -434,6 +464,8 @@ export interface WakeResult {
   packetsSent: number;
   interface: string | null;
   sourceIp: string | null;
+  /** Destinations that could not be sent to, as "addr:port: error" (absent from older backends). */
+  failures?: string[];
 }
 
 /** Optional `wake_device` arguments (`mac` is passed separately). */
@@ -477,8 +509,13 @@ export interface LatencySample {
   jitterMs: number | null;
   sent: number;
   received: number;
-  /** Up to 120 samples, oldest first; `null` for lost probes. */
-  history: (number | null)[];
+  /**
+   * The whole window (up to 120 samples), oldest first; `null` for lost probes. Live updates
+   * carry it on a host's first update and then at most every 30 s (older backends: always).
+   */
+  history?: (number | null)[];
+  /** Live updates: every sample since this host's previous update, oldest first (usually one). */
+  newSamples?: (number | null)[];
 }
 
 /** Payload of the `latency-update` event. */
@@ -670,7 +707,15 @@ export interface ReportMeta {
   dhcpServers?: string[];
   ipv6Routers?: string[];
   scannerHost?: string;
+  /** Every SNMP agent the latest scan polled (community class only, never the community). */
+  snmpAgents?: { ip: string; version?: string; communityClass?: string; answered: boolean }[];
 }
+
+/**
+ * One `snmpInfos` record: a `query_snmp` result, or the identity / PoE budget an answered
+ * `snmp_agent` event carried (every field but `ip` optional, the backend defaults the rest).
+ */
+export type ReportSnmpInfo = Partial<SnmpDeviceInfo> & { ip: string };
 
 /** `generate_report()` arguments. */
 export interface GenerateReportArgs {
@@ -678,7 +723,7 @@ export interface GenerateReportArgs {
   vlans?: VlanInfo[];
   neighbors?: CdpLldpNeighbor[];
   portMappings?: SwitchPortMapping[];
-  snmpInfos?: (SnmpDeviceInfo & { ip: string })[];
+  snmpInfos?: ReportSnmpInfo[];
   meta?: ReportMeta;
   format: ReportFormat;
   title?: string;

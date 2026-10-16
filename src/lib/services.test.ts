@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Device, OnvifInfo, PoeInfo, ScanConfig, SipInfo, SnmpConfig, SnmpDeviceInfo, SsdpInfo } from "../types.ts";
+import type { Device, OnvifInfo, PoeInfo, ScanConfig, SipInfo, SnmpAgentStatus, SnmpConfig, SnmpDeviceInfo, SsdpInfo } from "../types.ts";
 import {
   budgetUsage,
   deviceKindLabel,
@@ -12,6 +12,7 @@ import {
   dhcpOsLabel,
   modelFirmware,
   modelSerialText,
+  netServiceBadges,
   poeTone,
   portPoeTotal,
   rtspCandidates,
@@ -20,7 +21,8 @@ import {
   withServiceDiscovery,
 } from "./services.ts";
 import { detectAutoColumns, effectiveVisibility } from "./columns.ts";
-import { buildRow } from "./store.ts";
+import { ScanStore, buildRow, summaryMeta } from "./store.ts";
+import { MAX_SNMP_AGENTS, recordAgent, reportSnmpAgents, reportSnmpInfos, snmpViewFor } from "./snmpAgents.ts";
 import {
   buildReportArgs,
   buildReportMeta,
@@ -381,4 +383,169 @@ test("report input: devices as exported, built in chunks; SNMP results keyed by 
   assert.equal(args.title, "Audit");
   assert.equal("org" in args, false, "blank organization is omitted");
   assert.equal(args.format, "html");
+});
+
+// --- snmp_agent events, scan summary metadata, DHCP / RA badges --------------------------------------
+
+function agent(ip: string | null, patch: Partial<SnmpAgentStatus> = {}): SnmpAgentStatus {
+  return {
+    ip,
+    version: "v2c",
+    communityClass: "custom",
+    answered: true,
+    partial: false,
+    sysName: ip ? `sw-${ip}` : null,
+    sysDescr: "Cisco IOS-XE",
+    role: "switch",
+    poeBudget: null,
+    warnings: [],
+    ...patch,
+  };
+}
+
+const BUDGET = { nominalWatts: 370, consumedWatts: 300, usageThresholdPct: 80, portsDelivering: 30 };
+
+test("snmp agents: bounded, answered stays answered, no IP dropped", () => {
+  const m = new Map<string, SnmpAgentStatus>();
+  assert.equal(recordAgent(m, agent(null)), false);
+  assert.equal(recordAgent(m, agent("10.0.0.2")), true);
+  assert.equal(recordAgent(m, agent("10.0.0.2", { answered: false, sysName: null })), false, "a later timeout keeps the answer");
+  assert.equal(m.get("10.0.0.2")?.sysName, "sw-10.0.0.2");
+  assert.equal(recordAgent(m, agent("10.0.0.3", { answered: false })), true);
+  assert.equal(recordAgent(m, agent("10.0.0.3")), true, "an answer replaces a timeout");
+  assert.equal(recordAgent(m, agent("10.0.0.4"), 2), false, "cap");
+  assert.equal(m.size, 2);
+  assert.ok(MAX_SNMP_AGENTS >= 1000);
+});
+
+test("snmp agents feed the report: meta.snmpAgents and snmpInfos, query results win", () => {
+  const agents = [
+    agent("10.0.0.2", { poeBudget: BUDGET, sysName: "from-agent" }),
+    agent("10.0.0.3", { role: null, partial: true, warnings: ["walk truncated"] }),
+    agent("10.0.0.9", { answered: false, communityClass: "public", sysName: null }),
+    agent(null),
+  ];
+  assert.deepEqual(reportSnmpAgents(agents), [
+    { ip: "10.0.0.2", version: "v2c", communityClass: "custom", answered: true },
+    { ip: "10.0.0.3", version: "v2c", communityClass: "custom", answered: true },
+    { ip: "10.0.0.9", version: "v2c", communityClass: "public", answered: false },
+  ]);
+  const query: SnmpDeviceInfo & { ip: string } = {
+    ip: "10.0.0.2",
+    sysName: "from-query",
+    sysDescr: null,
+    sysUptimeTicks: 5,
+    sysObjectId: null,
+    role: "switch",
+    vlans: [],
+    portMappings: [],
+    portMacCounts: [],
+    poeBudget: null,
+    partial: false,
+    warnings: [],
+  };
+  const infos = reportSnmpInfos([query], agents);
+  assert.equal(infos.length, 2, "timeouts add no snmpInfos entry");
+  assert.equal(infos[0]?.sysName, "from-query", "query wins");
+  assert.equal(infos[0]?.sysDescr, "Cisco IOS-XE", "agent fills gaps");
+  assert.deepEqual(infos[0]?.poeBudget, BUDGET, "agent PoE budget fills a query without one");
+  assert.equal(infos[0]?.sysUptimeTicks, 5);
+  assert.deepEqual(infos[1], { ip: "10.0.0.3", sysName: "sw-10.0.0.3", sysDescr: "Cisco IOS-XE", poeBudget: null, partial: true, warnings: ["walk truncated"] });
+  assert.equal("role" in infos[1]!, false, "a null role is omitted (the backend defaults it)");
+});
+
+test("snmp view: agents fill devices nobody queried (by IP, also VLAN keys), queries merge the budget", () => {
+  const agents = new Map([
+    ["10.0.0.2", agent("10.0.0.2", { poeBudget: BUDGET })],
+    ["10.0.20.1", agent("10.0.20.1", { role: null })],
+    ["10.0.0.9", agent("10.0.0.9", { answered: false })],
+  ]);
+  const query: SnmpDeviceInfo = { sysName: "q", sysDescr: null, sysUptimeTicks: 1, sysObjectId: null, role: "switch", vlans: [], portMappings: [], portMacCounts: [], poeBudget: null, partial: false, warnings: [] };
+  const keys: Record<string, string[]> = { "10.0.0.2": ["10.0.0.2"], "10.0.20.1": ["10.0.20.1@20"], "10.0.0.9": ["10.0.0.9"], "10.0.0.5": ["10.0.0.5"] };
+  const view = snmpViewFor(
+    { "10.0.0.5": query, "10.0.0.2": { ...query, sysName: "queried" } },
+    agents,
+    (ip) => keys[ip] ?? [],
+    (key) => (key === "10.0.20.1@20" ? "router" : undefined),
+    (key) => key.split("@")[0]!,
+  );
+  assert.equal(view["10.0.0.2"]?.sysName, "queried");
+  assert.deepEqual(view["10.0.0.2"]?.poeBudget, BUDGET);
+  assert.equal(view["10.0.0.2"]?.fromScan, undefined);
+  assert.equal(view["10.0.20.1@20"]?.fromScan, true);
+  assert.equal(view["10.0.20.1@20"]?.role, "router", "null agent role falls back to the device's");
+  assert.equal(view["10.0.0.9"], undefined, "timeouts are not shown as SNMP data");
+  assert.equal(view["10.0.0.5"], query);
+});
+
+test("store: snmp_agent events and the full scan's summary metadata, per scan job", () => {
+  const timers: Array<() => void> = [];
+  const store = new ScanStore((fn) => timers.push(fn));
+  const t = store.beginStart("scan");
+  store.startResolved(1, t);
+  store.handlePayload({ scanId: 1, event: { type: "device", data: device("10.0.0.2", { role: "switch" }) } });
+  store.handlePayload({ scanId: 1, event: { type: "snmp_agent", data: agent("10.0.0.2", { poeBudget: BUDGET }) } });
+  store.handlePayload({ scanId: 1, event: { type: "snmp_agent", data: agent("10.0.0.7", { answered: false }) } });
+  store.handlePayload({ scanId: 2, event: { type: "snmp_agent", data: agent("10.0.0.8") } });
+  store.handlePayload({
+    scanId: 1,
+    event: { type: "finished", data: { devices: 1, vlans: 0, neighbors: 0, elapsedMs: 5, cancelled: false, interface: "en0", gateway: "10.0.0.1", scannerHost: "mac.local" } },
+  });
+  let snap = store.flushNow();
+  assert.deepEqual(snap.snmpAgents.map((a) => a.ip), ["10.0.0.2", "10.0.0.7"]);
+  assert.deepEqual(snap.snmpView["10.0.0.2"]?.poeBudget, BUDGET, "switch PoE without Query SNMP");
+  assert.deepEqual(snap.snmpAgents.length, 2);
+  assert.deepEqual(snap.scanMeta, { interface: "en0", gateway: "10.0.0.1", scannerHost: "mac.local" });
+  assert.deepEqual(snap.snmp, {}, "query results stay separate");
+  // VLAN discovery keeps the scan's agents and metadata (its summary has neither).
+  const t2 = store.beginStart("vlan_discovery");
+  store.startResolved(2, t2);
+  store.handlePayload({ scanId: 2, event: { type: "finished", data: { devices: 0, vlans: 3, neighbors: 1, elapsedMs: 5, cancelled: false } } });
+  snap = store.flushNow();
+  assert.equal(snap.snmpAgents.length, 2);
+  assert.equal(snap.scanMeta?.gateway, "10.0.0.1");
+  // A new full scan starts over.
+  const t3 = store.beginStart("scan");
+  store.startResolved(3, t3);
+  snap = store.flushNow();
+  assert.equal(snap.snmpAgents.length, 0);
+  assert.equal(snap.scanMeta, null);
+  // Absent summary fields never clear known values.
+  assert.deepEqual(summaryMeta({ devices: 0, vlans: 0, neighbors: 0, elapsedMs: 0, cancelled: true }, { gateway: "10.0.0.1" }), { gateway: "10.0.0.1" });
+  assert.equal(summaryMeta({ devices: 0, vlans: 0, neighbors: 0, elapsedMs: 0, cancelled: false, interface: " " }), null);
+});
+
+test("report metadata: interface / gateway / scanner host from the scan summary, agents without secrets", () => {
+  const v2: SnmpConfig = { version: "v2c", community: SECRET_COMMUNITY, v3: null, port: 161, timeoutMs: 2000, retries: 1 };
+  const meta = buildReportMeta({
+    ...ctx(config(v2)),
+    summary: { interface: "en7", gateway: "10.0.0.1", scannerHost: "mac.local" },
+    snmpAgents: [agent("10.0.0.2"), agent("10.0.0.3", { answered: false, communityClass: "public" })],
+  });
+  assert.equal(meta.interface, "en7", "the backend's interface wins");
+  assert.equal(meta.gateway, "10.0.0.1");
+  assert.equal(meta.scannerHost, "mac.local");
+  assert.deepEqual(meta.snmpAgents?.map((a) => [a.ip, a.communityClass, a.answered]), [
+    ["10.0.0.2", "custom", true],
+    ["10.0.0.3", "public", false],
+  ]);
+  assert.equal(leaksSecret(meta, snmpSecrets(v2)), false);
+  // No summary: the config's / resolved interface, and no gateway key at all.
+  const plain = buildReportMeta({ ...ctx(config(v2)), summary: { gateway: undefined } as never });
+  assert.equal(plain.interface, "en0");
+  assert.equal("gateway" in plain, false);
+  assert.equal("scannerHost" in plain, false);
+  assert.equal("snmpAgents" in plain, false);
+});
+
+test("DHCP server / IPv6 RA badges and search", () => {
+  assert.deepEqual(netServiceBadges({ dhcpServer: true, ipv6Router: null }).map((b) => b.label), ["DHCP server"]);
+  assert.deepEqual(netServiceBadges({ dhcpServer: false, ipv6Router: true }).map((b) => b.label), ["IPv6 RA"]);
+  assert.deepEqual(netServiceBadges({}), []);
+  const row = buildRow("10.0.0.77", device("10.0.0.77", { dhcpServer: true, ipv6Router: true }), undefined);
+  assert.ok(row.search.includes("dhcp server"));
+  assert.ok(row.search.includes("ipv6 ra"));
+  assert.ok(row.search.includes("router advertisement"));
+  assert.equal(buildRow("10.0.0.5", device("10.0.0.5"), undefined).search.includes("dhcp server"), false);
+  assert.equal(deviceKindLabel("media_player"), "Media Player");
 });

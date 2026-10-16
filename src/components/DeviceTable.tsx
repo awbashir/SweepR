@@ -35,8 +35,8 @@ import { completeOrder, effectiveVisibility, type AutoColumns } from "../lib/col
 import { latencyStore, useLatency } from "../tools.ts";
 import { Sparkline } from "./Charts.tsx";
 import { ContextMenu, type MenuItem } from "./Menu.tsx";
-import { KindIcon, RoleIcon, TONE_TEXT_CLASS, cx } from "./ui.tsx";
-import { deviceKindOf, formatWatts, poeSummary, poeTone } from "../lib/services.ts";
+import { KindIcon, MiniBadge, RoleIcon, TONE_TEXT_CLASS, cx } from "./ui.tsx";
+import { deviceKindOf, formatWatts, netServiceBadges, poeSummary, poeTone } from "../lib/services.ts";
 
 export const ROW_H = 22;
 const HEADER_H = 24;
@@ -725,6 +725,9 @@ function CellContent({ id, row, selected, width }: { id: ColId; row: DeviceRow; 
         <span className="flex min-w-0 items-center gap-1.5">
           <RoleIcon role={d.role} inherit={selected} />
           <span className="truncate">{ROLE_LABEL[d.role]}</span>
+          {netServiceBadges(d).map((b) => (
+            <MiniBadge key={b.id} label={b.label} title={b.title} inherit={selected} />
+          ))}
           {(d.warnings?.length ?? 0) > 0 && (
             <span
               className={cx("ml-auto flex shrink-0 items-center gap-0.5 text-[10px]", !selected && "text-warn")}

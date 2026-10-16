@@ -249,7 +249,14 @@ interface HostSim {
   spiky: boolean;
   r: () => number;
   window: Array<number | null>;
+  /** Samples not yet sent (`newSamples`). */
+  unsent: Array<number | null>;
+  /** When `history` was last sent (the backend resends it at most every 30 s). */
+  historyAt: number | null;
 }
+
+/** The backend resends a host's whole window at most this often (`latency::HISTORY_RESEND`). */
+const HISTORY_RESEND_MS = 30_000;
 
 function hostSim(ip: string, seed: number): HostSim {
   const r = rng(hash(`lat${ip}`) ^ seed);
@@ -264,6 +271,8 @@ function hostSim(ip: string, seed: number): HostSim {
     spiky: r() < 0.15,
     r: rng(hash(`walk${ip}`) ^ Date.now()),
     window: [],
+    unsent: [],
+    historyAt: null,
   };
 }
 
@@ -424,14 +433,17 @@ export function createMockTools(roleOf: (ip: string) => DeviceRole | null): Mock
         }
         const port = opts?.port ?? 9;
         const targets = opts?.broadcast ? [`${opts.broadcast}:${port}`] : [`10.177.134.255:${port}`, `255.255.255.255:${port}`];
+        // The limited broadcast is refused on some systems: exercise the failure list.
+        const failures = opts?.broadcast ? [] : [`255.255.255.255:${port}: Permission denied (os error 13)`];
         window.setTimeout(
           () =>
             resolve({
               mac: parsed.value,
               targets,
-              packetsSent: targets.length * (opts?.repeat ?? 3),
+              packetsSent: (targets.length - failures.length) * (opts?.repeat ?? 3),
               interface: opts?.interface ?? "en0",
               sourceIp: "10.177.134.25",
+              failures,
             }),
           150,
         );
@@ -448,14 +460,25 @@ export function createMockTools(roleOf: (ip: string) => DeviceRole | null): Mock
       if (monitoredHosts() + unique.length > 2000) throw `at most 2000 hosts can be monitored at once (${monitoredHosts()} already)`;
       const id = ++monitorSeq;
       const sims = new Map(unique.map((ip) => [ip, hostSim(ip, id)]));
+      let tickNo = 0;
       const tick = (): void => {
         const ts = Date.now();
+        tickNo++;
         const samples: LatencySample[] = [];
         for (const [ip, h] of sims) {
           const rtt = nextRtt(h);
           h.window.push(rtt);
           if (h.window.length > 120) h.window.shift();
-          samples.push({ ip, rttMs: rtt, ts, method: h.dead ? "tcp" : "icmp", ...stats(h.window), history: [...h.window] });
+          h.unsent.push(rtt);
+          // Spiky hosts report every other probe, so `newSamples` sometimes holds two.
+          if (h.spiky && tickNo % 2 === 0 && h.historyAt !== null) continue;
+          const s: LatencySample = { ip, rttMs: rtt, ts, method: h.dead ? "tcp" : "icmp", ...stats(h.window), newSamples: h.unsent };
+          h.unsent = [];
+          if (h.historyAt === null || ts - h.historyAt >= HISTORY_RESEND_MS) {
+            s.history = [...h.window];
+            h.historyAt = ts;
+          }
+          samples.push(s);
         }
         samples.sort((a, b) => (a.ip < b.ip ? -1 : 1));
         latencyHub.emit({ monitorId: id, samples });
