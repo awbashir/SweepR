@@ -7,7 +7,9 @@
 # It asks for your administrator password (sudo) and then:
 #   1. copies SweepR.app and "SweepR (Administrator).app" to /Applications
 #   2. removes the download quarantine flag from them (the app is not notarized)
-#   3. links the command-line tool to /usr/local/bin/sweepr (`sudo sweepr scan ...`)
+#   3. puts the command-line tool on your PATH: a /usr/local/bin/sweepr link plus an
+#      /etc/paths.d/sweepr entry for shells whose PATH lacks /usr/local/bin, so
+#      `sweepr --help` and `sudo sweepr scan` work in any new Terminal window
 #   4. optionally (asked, or --bpf / --no-bpf) gives your user read/write access to the
 #      packet-capture devices (/dev/bpf*) at every boot, so passive VLAN / CDP / LLDP
 #      listening works without sudo. Active ARP / 802.1Q / NDP scans still need root: use
@@ -35,6 +37,7 @@ apps=/Applications
 app="$apps/SweepR.app"
 launcher="$apps/SweepR (Administrator).app"
 bin_link=/usr/local/bin/sweepr
+paths_entry=/etc/paths.d/sweepr
 support="/Library/Application Support/SweepR"
 daemon=/Library/LaunchDaemons/com.sweepr.chmodbpf.plist
 bpf_group=access_bpf
@@ -58,12 +61,30 @@ for a in "$app" "$launcher"; do
 done
 
 exe="$(plutil -extract CFBundleExecutable raw "$app/Contents/Info.plist")"
-echo "==> Linking $bin_link -> $app/Contents/MacOS/$exe"
+echo "==> Adding sweepr to the PATH"
 mkdir -p /usr/local/bin
 if [ -e "$bin_link" ] && [ ! -L "$bin_link" ]; then
-  echo "    skipped: $bin_link exists and is not a link (remove it to use the bundled CLI)"
+  echo "    skipped $bin_link: it exists and is not a link (remove it to use the bundled CLI)"
 else
   ln -sfn "$app/Contents/MacOS/$exe" "$bin_link"
+  echo "    $bin_link -> $app/Contents/MacOS/$exe"
+fi
+# path_helper (run by /etc/zprofile and /etc/profile) appends every /etc/paths.d entry to
+# PATH in login shells, i.e. every new Terminal window.
+mkdir -p /etc/paths.d
+echo "$app/Contents/MacOS" > "$paths_entry"
+chmod 644 "$paths_entry"
+echo "    $paths_entry: $app/Contents/MacOS"
+if [ -n "$user" ] && [ "$user" != root ]; then
+  user_shell="$(dscl . -read "/Users/$user" UserShell 2>/dev/null | awk '{print $2}')"
+  [ -x "${user_shell:-}" ] || user_shell=/bin/zsh
+  found="$(sudo -H -u "$user" "$user_shell" -lc 'command -v sweepr' 2>/dev/null || true)"
+  if [ -n "$found" ]; then
+    echo "    a new Terminal window finds: $found"
+  else
+    echo "    warning: a login shell for $user still does not find sweepr; add this line to"
+    echo "    your shell profile (e.g. ~/.zshrc):  export PATH=\"\$PATH:$app/Contents/MacOS\""
+  fi
 fi
 
 if [ "$bpf_choice" = ask ]; then
@@ -139,5 +160,5 @@ cat <<EOF
 SweepR is installed.
   * SweepR (Administrator)  full scans (ARP, 802.1Q VLANs, IPv6, CDP/LLDP); asks for your password
   * SweepR                  runs without root (ICMP sweep + neighbor cache)
-  * Terminal                sudo sweepr scan   |   sweepr --help
+  * Terminal                sudo sweepr scan   |   sweepr --help   (open a new window first)
 EOF

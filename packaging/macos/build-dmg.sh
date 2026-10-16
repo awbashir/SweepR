@@ -37,6 +37,12 @@ npx tauri build "${build_args[@]}"
 app="$bundle_dir/SweepR.app"
 [ -d "$app" ] || { echo "error: $app was not built" >&2; exit 1; }
 version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
+# The Read Me and README tell drag-and-drop users to link Contents/MacOS/sweepr.
+exe="$(plutil -extract CFBundleExecutable raw "$app/Contents/Info.plist")"
+if [ "$exe" != sweepr ]; then
+  echo "error: the bundle executable is '$exe', expected 'sweepr' (update the docs)" >&2
+  exit 1
+fi
 case "$target" in
   universal-apple-darwin) arch=universal ;;
   aarch64-apple-darwin) arch=aarch64 ;;

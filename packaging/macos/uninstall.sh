@@ -1,7 +1,8 @@
 #!/bin/bash
 # SweepR uninstaller for macOS ("Uninstall SweepR.command" on the disk image).
 #
-# Removes the apps, the /usr/local/bin/sweepr link and SweepR's packet-capture boot job.
+# Removes the apps, the sweepr PATH entries (/usr/local/bin/sweepr, /etc/paths.d/sweepr) and
+# SweepR's packet-capture boot job.
 # Your settings and hostname overrides (~/Library/Application Support/com.SweepR.SweepR) and
 # the access_bpf group (Wireshark uses it too) are kept; to drop the group as well:
 #   sudo dseditgroup -o delete access_bpf
@@ -16,6 +17,10 @@ bin_link=/usr/local/bin/sweepr
 if [ -L "$bin_link" ] && [[ "$(readlink "$bin_link")" == */SweepR.app/* ]]; then
   echo "==> Removing $bin_link"
   rm -f "$bin_link"
+fi
+if [ -f /etc/paths.d/sweepr ]; then
+  echo "==> Removing /etc/paths.d/sweepr"
+  rm -f /etc/paths.d/sweepr
 fi
 
 if [ -f /Library/LaunchDaemons/com.sweepr.chmodbpf.plist ]; then

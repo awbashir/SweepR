@@ -55,7 +55,9 @@ discovery and a one-click security audit report, in a native desktop app and a s
    for your administrator password (`sudo`). The installer:
    - copies **SweepR** and **SweepR (Administrator)** to `/Applications`,
    - removes the download quarantine flag (the app is ad-hoc signed, not notarized),
-   - links the command-line tool to `/usr/local/bin/sweepr`,
+   - puts the `sweepr` command-line tool on your `PATH`: a `/usr/local/bin/sweepr` link,
+     plus an `/etc/paths.d/sweepr` entry for shells whose `PATH` lacks `/usr/local/bin`.
+     Open a new Terminal window and run `sweepr --help` or `sudo sweepr scan`,
    - optionally gives your user read/write access to the packet-capture devices
      (`/dev/bpf*`) at every boot, so passive VLAN / CDP / LLDP / DHCP listening works
      without `sudo` (the same mechanism as Wireshark's *ChmodBPF*).
@@ -72,9 +74,11 @@ bash "/Volumes/SweepR 0.1.0/Install SweepR.command" --bpf     # grant it without
 ```
 
 You can also drag the apps onto the *Applications* link in the disk image; then clear the
-quarantine flag yourself with `xattr -dr com.apple.quarantine /Applications/SweepR.app`.
-**Uninstall SweepR.command** removes the apps, the CLI link and the boot job (settings and
-hostname overrides are kept).
+quarantine flag yourself with `xattr -dr com.apple.quarantine /Applications/SweepR.app`, and
+add the CLI to your `PATH` with
+`sudo ln -sf /Applications/SweepR.app/Contents/MacOS/sweepr /usr/local/bin/sweepr`.
+**Uninstall SweepR.command** removes the apps, the `PATH` entries and the boot job (settings
+and hostname overrides are kept).
 
 Files SweepR creates while running as root (exports, reports, the hostname-overrides store)
 are handed back to the user who started it (`SUDO_UID` / `SUDO_GID`), so they never end up
@@ -527,7 +531,7 @@ src-tauri/
   data/dhcp_fingerprints.tsv  embedded DHCP signature table (best-effort heuristics)
 packaging/macos/
   build-dmg.sh     builds the installer disk image (macOS only)
-  install.sh       "Install SweepR.command": sudo installer (apps, CLI link, BPF access)
+  install.sh       "Install SweepR.command": sudo installer (apps, CLI on PATH, BPF access)
   uninstall.sh     "Uninstall SweepR.command"
   admin-launcher.applescript  "SweepR (Administrator)": starts the GUI as root
   ReadMe.txt       "Read Me.txt" shown in the disk image
