@@ -44,15 +44,29 @@ const CAPTURE_POLL_MS: i32 = 100;
 // Parsing (pure, bounds-checked)
 // ---------------------------------------------------------------------------------------------
 
+/// BPF filter of the DHCP capture. `vlan` must come last: it shifts the offsets of every
+/// primitive after it, so the tagged alternative repeats the UDP match inside the tag.
+pub const DHCP_FILTER: &str =
+    "udp and (port 67 or port 68) or (vlan and udp and (port 67 or port 68))";
+
+/// DHCP message types a client sends that carry its fingerprint (option 53).
+const CLIENT_MESSAGE_TYPES: [u8; 3] = [1, 3, 8]; // DISCOVER, REQUEST, INFORM
+
 /// A parsed DHCP client packet (only the fields we fingerprint on).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DhcpPacket {
+    /// BOOTP `op` (1 BOOTREQUEST from a client, 2 BOOTREPLY from a server).
+    pub op: u8,
     /// Option 53 message type (1 DISCOVER, 3 REQUEST, 8 INFORM, …).
     pub msg_type: Option<u8>,
     /// Client hardware address (`chaddr`, 6 octets for Ethernet).
     pub mac: Option<[u8; 6]>,
-    /// Client IP: `ciaddr` if set, else option 50 (requested IP).
+    /// Client IP: `ciaddr` if set, else the option-50 requested IP of a REQUEST that names
+    /// the server it accepted (option 54, SELECTING state). A DISCOVER's or INIT-REBOOT
+    /// REQUEST's option 50 is only a wish (possibly from another network) and is not used.
     pub client_ip: Option<Ipv4Addr>,
+    /// Option 54 server identifier.
+    pub server_id: Option<Ipv4Addr>,
     /// Option 55 parameter request list.
     pub param_list: Vec<u8>,
     /// Option 60 vendor class identifier.
@@ -107,15 +121,71 @@ pub fn dhcp_payload(frame: &[u8]) -> Option<(&[u8], Option<u16>)> {
     Some((dhcp, eth.vlan_id()))
 }
 
+impl DhcpPacket {
+    /// A client's DISCOVER / REQUEST / INFORM (BOOTREQUEST): the only packets fingerprinted.
+    /// Server replies (OFFER / ACK carry the *client's* `chaddr`), DECLINE (option 50 is the
+    /// conflicting host's address) and RELEASE are not.
+    pub fn is_client_request(&self) -> bool {
+        self.op == 1
+            && self
+                .msg_type
+                .is_some_and(|t| CLIENT_MESSAGE_TYPES.contains(&t))
+    }
+}
+
+/// Walk one DHCP option area (TLV; 0 = pad, 255 = end). Returns the option-52 overload value
+/// when present.
+fn parse_options(area: &[u8], pkt: &mut DhcpPacket, requested_ip: &mut Option<Ipv4Addr>) -> u8 {
+    let mut overload = 0;
+    let mut off = 0;
+    while let Some(&code) = area.get(off) {
+        match code {
+            0 => {
+                off += 1;
+                continue;
+            }
+            255 => break,
+            _ => {}
+        }
+        let Some(&len) = area.get(off + 1) else { break };
+        let len = usize::from(len);
+        let Some(value) = area.get(off + 2..off + 2 + len) else {
+            break;
+        };
+        off += 2 + len;
+        match code {
+            53 => pkt.msg_type = value.first().copied(),
+            55 => {
+                pkt.param_list = value.iter().take(MAX_PARAM_LIST).copied().collect();
+            }
+            60 => pkt.vendor_class = opt_text(value),
+            12 => pkt.hostname = opt_text(value),
+            61 => pkt.client_id = render_client_id(value),
+            77 => pkt.user_class = opt_text(value),
+            57 => pkt.max_message_size = be16(value, 0),
+            50 => *requested_ip = ipv4_at(value, 0),
+            54 => pkt.server_id = ipv4_at(value, 0).filter(|ip| !ip.is_unspecified()),
+            52 => overload = value.first().copied().unwrap_or(0),
+            82 => pkt.relay_agent = true,
+            _ => {}
+        }
+    }
+    overload
+}
+
 /// Parse a BOOTP/DHCP message. Bounds-checked throughout; returns `None` when it is not a DHCP
-/// message (no magic cookie) or is truncated past the fixed header.
+/// message (no magic cookie) or is truncated past the fixed header. Option overload (option
+/// 52) is honoured: options continue in the `file` and / or `sname` fields.
 pub fn parse_dhcp(dhcp: &[u8]) -> Option<DhcpPacket> {
     // Fixed BOOTP header is 236 bytes, then the 4-byte magic cookie, then options.
     if dhcp.len() < 240 || dhcp[236..240] != DHCP_MAGIC {
         return None;
     }
     let hlen = usize::from(dhcp[2]).min(6);
-    let mut pkt = DhcpPacket::default();
+    let mut pkt = DhcpPacket {
+        op: dhcp[0],
+        ..DhcpPacket::default()
+    };
     if hlen == 6 {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&dhcp[28..34]);
@@ -131,41 +201,18 @@ pub fn parse_dhcp(dhcp: &[u8]) -> Option<DhcpPacket> {
         pkt.giaddr = Some(gi);
     }
 
-    // Options (TLV from offset 240; 0 = pad, 255 = end).
-    let mut off = 240;
+    // Options (TLV from offset 240), then the overloaded `file` (108..236) / `sname`
+    // (44..108) fields when option 52 says so.
     let mut requested_ip = None;
-    while let Some(&code) = dhcp.get(off) {
-        match code {
-            0 => {
-                off += 1;
-                continue;
-            }
-            255 => break,
-            _ => {}
-        }
-        let Some(&len) = dhcp.get(off + 1) else { break };
-        let len = usize::from(len);
-        let Some(value) = dhcp.get(off + 2..off + 2 + len) else {
-            break;
-        };
-        off += 2 + len;
-        match code {
-            53 => pkt.msg_type = value.first().copied(),
-            55 => {
-                pkt.param_list = value.iter().take(MAX_PARAM_LIST).copied().collect();
-            }
-            60 => pkt.vendor_class = opt_text(value),
-            12 => pkt.hostname = opt_text(value),
-            61 => pkt.client_id = render_client_id(value),
-            77 => pkt.user_class = opt_text(value),
-            57 => pkt.max_message_size = be16(value, 0),
-            50 => requested_ip = ipv4_at(value, 0),
-            82 => pkt.relay_agent = true,
-            _ => {}
-        }
+    let overload = parse_options(&dhcp[240..], &mut pkt, &mut requested_ip);
+    if overload & 1 != 0 {
+        parse_options(&dhcp[108..236], &mut pkt, &mut requested_ip);
     }
-    if pkt.client_ip.is_none() {
-        pkt.client_ip = requested_ip.filter(|ip| !ip.is_unspecified());
+    if overload & 2 != 0 {
+        parse_options(&dhcp[44..108], &mut pkt, &mut requested_ip);
+    }
+    if pkt.client_ip.is_none() && pkt.msg_type == Some(3) && pkt.server_id.is_some() {
+        pkt.client_ip = requested_ip.filter(|ip| !ip.is_unspecified() && !ip.is_broadcast());
     }
     // A packet with neither a MAC nor a message type is not useful.
     (pkt.mac.is_some() || pkt.msg_type.is_some()).then_some(pkt)
@@ -373,7 +420,7 @@ fn open_dhcp_capture(if_name: &str) -> Result<pcap::Capture<pcap::Active>> {
         tracing::debug!("cannot restrict DHCP capture on {if_name} to inbound: {e}");
     }
     // Kernel BPF filter; verified before the capture loop runs.
-    cap.filter("udp and (port 67 or port 68)", true)
+    cap.filter(DHCP_FILTER, true)
         .with_context(|| format!("DHCP BPF filter rejected on {if_name}"))?;
     Ok(cap)
 }
@@ -406,6 +453,8 @@ pub async fn run_dhcp_fingerprint(
         let deadline = Instant::now().checked_add(duration);
         // Last fingerprint emitted per client, so we only re-emit on change.
         let mut seen: HashMap<[u8; 6], DhcpFingerprint> = HashMap::new();
+        // DHCP servers already reported.
+        let mut servers: HashSet<(Ipv4Addr, [u8; 6])> = HashSet::new();
         let mut count = 0u64;
         while deadline.is_none_or(|d| Instant::now() < d) && !cancel.is_cancelled() {
             match cap.next_packet() {
@@ -416,6 +465,20 @@ pub async fn run_dhcp_fingerprint(
                     let Some(parsed) = parse_dhcp(dhcp) else {
                         continue;
                     };
+                    if let Some(server) = server_observation(pkt.data, &parsed, vlan) {
+                        let key = (server.0, server.1);
+                        if !own.contains(&server.1)
+                            && servers.len() < MAX_SERVERS
+                            && servers.insert(key)
+                            && tx.blocking_send(ScanEvent::device(server.2)).is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if !parsed.is_client_request() {
+                        continue;
+                    }
                     let Some(mac) = parsed.mac else { continue };
                     if own.contains(&mac) {
                         continue;
@@ -443,6 +506,36 @@ pub async fn run_dhcp_fingerprint(
     })
     .await
     .context("DHCP fingerprint task failed")?
+}
+
+/// Distinct DHCP servers a capture run reports.
+const MAX_SERVERS: usize = 256;
+
+/// A DHCP server answering (BOOTREPLY OFFER / ACK / NAK): `(server address, server MAC,
+/// device snapshot with dhcpServer = true)`. The address is the option-54 server identifier,
+/// else the IPv4 source of the reply (relayed replies are not attributed to the relay).
+pub fn server_observation(
+    frame: &[u8],
+    pkt: &DhcpPacket,
+    vlan: Option<u16>,
+) -> Option<(Ipv4Addr, [u8; 6], Device)> {
+    if pkt.op != 2 || !matches!(pkt.msg_type, Some(2 | 5 | 6)) {
+        return None;
+    }
+    let eth = arp_vlan::parse_frame(frame)?;
+    let src = ipv4_at(eth.payload, 12)?;
+    let ip = pkt
+        .server_id
+        .or((!src.is_unspecified()).then_some(src))
+        .filter(|ip| !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast())?;
+    // A relayed reply comes from the relay (giaddr), whose MAC is not the server's.
+    let mac = (pkt.giaddr.is_none() || pkt.server_id == Some(src)).then_some(eth.src);
+    let mut dev = Device::new(IpAddr::V4(ip));
+    dev.vlan_id = vlan;
+    dev.mac = mac.map(|m| crate::models::format_mac(&m));
+    dev.dhcp_server = Some(true);
+    dev.add_source(DiscoverySource::Dhcp);
+    Some((ip, mac.unwrap_or([0; 6]), dev))
 }
 
 /// Build a [`Device`] snapshot for a fingerprinted DHCP client. A client that has no address
@@ -656,11 +749,121 @@ mod tests {
         assert!(dev.dns_name.is_none());
         let fp = dev.dhcp_fingerprint.unwrap();
         assert_eq!(fp.hostname.as_deref(), Some("my-laptop"));
-        // A REQUEST carrying option 50 (requested IP) keys the row by that address.
-        let frame = build_dhcp_frame(mac, 3, &[(50, vec![10, 0, 0, 42])], None);
+        // A REQUEST carrying option 50 (requested IP) and option 54 (the server it accepted)
+        // keys the row by that address.
+        let frame = build_dhcp_frame(
+            mac,
+            3,
+            &[(50, vec![10, 0, 0, 42]), (54, vec![10, 0, 0, 1])],
+            None,
+        );
         let (dhcp, vlan) = dhcp_payload(&frame).unwrap();
         let pkt = parse_dhcp(dhcp).unwrap();
         let dev = device_for(&pkt, vlan, fingerprint(&pkt));
         assert_eq!(dev.ip.to_string(), "10.0.0.42");
+    }
+
+    fn parsed(frame: &[u8]) -> DhcpPacket {
+        parse_dhcp(dhcp_payload(frame).unwrap().0).unwrap()
+    }
+
+    /// Only client DISCOVER / REQUEST / INFORM are fingerprinted, and option 50 only gives the
+    /// client's address on a SELECTING REQUEST (review M2).
+    #[test]
+    fn only_client_requests_with_trustworthy_addresses() {
+        let mac = [0x00, 0x1a, 0x2b, 0x03, 0x04, 0x06];
+        // A DISCOVER asking for a stale address from another network: no address.
+        let p = parsed(&build_dhcp_frame(
+            mac,
+            1,
+            &[(50, vec![192, 168, 7, 9])],
+            None,
+        ));
+        assert!(p.is_client_request());
+        assert_eq!(p.client_ip, None);
+        // INIT-REBOOT REQUEST (option 50 without 54): no address either.
+        let p = parsed(&build_dhcp_frame(
+            mac,
+            3,
+            &[(50, vec![192, 168, 7, 9])],
+            None,
+        ));
+        assert_eq!(p.client_ip, None);
+        // INFORM with ciaddr: the address is the client's own.
+        let mut f = build_dhcp_frame(mac, 8, &[], None);
+        let bootp = f.len() - (240 + 3 + 1); // start of the BOOTP header
+        f[bootp + 12..bootp + 16].copy_from_slice(&[10, 0, 0, 77]);
+        let p = parsed(&f);
+        assert!(p.is_client_request());
+        assert_eq!(p.client_ip, Some(Ipv4Addr::new(10, 0, 0, 77)));
+        // DECLINE (4) carries the *conflicting* address in option 50; RELEASE (7) is not a
+        // fingerprint either.
+        for t in [4u8, 7] {
+            let p = parsed(&build_dhcp_frame(mac, t, &[(50, vec![10, 0, 0, 5])], None));
+            assert!(!p.is_client_request(), "type {t}");
+        }
+        // Server replies (op 2: OFFER / ACK) carry the client's chaddr: never fingerprinted.
+        let mut f = build_dhcp_frame(mac, 2, &[(54, vec![10, 0, 0, 1])], None);
+        f[bootp] = 2;
+        let p = parsed(&f);
+        assert_eq!(p.op, 2);
+        assert!(!p.is_client_request());
+        let mut f = build_dhcp_frame(mac, 3, &[], None);
+        f[bootp] = 2; // a BOOTREPLY claiming to be a REQUEST
+        assert!(!parsed(&f).is_client_request());
+    }
+
+    /// DHCP server replies are recorded as server observations (rogue-DHCP audit input),
+    /// never as client fingerprints.
+    #[test]
+    fn server_replies_mark_the_server() {
+        let client = [0x00, 0x1a, 0x2b, 0x03, 0x04, 0x09];
+        let mut f = build_dhcp_frame(client, 2, &[(54, vec![10, 0, 0, 1])], None);
+        let bootp = f.len() - (240 + 3 + 6 + 1);
+        f[bootp] = 2; // BOOTREPLY
+                      // Ethernet source = the server; IPv4 source = 10.0.0.1.
+        f[6..12].copy_from_slice(&[0x00, 0x50, 0x56, 0, 0, 1]);
+        f[14 + 12..14 + 16].copy_from_slice(&[10, 0, 0, 1]);
+        let p = parsed(&f);
+        assert!(!p.is_client_request());
+        let (ip, mac, dev) = server_observation(&f, &p, None).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(mac, [0x00, 0x50, 0x56, 0, 0, 1]);
+        assert_eq!(dev.dhcp_server, Some(true));
+        assert_eq!(dev.mac.as_deref(), Some("00:50:56:00:00:01"));
+        // A client request is no server observation.
+        let req = build_dhcp_frame(client, 1, &[], None);
+        assert!(server_observation(&req, &parsed(&req), None).is_none());
+    }
+
+    /// Option overload (52): the parameter list may live in the `file` field.
+    #[test]
+    fn option_overload_reads_file_and_sname() {
+        let mac = [0x00, 0x1a, 0x2b, 0x03, 0x04, 0x07];
+        let mut f = build_dhcp_frame(mac, 1, &[(52, vec![3])], None);
+        let bootp = f.len() - (240 + 3 + 3 + 1);
+        // file (108..236): option 55; sname (44..108): option 60.
+        f[bootp + 108..bootp + 108 + 6].copy_from_slice(&[55, 3, 1, 3, 6, 255]);
+        f[bootp + 44..bootp + 44 + 6].copy_from_slice(&[60, 3, b'a', b'b', b'c', 255]);
+        let p = parsed(&f);
+        assert_eq!(p.param_list, vec![1, 3, 6]);
+        assert_eq!(p.vendor_class.as_deref(), Some("abc"));
+    }
+
+    /// The capture filter matches untagged and 802.1Q-tagged DHCP (review M3). Compiled on a
+    /// dead capture, so no privileges are needed.
+    #[test]
+    fn bpf_filter_accepts_tagged_dhcp() {
+        let cap = pcap::Capture::dead(pcap::Linktype::ETHERNET).unwrap();
+        let prog = cap.compile(DHCP_FILTER, true).unwrap();
+        let mac = [0x00, 0x1a, 0x2b, 0x03, 0x04, 0x08];
+        assert!(prog.filter(&build_dhcp_frame(mac, 1, &[], None)));
+        assert!(prog.filter(&build_dhcp_frame(mac, 1, &[], Some(20))));
+        // Unrelated tagged traffic (an ARP inside a tag) does not match.
+        let mut arp = vec![0xff; 6];
+        arp.extend_from_slice(&mac);
+        arp.extend_from_slice(&[0x81, 0x00, 0x00, 0x14, 0x08, 0x06]);
+        arp.extend_from_slice(&[0u8; 28]);
+        assert!(!prog.filter(&arp));
     }
 }

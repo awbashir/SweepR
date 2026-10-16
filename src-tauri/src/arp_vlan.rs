@@ -2523,6 +2523,8 @@ pub async fn run_l2_scan(
             .map(|g| g.report_vlan);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut warned_untagged = false;
+            let mut routers_seen: std::collections::HashSet<(IpAddr, Option<u16>)> =
+                std::collections::HashSet::new();
             while !done.load(Ordering::Acquire) && !cancel.is_cancelled() {
                 let data = match capture.next_packet() {
                     Ok(pkt) => pkt.data,
@@ -2551,7 +2553,7 @@ pub async fn run_l2_scan(
                     let in_scope = groups
                         .iter()
                         .any(|g| g.targets.iter().any(|t| t.contains(r.ip)));
-                    in_scope.then_some((IpAddr::V4(r.ip), r.mac, vlan, DiscoverySource::Arp))
+                    in_scope.then_some((IpAddr::V4(r.ip), r.mac, vlan, DiscoverySource::Arp, false))
                 } else if want_v6 {
                     parse_icmpv6_discovery(data)
                         .filter(|o| accept_ipv6_observation(o, &iface))
@@ -2561,12 +2563,13 @@ pub async fn run_l2_scan(
                                 o.mac,
                                 attribute_vlan(&groups, o.vlan),
                                 DiscoverySource::Ndp,
+                                o.icmp_type == ICMPV6_ROUTER_ADVERT,
                             )
                         })
                 } else {
                     None
                 };
-                let Some((ip, mac, vlan, source)) = observed else {
+                let Some((ip, mac, vlan, source, router)) = observed else {
                     continue;
                 };
                 if mac == src_mac {
@@ -2576,7 +2579,11 @@ pub async fn run_l2_scan(
                     .lock()
                     .map(|mut set| set.insert((ip, vlan)))
                     .unwrap_or(false);
-                if !is_new {
+                // A router advertisement from an already-seen host still marks it as a router
+                // (once).
+                let new_router =
+                    router && routers_seen.len() < 4096 && routers_seen.insert((ip, vlan));
+                if !is_new && !new_router {
                     continue;
                 }
                 if want_v6 && ip.is_ipv4() && untagged_vlan == Some(vlan) {
@@ -2586,13 +2593,18 @@ pub async fn run_l2_scan(
                         }
                     }
                 }
-                found.fetch_add(1, Ordering::Relaxed);
+                if is_new {
+                    found.fetch_add(1, Ordering::Relaxed);
+                }
                 let mut dev = Device::new(ip);
                 dev.mac = Some(format_mac(&mac));
                 dev.vlan_id = vlan;
                 dev.role = DeviceRole::Host;
                 dev.interface = Some(iface.name.clone());
                 dev.add_source(source);
+                if router {
+                    dev.ipv6_router = Some(true);
+                }
                 if tx.blocking_send(ScanEvent::device(dev)).is_err() {
                     break;
                 }

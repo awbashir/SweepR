@@ -662,10 +662,15 @@ fn be16(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]))
 }
 
-/// Parse a packet read from a raw IPv4 ICMP socket (starts with the IPv4 header). Returns
-/// what it says about our probe `seq` (matched by `ident`, and by the quoted destination
-/// for errors).
-pub fn parse_icmp_v4(buf: &[u8], ident: u16, target: Ipv4Addr) -> Option<(IcmpKind, u16)> {
+/// Parse a packet read from a raw IPv4 ICMP socket (starts with the IPv4 header), received
+/// from `from`. Returns what it says about our probe `seq`: an Echo Reply counts only when it
+/// comes from `target` with our `ident`; errors must quote a probe of ours to `target`.
+pub fn parse_icmp_v4(
+    buf: &[u8],
+    ident: u16,
+    target: Ipv4Addr,
+    from: Ipv4Addr,
+) -> Option<(IcmpKind, u16)> {
     let first = *buf.first()?;
     if first >> 4 != 4 {
         return None;
@@ -678,7 +683,8 @@ pub fn parse_icmp_v4(buf: &[u8], ident: u16, target: Ipv4Addr) -> Option<(IcmpKi
     match *icmp.first()? {
         0 => {
             // Echo reply: id / seq follow type, code and checksum.
-            (be16(icmp, 4)? == ident).then_some((IcmpKind::EchoReply, be16(icmp, 6)?))
+            (from == target && be16(icmp, 4)? == ident)
+                .then_some((IcmpKind::EchoReply, be16(icmp, 6)?))
         }
         t @ (3 | 11) => {
             // Quoted original datagram: IPv4 header + the first 8 bytes of our echo.
@@ -712,10 +718,17 @@ pub fn parse_icmp_v4(buf: &[u8], ident: u16, target: Ipv4Addr) -> Option<(IcmpKi
     }
 }
 
-/// Parse a packet read from a raw ICMPv6 socket (no IPv6 header).
-pub fn parse_icmp_v6(buf: &[u8], ident: u16, target: Ipv6Addr) -> Option<(IcmpKind, u16)> {
+/// Parse a packet read from a raw ICMPv6 socket (no IPv6 header), received from `from`
+/// (same rules as [`parse_icmp_v4`]).
+pub fn parse_icmp_v6(
+    buf: &[u8],
+    ident: u16,
+    target: Ipv6Addr,
+    from: Ipv6Addr,
+) -> Option<(IcmpKind, u16)> {
     match *buf.first()? {
-        129 => (be16(buf, 4)? == ident).then_some((IcmpKind::EchoReply, be16(buf, 6)?)),
+        129 => (from == target && be16(buf, 4)? == ident)
+            .then_some((IcmpKind::EchoReply, be16(buf, 6)?)),
         t @ (1 | 3) => {
             // Quoted packet: IPv6 header (40 bytes) + our echo request.
             let inner = buf.get(8..)?;
@@ -757,6 +770,14 @@ pub fn open_raw(target: IpAddr) -> io::Result<Socket> {
     Ok(sock)
 }
 
+/// A distinct ICMP identifier per trace (concurrent traces in one process must not take each
+/// other's replies).
+fn next_ident() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ((std::process::id() as u16) ^ 0x5357).wrapping_add(n.wrapping_mul(0x9e37))
+}
+
 /// Raw engine: one echo probe per TTL per round on a blocking thread.
 fn raw_worker(
     sock: Socket,
@@ -765,7 +786,7 @@ fn raw_worker(
     tx: mpsc::Sender<Msg>,
     cancel: CancellationToken,
 ) {
-    let ident = (std::process::id() as u16) ^ 0x5357;
+    let ident = next_ident();
     let dest: SockAddr = SocketAddr::new(target, 0).into();
     let mut dest_ttl: Option<u8> = None;
     let mut buf = vec![0u8; 2048];
@@ -818,15 +839,16 @@ fn raw_worker(
             };
             let received_at = Instant::now();
             let data = &buf[..n.min(buf.len())];
-            let parsed = match target {
-                IpAddr::V4(t) => parse_icmp_v4(data, ident, t),
-                IpAddr::V6(t) => parse_icmp_v6(data, ident, t),
+            let Some(from) = from.as_socket().map(|s| s.ip()) else {
+                continue;
+            };
+            let parsed = match (target, from) {
+                (IpAddr::V4(t), IpAddr::V4(f)) => parse_icmp_v4(data, ident, t, f),
+                (IpAddr::V6(t), IpAddr::V6(f)) => parse_icmp_v6(data, ident, t, f),
+                _ => None,
             };
             let Some((kind, seq)) = parsed else { continue };
             let Some(sent_at) = pending.remove(&seq) else {
-                continue;
-            };
-            let Some(from) = from.as_socket().map(|s| s.ip()) else {
                 continue;
             };
             let ttl = decode_ttl(seq);
@@ -1237,6 +1259,9 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
         let echo = build_echo_v4(ident, seq);
         assert_eq!(checksum(&echo), 0, "a valid checksum sums to zero");
         let target = Ipv4Addr::new(8, 8, 8, 8);
+        let router = Ipv4Addr::new(10, 0, 0, 1);
+        let r6_router: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_ne!(next_ident(), next_ident(), "each trace gets its own ident");
 
         // Echo reply from the destination: IPv4 header + ICMP type 0.
         let mut ip = vec![
@@ -1246,10 +1271,21 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
         reply[0] = 0;
         ip.extend_from_slice(&reply);
         assert_eq!(
-            parse_icmp_v4(&ip, ident, target),
+            parse_icmp_v4(&ip, ident, target, target),
             Some((IcmpKind::EchoReply, seq))
         );
-        assert_eq!(parse_icmp_v4(&ip, ident ^ 1, target), None, "other process");
+        assert_eq!(
+            parse_icmp_v4(&ip, ident ^ 1, target, target),
+            None,
+            "other process"
+        );
+        // An echo reply with our ident from anyone but the target is not ours (another
+        // trace's destination, or a spoofed reply).
+        assert_eq!(
+            parse_icmp_v4(&ip, ident, target, Ipv4Addr::new(10, 0, 0, 9)),
+            None,
+            "reply from a different host"
+        );
 
         // Time exceeded from a router quoting our probe.
         let mut te = vec![
@@ -1261,21 +1297,21 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
         ]);
         te.extend_from_slice(&echo[..8]);
         assert_eq!(
-            parse_icmp_v4(&te, ident, target),
+            parse_icmp_v4(&te, ident, target, router),
             Some((IcmpKind::TimeExceeded, seq))
         );
         assert_eq!(
-            parse_icmp_v4(&te, ident, Ipv4Addr::new(1, 1, 1, 1)),
+            parse_icmp_v4(&te, ident, Ipv4Addr::new(1, 1, 1, 1), router),
             None,
             "other target"
         );
         // Truncated / garbage packets never panic.
         for n in 0..te.len() {
-            let _ = parse_icmp_v4(&te[..n], ident, target);
+            let _ = parse_icmp_v4(&te[..n], ident, target, router);
         }
-        assert_eq!(parse_icmp_v4(&[0x4f; 3], ident, target), None);
+        assert_eq!(parse_icmp_v4(&[0x4f; 3], ident, target, target), None);
         assert_eq!(
-            parse_icmp_v4(&[0x41, 0, 0], ident, target),
+            parse_icmp_v4(&[0x41, 0, 0], ident, target, target),
             None,
             "IHL < 20"
         );
@@ -1286,8 +1322,12 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
         let mut r6 = e6.clone();
         r6[0] = 129;
         assert_eq!(
-            parse_icmp_v6(&r6, ident, t6),
+            parse_icmp_v6(&r6, ident, t6, t6),
             Some((IcmpKind::EchoReply, seq))
+        );
+        assert_eq!(
+            parse_icmp_v6(&r6, ident, t6, "2001:db8::99".parse().unwrap()),
+            None
         );
         let mut te6 = vec![3, 0, 0, 0, 0, 0, 0, 0];
         let mut hdr = vec![0x60, 0, 0, 0, 0, 24, 58, 1];
@@ -1296,11 +1336,11 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
         te6.extend_from_slice(&hdr);
         te6.extend_from_slice(&e6);
         assert_eq!(
-            parse_icmp_v6(&te6, ident, t6),
+            parse_icmp_v6(&te6, ident, t6, r6_router),
             Some((IcmpKind::TimeExceeded, seq))
         );
         for n in 0..te6.len() {
-            let _ = parse_icmp_v6(&te6[..n], ident, t6);
+            let _ = parse_icmp_v6(&te6[..n], ident, t6, r6_router);
         }
     }
 

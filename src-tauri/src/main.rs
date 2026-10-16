@@ -32,7 +32,7 @@ use sweepr_core::{
     enricher,
     export::{self, ExportFormat},
     iperf,
-    jobs::JobRegistry,
+    jobs::{JobRegistry, OnDrop},
     latency::{self, MonitorConfig},
     limits::{self, SocketBudget},
     models::{
@@ -896,7 +896,7 @@ impl LiveRenderer {
                     diag!("{ROOT_HINT}");
                 }
             }
-            ScanEvent::PortMapping(_) | ScanEvent::Finished(_) => {}
+            ScanEvent::PortMapping(_) | ScanEvent::SnmpAgent(_) | ScanEvent::Finished(_) => {}
         }
     }
 
@@ -1122,16 +1122,21 @@ async fn cmd_scan(args: ScanArgs, cancel: CancellationToken) -> Result<()> {
     if let (Some(collector), Some(format), Some(path), Some(cfg)) =
         (collector, report_format, &args.report, report_cfg)
     {
-        let meta = report::meta_from_config(
+        let mut meta = report::meta_from_config(
             &cfg,
-            None,
+            summary.interface.clone(),
             started_ms,
             sweepr_core::models::now_ms(),
             summary.cancelled,
         );
+        meta.gateway = summary.gateway.map(|g| g.to_string());
+        meta.scanner_host = summary.scanner_host.clone();
         let input = collector.finish(Some(devices), meta)?;
         let bytes = report::render(&input, &ReportOptions::default(), format)?;
-        std::fs::write(path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        report::write_file_no_follow(path, &bytes)?;
+        for w in &input.warnings {
+            diag!("warning: {w}");
+        }
         diag!("wrote {format} audit report to {}", path.display());
     }
     Ok(())
@@ -1149,8 +1154,10 @@ fn cmd_report(args: ReportArgs) -> Result<()> {
         opts.logo = Some(report::Logo::load(logo)?);
     }
     let bytes = report::render(&input, &opts, format)?;
-    std::fs::write(&args.output, bytes)
-        .with_context(|| format!("cannot write {}", args.output.display()))?;
+    report::write_file_no_follow(&args.output, &bytes)?;
+    for w in &input.warnings {
+        diag!("warning: {w}");
+    }
     if input.skipped_records > 0 {
         diag!(
             "warning: {} malformed record(s) in {} were skipped",
@@ -1203,8 +1210,24 @@ async fn cmd_vlans(args: VlansArgs, cancel: CancellationToken) -> Result<()> {
     let res: PassiveResults = job.await.context("VLAN discovery task crashed")??;
 
     if args.json {
+        let mut value = serde_json::to_value(&res)?;
+        if dhcp {
+            // Additive: fingerprinted clients that had an address (address-less DISCOVERs are
+            // logged to stderr only).
+            let fingerprinted: Vec<Device> = ui
+                .sorted_devices()
+                .into_iter()
+                .filter(|d| d.dhcp_fingerprint.is_some())
+                .collect();
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "dhcpFingerprints".into(),
+                    serde_json::to_value(&fingerprinted)?,
+                );
+            }
+        }
         let mut out = io::stdout().lock();
-        serde_json::to_writer_pretty(&mut out, &res)?;
+        serde_json::to_writer_pretty(&mut out, &value)?;
         writeln!(out)?;
         out.flush()?;
     } else {
@@ -1467,6 +1490,9 @@ async fn cmd_wake(args: WakeArgs) -> Result<()> {
             .map(|i| format!(" via {}", sanitize_text(i)))
             .unwrap_or_default()
     ))?;
+    for f in &res.failures {
+        diag!("warning: send to {}", sanitize_log(f));
+    }
     Ok(())
 }
 
@@ -1512,7 +1538,7 @@ fn ping_table(samples: &[LatencySample]) -> String {
             fmt_ms(s.min_ms),
             fmt_ms(s.max_ms),
             fmt_ms(s.jitter_ms),
-            latency::sparkline(&s.history, 30),
+            latency::sparkline(s.history.as_deref().unwrap_or_default(), 30),
         ]);
     }
     t.to_string()
@@ -2030,6 +2056,7 @@ where
                     neighbors: 0,
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                     cancelled: cancel.is_cancelled(),
+                    ..Default::default()
                 }))
                 .await;
         }
@@ -2404,6 +2431,9 @@ async fn discover_services(
     let ip: IpAddr = ip
         .parse()
         .map_err(|_| format!("'{ip}' is not an IP address"))?;
+    if !probeable_unicast(ip) {
+        return Err(format!("{ip} cannot be probed"));
+    }
     let _slot = probes.0.try_enter().ok_or_else(|| {
         format!("{MAX_PORT_SCAN_JOBS} service probes are already running; wait for one to finish")
     })?;
@@ -2430,6 +2460,12 @@ async fn discover_services(
         return Err("service probe stopped".into());
     }
     Ok(res)
+}
+
+/// A single host the drawer helpers may probe: not unspecified, multicast or (IPv4)
+/// broadcast.
+fn probeable_unicast(ip: IpAddr) -> bool {
+    !(ip.is_unspecified() || ip.is_multicast() || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()))
 }
 
 /// Poll one device over SNMP for the GUI details drawer. `snmp` defaults to the v2c `public`
@@ -2573,6 +2609,8 @@ async fn start_latency_monitor(
     let reservation = latency::reserve_hosts(cfg.ips.len()).map_err(|e| e.to_string())?;
     let (id, cancel) = jobs.latency.begin()?;
     tauri::async_runtime::spawn(async move {
+        let end = app.clone();
+        let _end = OnDrop::new(move || end.state::<UtilityJobs>().latency.end(id));
         let (tx, mut rx) = mpsc::channel::<Vec<LatencySample>>(16);
         let emitter = app.clone();
         let forwarder = tauri::async_runtime::spawn(async move {
@@ -2593,7 +2631,6 @@ async fn start_latency_monitor(
             tracing::warn!("latency monitor {id} failed: {e:#}");
         }
         let _ = forwarder.await;
-        app.state::<UtilityJobs>().latency.end(id);
     });
     Ok(id)
 }
@@ -2619,6 +2656,8 @@ async fn start_trace(
     let opts = TraceOptions::new(max_hops, rounds).map_err(|e| e.to_string())?;
     let (id, cancel) = jobs.traces.begin()?;
     tauri::async_runtime::spawn(async move {
+        let end = app.clone();
+        let _end = OnDrop::new(move || end.state::<UtilityJobs>().traces.end(id));
         let (tx, mut rx) = mpsc::channel::<TraceUpdate>(64);
         let emitter = app.clone();
         let forwarder = tauri::async_runtime::spawn(async move {
@@ -2628,7 +2667,6 @@ async fn start_trace(
         });
         trace::run_trace(target, opts, id, tx, cancel).await;
         let _ = forwarder.await;
-        app.state::<UtilityJobs>().traces.end(id);
     });
     Ok(id)
 }
@@ -2648,11 +2686,12 @@ async fn grab_web_identity(
     ports: Option<Vec<u16>>,
 ) -> Result<WebIdentity, String> {
     let ip = gui_ip(&ip)?;
-    if ip.is_unspecified() || ip.is_multicast() {
+    if !probeable_unicast(ip) {
         return Err(format!("{ip} cannot be probed"));
     }
     let ports = webid::plan_ports(ports.as_deref())?;
     let (id, cancel) = jobs.web.begin()?;
+    let _end = OnDrop::new(|| jobs.web.end(id));
     let res = webid::grab_web_identity(
         ip,
         &ports,
@@ -2661,9 +2700,7 @@ async fn grab_web_identity(
         SocketBudget::global(),
     )
     .await;
-    let stopped = cancel.is_cancelled();
-    jobs.web.end(id);
-    if stopped {
+    if cancel.is_cancelled() {
         return Err("web identity lookup stopped".into());
     }
     Ok(res)
@@ -2696,6 +2733,8 @@ async fn start_iperf(
     }
     let (id, cancel) = jobs.iperf.begin()?;
     tauri::async_runtime::spawn(async move {
+        let end = app.clone();
+        let _end = OnDrop::new(move || end.state::<UtilityJobs>().iperf.end(id));
         let (tx, mut rx) = mpsc::channel::<IperfInterval>(64);
         let emitter = app.clone();
         let forwarder = tauri::async_runtime::spawn(async move {
@@ -2728,7 +2767,6 @@ async fn start_iperf(
                 error,
             },
         );
-        app.state::<UtilityJobs>().iperf.end(id);
     });
     Ok(id)
 }
@@ -3106,6 +3144,23 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("SWEEPR_SNMP_AUTH_PASS") && !help.contains("env-auth-pass"));
+    }
+
+    #[test]
+    fn drawer_probes_reject_non_unicast_targets() {
+        for bad in [
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.251",
+            "239.255.255.250",
+            "::",
+            "ff02::1",
+        ] {
+            assert!(!probeable_unicast(bad.parse().unwrap()), "{bad}");
+        }
+        for ok in ["10.0.0.5", "fe80::1", "2001:db8::1"] {
+            assert!(probeable_unicast(ok.parse().unwrap()), "{ok}");
+        }
     }
 
     #[test]

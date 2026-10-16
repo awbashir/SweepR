@@ -39,14 +39,19 @@ pub const HISTORY_LEN: usize = 120;
 pub const MAX_MONITORED_HOSTS: usize = 2_000;
 /// Minimum spacing of sample batches (≤ 4 per second).
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(250);
-/// Ports tried for the TCP fallback when no open port is known.
-pub const FALLBACK_TCP_PORTS: &[u16] = &[443, 80, 22, 445];
+/// Ports tried for the TCP fallback when no open port is known. SSH / SMB are left out: a
+/// connect every tick fills their authentication logs; known open ports are used first.
+pub const FALLBACK_TCP_PORTS: &[u16] = &[443, 80, 8080];
+/// A host's full `history` is re-sent in live updates at most this often.
+pub const HISTORY_RESEND: Duration = Duration::from_secs(30);
+/// Longest gap (in probes) between two TCP port searches of a silent host.
+const MAX_SEARCH_GAP: u32 = 64;
+/// Consecutive losses on the chosen TCP port before searching again (another port first).
+const TCP_LOSSES_BEFORE_ROTATE: u32 = 3;
 /// Most ports tried per host for the TCP fallback.
 const MAX_TCP_PORTS_PER_HOST: usize = 4;
 /// Consecutive ICMP losses (with no ICMP reply so far) before the TCP fallback is tried.
 const ICMP_MISSES_BEFORE_TCP: u32 = 3;
-/// After an unsuccessful TCP port search, search again every this many lost probes.
-const TCP_SEARCH_EVERY: u32 = 10;
 const PING_PAYLOAD: &[u8; 16] = b"SweepR-latency\0\0";
 
 // ---------------------------------------------------------------------------------------------
@@ -111,6 +116,10 @@ pub struct Window {
     samples: VecDeque<Option<f64>>,
     last_ts: u64,
     method: ProbeMethod,
+    /// Samples not yet sent in a live update.
+    unsent: Vec<Option<f64>>,
+    /// When the full history was last sent (`None`: never).
+    history_sent: Option<Instant>,
 }
 
 impl Window {
@@ -119,8 +128,11 @@ impl Window {
         if self.samples.len() == HISTORY_LEN {
             self.samples.pop_front();
         }
-        self.samples
-            .push_back(rtt_ms.filter(|v| v.is_finite() && *v >= 0.0).map(round3));
+        let v = rtt_ms.filter(|v| v.is_finite() && *v >= 0.0).map(round3);
+        self.samples.push_back(v);
+        if self.unsent.len() < HISTORY_LEN {
+            self.unsent.push(v);
+        }
         self.last_ts = ts;
         self.method = method;
     }
@@ -138,9 +150,26 @@ impl Window {
         self.sample_for(None).stats()
     }
 
-    /// The newest sample of `ip` with the window's statistics and history.
+    /// The newest sample of `ip` with the window's statistics and full history.
     pub fn sample(&self, ip: IpAddr) -> LatencySample {
         self.sample_for(Some(ip))
+    }
+
+    /// A live update for `ip`: the newest sample and statistics, the samples taken since the
+    /// previous update (`newSamples`), and the full history only on the first update and
+    /// then every [`HISTORY_RESEND`].
+    pub fn update(&mut self, ip: IpAddr, now: Instant) -> LatencySample {
+        let mut s = self.sample_for(Some(ip));
+        s.new_samples = std::mem::take(&mut self.unsent);
+        let resend = self
+            .history_sent
+            .is_none_or(|t| now.saturating_duration_since(t) >= HISTORY_RESEND);
+        if resend {
+            self.history_sent = Some(now);
+        } else {
+            s.history = None;
+        }
+        s
     }
 
     fn sample_for(&self, ip: Option<IpAddr>) -> LatencySample {
@@ -158,7 +187,8 @@ impl Window {
             jitter_ms: s.jitter.map(round3),
             sent: s.sent,
             received: s.received,
-            history,
+            history: Some(history),
+            new_samples: Vec::new(),
         }
     }
 }
@@ -360,17 +390,35 @@ async fn host_loop(
     let mut icmp_seen = false;
     let mut misses = 0u32;
     let mut tcp_port: Option<u16> = None;
+    let mut tcp_losses = 0u32;
     let mut done = 0u32;
+    let mut ports = fallback_ports;
+    // TCP port searches back off exponentially while the host stays silent.
+    let first_search = if pinger.is_some() {
+        ICMP_MISSES_BEFORE_TCP
+    } else {
+        1
+    };
+    let mut next_search = first_search;
+    let mut search_gap = first_search.max(2);
 
     loop {
+        if probe.count.is_some_and(|c| done >= c) {
+            return;
+        }
         tokio::select! {
             _ = cancel.cancelled() => return,
             _ = ticker.tick() => {}
         }
-        if probe.count.is_some_and(|c| done >= c) {
-            return;
-        }
         let ts = now_ms();
+        let mut search = |misses: u32| {
+            let due = !ports.is_empty() && misses >= next_search;
+            if due {
+                search_gap = (search_gap * 2).min(MAX_SEARCH_GAP);
+                next_search = misses + search_gap;
+            }
+            due
+        };
         let sample = match (&mut pinger, tcp_port) {
             (Some(p), None) => {
                 let rtt = tokio::select! {
@@ -386,15 +434,10 @@ async fn host_loop(
                     }
                     None => {
                         misses += 1;
-                        // Search after a few misses, then only every few probes so dead
-                        // hosts do not keep a burst of connects in flight on every tick.
-                        let try_tcp = !icmp_seen
-                            && !fallback_ports.is_empty()
-                            && (misses == ICMP_MISSES_BEFORE_TCP
-                                || (misses > ICMP_MISSES_BEFORE_TCP
-                                    && misses.is_multiple_of(TCP_SEARCH_EVERY)));
-                        let found = if try_tcp {
-                            find_tcp_port(ip, &fallback_ports, probe.timeout, &probe.budget).await
+                        // Search after a few misses, then with an exponential back-off so
+                        // dead hosts do not keep a burst of connects in flight.
+                        let found = if !icmp_seen && search(misses) {
+                            find_tcp_port(ip, &ports, probe.timeout, &probe.budget).await
                         } else {
                             None
                         };
@@ -408,16 +451,32 @@ async fn host_loop(
                     }
                 }
             }
-            (_, Some(port)) => (
-                tcp_rtt(ip, port, probe.timeout, &probe.budget).await,
-                ProbeMethod::Tcp,
-            ),
+            (_, Some(port)) => {
+                let rtt = tcp_rtt(ip, port, probe.timeout, &probe.budget).await;
+                if rtt.is_some() {
+                    tcp_losses = 0;
+                } else {
+                    tcp_losses += 1;
+                    misses += 1;
+                    // The port stopped answering: search again later, another port first.
+                    if tcp_losses >= TCP_LOSSES_BEFORE_ROTATE {
+                        tcp_port = None;
+                        tcp_losses = 0;
+                        if let Some(i) = ports.iter().position(|p| *p == port) {
+                            let p = ports.remove(i);
+                            ports.push(p);
+                        }
+                        next_search = misses + search_gap;
+                    }
+                }
+                (rtt, ProbeMethod::Tcp)
+            }
             // ICMP unavailable: TCP only, searching for an answering port (on the first probe,
-            // then every few probes) until one is found.
+            // then with an exponential back-off) until one is found.
             (None, None) => {
                 misses += 1;
-                let found = if misses == 1 || misses.is_multiple_of(TCP_SEARCH_EVERY) {
-                    find_tcp_port(ip, &fallback_ports, probe.timeout, &probe.budget).await
+                let found = if search(misses) {
+                    find_tcp_port(ip, &ports, probe.timeout, &probe.budget).await
                 } else {
                     None
                 };
@@ -525,10 +584,11 @@ pub async fn run_monitor_reserved(
     let mut dirty: BTreeSet<IpAddr> = BTreeSet::new();
     let mut flush = tokio::time::interval(FLUSH_INTERVAL);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let batch = |windows: &BTreeMap<IpAddr, Window>, dirty: &mut BTreeSet<IpAddr>| {
+    let batch = |windows: &mut BTreeMap<IpAddr, Window>, dirty: &mut BTreeSet<IpAddr>| {
+        let now = Instant::now();
         let samples: Vec<LatencySample> = dirty
             .iter()
-            .filter_map(|ip| windows.get(ip).map(|w| w.sample(*ip)))
+            .filter_map(|ip| windows.get_mut(ip).map(|w| w.update(*ip, now)))
             .collect();
         dirty.clear();
         samples
@@ -545,7 +605,7 @@ pub async fn run_monitor_reserved(
             },
             _ = flush.tick() => {
                 if !dirty.is_empty() {
-                    let samples = batch(&windows, &mut dirty);
+                    let samples = batch(&mut windows, &mut dirty);
                     if out.send(samples).await.is_err() {
                         break;
                     }
@@ -562,7 +622,7 @@ pub async fn run_monitor_reserved(
         dirty.insert(ip);
     }
     if !dirty.is_empty() {
-        let samples = batch(&windows, &mut dirty);
+        let samples = batch(&mut windows, &mut dirty);
         let _ = out.send(samples).await;
     }
     drop((v4, v6));
@@ -637,7 +697,7 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let s = w.sample(ip);
         assert_eq!(s.ip, ip);
-        assert_eq!(s.history.len(), HISTORY_LEN);
+        assert_eq!(s.history.as_ref().unwrap().len(), HISTORY_LEN);
         assert_eq!(s.rtt_ms, None);
         assert_eq!(s.ts, 10_000);
         assert_eq!(s.method, ProbeMethod::Tcp);
@@ -645,7 +705,10 @@ mod tests {
             (s.sent, s.received),
             (HISTORY_LEN as u32, HISTORY_LEN as u32 - 2)
         );
-        assert_eq!(s.history.first().copied().flatten(), Some(32.0));
+        assert_eq!(
+            s.history.as_ref().unwrap().first().copied().flatten(),
+            Some(32.0)
+        );
         let stats = w.stats();
         assert_eq!(stats.updated_ms, 10_000);
         assert_eq!(stats.max_ms, Some((HISTORY_LEN + 29) as f64));
@@ -711,7 +774,7 @@ mod tests {
         assert_eq!(s.method, ProbeMethod::Tcp);
         assert_eq!((s.sent, s.received), (3, 3));
         assert!(s.avg_ms.is_some() && s.loss_pct == 0.0);
-        assert_eq!(s.history.len(), 3);
+        assert_eq!(s.history.as_ref().unwrap().len(), 3);
         let mut batches = 0;
         while let Ok(b) = rx.try_recv() {
             assert!(b.iter().all(|x| x.ip == ip));
@@ -754,5 +817,61 @@ mod tests {
         .unwrap();
         stopper.await.unwrap();
         assert!(fin.len() <= 1);
+    }
+
+    /// Live updates carry only the new samples; the full history goes out on a host's first
+    /// update and then at most every HISTORY_RESEND.
+    #[test]
+    fn live_updates_send_history_at_a_reduced_cadence() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut w = Window::default();
+        let t0 = Instant::now();
+        w.push(Some(1.0), 1, ProbeMethod::Icmp);
+        let first = w.update(ip, t0);
+        assert_eq!(first.history.as_ref().map(Vec::len), Some(1));
+        assert_eq!(first.new_samples, vec![Some(1.0)]);
+        w.push(None, 2, ProbeMethod::Icmp);
+        w.push(Some(3.0), 3, ProbeMethod::Icmp);
+        let next = w.update(ip, t0 + Duration::from_secs(1));
+        assert!(next.history.is_none());
+        assert_eq!(next.new_samples, vec![None, Some(3.0)]);
+        assert_eq!((next.rtt_ms, next.sent, next.received), (Some(3.0), 3, 2));
+        w.push(Some(4.0), 4, ProbeMethod::Icmp);
+        let later = w.update(ip, t0 + HISTORY_RESEND + Duration::from_secs(1));
+        assert_eq!(later.history.as_ref().map(Vec::len), Some(4));
+        // Final results always carry the full history.
+        assert_eq!(w.sample(ip).history.as_ref().map(Vec::len), Some(4));
+    }
+
+    /// `--count N` ends right after the Nth probe instead of waiting one more interval.
+    #[tokio::test]
+    async fn count_does_not_wait_an_extra_interval() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut cfg = MonitorConfig::new(vec![ip], Some(2_000)).unwrap();
+        cfg.icmp = false;
+        cfg.count = Some(1);
+        cfg.tcp_ports.insert(ip, vec![port]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let started = Instant::now();
+        let fin = run_monitor_with(cfg, tx, CancellationToken::new(), &SocketBudget::new(4))
+            .await
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        assert_eq!(fin[0].sent, 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "took {:?}",
+            started.elapsed()
+        );
+        accept.abort();
     }
 }

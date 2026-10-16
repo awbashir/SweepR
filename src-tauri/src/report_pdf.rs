@@ -662,7 +662,46 @@ fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     )
 }
 
-fn cover(b: &mut Builder, has_logo: bool) {
+/// Placement `(x, y_top, w, h)` of a `width` x `height` image fitted (aspect ratio kept)
+/// and centred in the box `(bx, by, bw, bh)`.
+fn fit_box(width: u32, height: u32, bx: f32, by: f32, bw: f32, bh: f32) -> (f32, f32, f32, f32) {
+    let (iw, ih) = (width.max(1) as f32, height.max(1) as f32);
+    let scale = (bw / iw).min(bh / ih);
+    let (w, h) = (iw * scale, ih * scale);
+    (bx + (bw - w) / 2.0, by + (bh - h) / 2.0, w, h)
+}
+
+/// Title lines for the cover: the largest size (26 / 21 / 17 pt) at which the title wraps
+/// to at most two lines; at the smallest size the second line is cut with an ellipsis.
+fn cover_title(title: &str) -> (f32, Vec<String>) {
+    for size in [26.0, 21.0] {
+        let lines = wrap(title, Font::Bold, size, CONTENT_W - 40.0);
+        if lines.len() <= 2
+            && lines
+                .iter()
+                .all(|l| text_width(l, Font::Bold, size) <= CONTENT_W - 40.0)
+        {
+            return (size, lines);
+        }
+    }
+    let size = 17.0;
+    let mut lines = wrap(title, Font::Bold, size, CONTENT_W - 40.0);
+    let rest = if lines.len() > 1 {
+        lines[1..].join(" ")
+    } else {
+        String::new()
+    };
+    lines.truncate(1);
+    if let Some(first) = lines.first_mut() {
+        *first = fit(first, Font::Bold, size, CONTENT_W - 40.0);
+    }
+    if !rest.is_empty() {
+        lines.push(fit(&rest, Font::Bold, size, CONTENT_W - 40.0));
+    }
+    (size, lines)
+}
+
+fn cover(b: &mut Builder, logo: Option<(u32, u32)>) {
     let r = b.report;
     let band_h = 260.0;
     b.fill_rect(0.0, 0.0, PAGE_W, band_h, BRAND);
@@ -678,18 +717,12 @@ fn cover(b: &mut Builder, has_logo: bool) {
     }
     b.fill_rect(0.0, band_h, PAGE_W, PAGE_H - band_h, WHITE);
     draw_glyph(b, MARGIN, 44.0, 46.0, WHITE, BRAND);
-    if has_logo {
+    if let Some((w, h)) = logo {
         b.round_rect(PAGE_W - MARGIN - 128.0, 40.0, 128.0, 56.0, 8.0, WHITE);
+        let (x, y_top, iw, ih) = fit_box(w, h, PAGE_W - MARGIN - 122.0, 46.0, 116.0, 44.0);
         let c = b.c();
         c.save_state();
-        c.transform([
-            116.0,
-            0.0,
-            0.0,
-            44.0,
-            PAGE_W - MARGIN - 122.0,
-            PAGE_H - 90.0,
-        ]);
+        c.transform([iw, 0.0, 0.0, ih, x, PAGE_H - y_top - ih]);
         c.x_object(Name(b"Im1"));
         c.restore_state();
     }
@@ -702,12 +735,10 @@ fn cover(b: &mut Builder, has_logo: bool) {
         mix(WHITE, BRAND, 0.15),
     );
     let mut y = 150.0;
-    for line in wrap(&r.opts.title, Font::Bold, 26.0, CONTENT_W - 40.0)
-        .iter()
-        .take(3)
-    {
-        b.text(MARGIN, y, line, Font::Bold, 26.0, WHITE);
-        y += 31.0;
+    let (size, lines) = cover_title(&r.opts.title);
+    for line in &lines {
+        b.text(MARGIN, y, line, Font::Bold, size, WHITE);
+        y += size * 1.2;
     }
     if let Some(org) = &r.opts.org {
         b.text(
@@ -769,6 +800,17 @@ fn cover(b: &mut Builder, has_logo: bool) {
         Font::Bold,
         9.5,
         INK,
+    );
+    b.text_center(
+        MARGIN + 75.0,
+        b.y + 114.0,
+        &format!(
+            "graded on {} of {} checks",
+            score.evaluated_checks, score.total_checks
+        ),
+        Font::Regular,
+        7.5,
+        MUTED,
     );
     let s = &r.stats;
     let infra: Vec<String> = s
@@ -1134,7 +1176,7 @@ fn findings(b: &mut Builder) {
             MARGIN,
             CONTENT_W,
             &format!(
-                "The {shown} highest-priority of {} findings. The HTML report and JSON export list all findings with every affected device.",
+                "The {shown} highest-priority of {} findings. The HTML report lists every finding; the JSON export also lists every affected device (up to 100,000 per finding).",
                 r.audit.findings.len()
             ),
             Font::Regular,
@@ -1147,6 +1189,9 @@ fn findings(b: &mut Builder) {
         finding_block(b, f);
     }
 }
+
+/// Switch rows shown in the PDF before the rest is summarized.
+const MAX_PDF_SWITCHES: usize = 40;
 
 fn switch_section(b: &mut Builder) {
     let r = b.report;
@@ -1185,10 +1230,43 @@ fn switch_section(b: &mut Builder) {
         x += w;
     }
     b.y += 16.0;
-    for sw in &r.stats.switches {
+    // Switches with SNMP data first; a huge inventory is summarized.
+    let mut order: Vec<&SwitchUtil> = r.stats.switches.iter().collect();
+    order.sort_by_key(|s| !s.has_data);
+    for sw in order.iter().take(MAX_PDF_SWITCHES) {
         switch_row(b, sw, &cols);
     }
+    if order.len() > MAX_PDF_SWITCHES {
+        b.y += 4.0;
+        b.para(
+            MARGIN,
+            CONTENT_W,
+            &format!(
+                "and {} more switch(es); the HTML report and JSON export list all of them.",
+                order.len() - MAX_PDF_SWITCHES
+            ),
+            Font::Regular,
+            8.5,
+            MUTED,
+        );
+    }
     b.y += 6.0;
+    let poe: Vec<Vec<String>> = order
+        .iter()
+        .filter_map(|sw| {
+            crate::report_html::poe_line(sw)
+                .map(|l| vec![sw.name.clone(), l.trim_start_matches("PoE: ").to_string()])
+        })
+        .take(MAX_PDF_SWITCHES)
+        .collect();
+    if !poe.is_empty() {
+        b.subheading("Power over Ethernet");
+        b.table(
+            &[("Switch", 170.0, false), ("PoE", CONTENT_W - 170.0, false)],
+            &poe,
+        );
+        b.y += 6.0;
+    }
     let mut busiest: Vec<(String, String, u32, bool)> = r
         .stats
         .switches
@@ -1298,8 +1376,11 @@ fn switch_row(b: &mut Builder, sw: &SwitchUtil, cols: &[(&str, f32, bool)]) {
 
 /// Bulleted paragraph with a hanging indent.
 fn bullet(b: &mut Builder, text: &str) {
-    b.ensure(13.0);
+    // Room for the first line, so the dot and the text start on the same page; the dot is
+    // drawn before the paragraph (which may continue on the next page).
+    b.ensure(8.8 * 1.38 + 1.0);
     let y = b.y;
+    b.circle(MARGIN + 4.0, y + 5.8, 1.6, INK_2, None);
     b.para(
         MARGIN + 12.0,
         CONTENT_W - 12.0,
@@ -1308,7 +1389,6 @@ fn bullet(b: &mut Builder, text: &str) {
         8.8,
         INK_2,
     );
-    b.circle(MARGIN + 4.0, y + 5.8, 1.6, INK_2, None);
     b.y += 2.0;
 }
 
@@ -1370,7 +1450,7 @@ fn appendix(b: &mut Builder) {
     for l in LIMITATIONS {
         bullet(b, l);
     }
-    if r.input.skipped_records > 0 || r.input.meta.cancelled {
+    if r.input.skipped_records > 0 || r.input.meta.cancelled || !r.input.warnings.is_empty() {
         b.y += 6.0;
         b.subheading("Data quality");
         if r.input.meta.cancelled {
@@ -1396,6 +1476,9 @@ fn appendix(b: &mut Builder) {
                 INK_2,
             );
         }
+        for w in &r.input.warnings {
+            b.para(MARGIN, CONTENT_W, w, Font::Regular, 8.8, INK_2);
+        }
     }
 }
 
@@ -1406,7 +1489,7 @@ pub fn render_pdf(report: &Report) -> Result<Vec<u8>> {
         None => None,
     };
     let mut b = Builder::new(report);
-    cover(&mut b, image.is_some());
+    cover(&mut b, image.as_ref().map(|i| (i.width, i.height)));
     overview(&mut b);
     findings(&mut b);
     switch_section(&mut b);
@@ -1643,5 +1726,59 @@ mod tests {
         opts.logo = Some(logo);
         let pdf = render(&AuditInput::default(), &opts, ReportFormat::Pdf).unwrap();
         assert!(String::from_utf8_lossy(&pdf).contains("/SMask"));
+    }
+
+    #[test]
+    fn logo_keeps_its_aspect_ratio() {
+        // A square logo in the 116 x 44 box: 44 x 44, centred horizontally.
+        let (x, y, w, h) = fit_box(100, 100, 0.0, 0.0, 116.0, 44.0);
+        assert!((w - 44.0).abs() < 0.01 && (h - 44.0).abs() < 0.01);
+        assert!((x - 36.0).abs() < 0.01 && y.abs() < 0.01);
+        // A wide banner fills the width.
+        let (_, _, w, h) = fit_box(1000, 100, 0.0, 0.0, 116.0, 44.0);
+        assert!((w - 116.0).abs() < 0.01 && (h - 11.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn long_cover_titles_fit_the_band() {
+        let (size, lines) = cover_title("Short title");
+        assert_eq!((size, lines.len()), (26.0, 1));
+        let long = "Quarterly network security and hygiene audit of the headquarters campus, \
+                    both data centres and all branch offices including remote warehouses";
+        let (size, lines) = cover_title(long);
+        assert!(lines.len() <= 2, "{lines:?}");
+        assert!(lines
+            .iter()
+            .all(|l| text_width(l, Font::Bold, size) <= CONTENT_W - 40.0 + 0.01));
+        let (_, lines) = cover_title(&"W".repeat(300));
+        assert!(lines.len() <= 2 && lines.iter().all(|l| l.len() < 300));
+    }
+
+    /// A huge switch inventory is summarized (bounded table) and PoE budgets appear.
+    #[test]
+    fn many_switches_and_poe_render() {
+        let mut maps = Vec::new();
+        let mut infos = Vec::new();
+        for i in 0..120u32 {
+            maps.push(
+                json!({ "switchName": format!("sw{i}"), "portName": "Gi1/0/1",
+                              "mac": format!("00:11:22:00:{:02x}:{:02x}", i / 256, i % 256),
+                              "poe": { "status": "delivering", "watts": 5.5 } }),
+            );
+            infos.push(json!({ "ip": format!("10.1.{}.{}", i / 250, i % 250 + 1), "sysName": format!("sw{i}"),
+                               "poeBudget": { "nominalWatts": 370.0, "consumedWatts": 100.0 } }));
+        }
+        let input =
+            AuditInput::from_json_value(json!({ "portMappings": maps, "snmpInfos": infos }))
+                .unwrap();
+        let opts = ReportOptions::new(None, None);
+        let pdf = render(&input, &opts, ReportFormat::Pdf).unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        let report = crate::report::Report::build(&input, &opts);
+        let line = crate::report_html::poe_line(&report.stats.switches[0]).unwrap();
+        assert!(line.contains("100 W of 370 W"), "{line}");
+        let html = String::from_utf8(render(&input, &opts, ReportFormat::Html).unwrap()).unwrap();
+        assert!(html.contains("PoE: 100 W of 370 W budget in use (27%)"));
+        assert!(html.contains("Graded on "));
     }
 }

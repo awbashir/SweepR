@@ -3,8 +3,9 @@
 //! Runs once per scan after names / ports are known ([`enrich_services`]): the two multicast
 //! discoveries (IPv4, plus IPv6 when the scan has `ipv6`) and the SIP OPTIONS probes of the
 //! candidates run concurrently, then every *discovered* device whose address answered gets a
-//! sparse update carrying `ssdp` / `onvif` / `sip` and a `deviceKind`. Responders that were not
-//! discovered by the scan are not added (the same policy as SNMP polling).
+//! sparse update carrying `ssdp` / `onvif` / `sip` and a `deviceKind`. Multicast responders
+//! that were not discovered by the scan are dropped before any follow-up request (no
+//! description / ONVIF / WS-Transfer fetch goes to them), the same policy as SNMP polling.
 //!
 //! [`probe_host`] is the single-device variant behind the GUI `discover_services` command
 //! (unicast SSDP / WS-Discovery to the host, plus SIP OPTIONS).
@@ -45,19 +46,40 @@ pub fn sip_timeout(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.clamp(300, 1_500))
 }
 
+/// Name fragments that suggest a PBX or phone (SIP over UDP shows no open TCP port).
+const SIP_NAME_HINTS: &[&str] = &[
+    "pbx", "asterisk", "freepbx", "3cx", "voip", "sip", "phone", "yealink", "polycom", "cucm",
+];
+
 /// Hosts worth a SIP OPTIONS probe: TCP 5060/5061 open, a VoIP-maker OUI, a CDP/LLDP neighbor
-/// that advertises the Telephone capability — or every IPv4 host with `all`. Sorted and
+/// that advertises the Telephone capability (or a Cisco `SEP…` phone ID), a phone / PBX
+/// device kind, or a host name hinting at one — or every IPv4 host with `all`. Sorted and
 /// de-duplicated; only discovered hosts are ever probed.
 pub fn sip_candidates(devices: &[Device], all: bool) -> Vec<IpAddr> {
+    let name_hint = |d: &Device| {
+        [&d.hostname, &d.dns_name, &d.mdns_name, &d.smb_name]
+            .into_iter()
+            .flatten()
+            .any(|n| {
+                let n = n.to_ascii_lowercase();
+                SIP_NAME_HINTS.iter().any(|h| n.contains(h))
+            })
+    };
     let mut out: Vec<IpAddr> = devices
         .iter()
         .filter(|d| d.ip.is_ipv4())
         .filter(|d| {
             all || d.open_ports.iter().any(|p| SIP_HINT_PORTS.contains(p))
                 || d.vendor.as_deref().is_some_and(sip::is_voip_vendor)
-                || d.neighbor
-                    .as_ref()
-                    .is_some_and(|n| n.capabilities.contains(&Capability::Telephone))
+                || d.neighbor.as_ref().is_some_and(|n| {
+                    n.capabilities.contains(&Capability::Telephone)
+                        || n.device_id.starts_with("SEP")
+                })
+                || matches!(
+                    d.device_kind.as_deref(),
+                    Some(crate::models::DEVICE_KIND_VOIP_PHONE | crate::models::DEVICE_KIND_PBX)
+                )
+                || name_hint(d)
         })
         .map(|d| d.ip)
         .collect();
@@ -108,8 +130,15 @@ pub async fn enrich_services(
         Some(_) => sip_candidates(&devices, cfg.sip_all),
         None => Vec::new(),
     };
-    let ssdp_fut = ssdp::discover_ssdp(local_v4, v6_index, window, budget, &cancel);
-    let wsd_fut = wsd::discover_wsd(local_v4, v6_index, window, budget, &cancel);
+    // Follow-up requests (descriptions, ONVIF / WS-Transfer queries) only go to devices the
+    // scan discovered, never to arbitrary multicast responders.
+    let scope = ssdp::scope_of(
+        devices
+            .iter()
+            .flat_map(|d| std::iter::once(&d.ip).chain(&d.extra_ips)),
+    );
+    let ssdp_fut = ssdp::discover_ssdp(local_v4, v6_index, window, &scope, budget, &cancel);
+    let wsd_fut = wsd::discover_wsd(local_v4, v6_index, window, &scope, budget, &cancel);
     let sip_fut = async {
         let Some(local) = local_v4 else {
             return HashMap::new();
@@ -130,13 +159,21 @@ pub async fn enrich_services(
     };
     let (ssdp_map, wsd_map, sip_map) = tokio::join!(ssdp_fut, wsd_fut, sip_fut);
 
+    // Rows per address: in a multi-VLAN scan the same IP can be a different host in each
+    // VLAN, and a reply carries no VLAN, so it is attributed only when unambiguous.
+    let owners = address_owners(&devices);
     let (mut n_ssdp, mut n_wsd, mut n_sip) = (0usize, 0usize, 0usize);
     for dev in &devices {
         progress.add(1);
         if cancel.is_cancelled() {
             continue;
         }
-        let addrs = || std::iter::once(&dev.ip).chain(&dev.extra_ips);
+        let key = dev.key();
+        let addrs = || {
+            std::iter::once(&dev.ip)
+                .chain(&dev.extra_ips)
+                .filter(|ip| owners.get(*ip).is_some_and(|k| *k == key))
+        };
         let s = addrs().find_map(|ip| ssdp_map.get(ip)).cloned();
         let o = addrs().find_map(|ip| wsd_map.get(ip)).cloned();
         let p = addrs().find_map(|ip| sip_map.get(ip)).cloned();
@@ -156,6 +193,33 @@ pub async fn enrich_services(
             sip_candidates(&devices, cfg.sip_all).len()
         )))
         .await;
+}
+
+/// The row each address' service replies belong to: the only row with that address, else the
+/// untagged row (the scanner's own segment, which multicast and unicast replies reach
+/// directly) when exactly one exists. Addresses shared by several tagged rows are left out.
+pub fn address_owners(devices: &[Device]) -> HashMap<IpAddr, String> {
+    let mut rows: HashMap<IpAddr, Vec<&Device>> = HashMap::new();
+    for d in devices {
+        for ip in std::iter::once(&d.ip).chain(&d.extra_ips) {
+            let v = rows.entry(*ip).or_default();
+            if !v.iter().any(|x| x.key() == d.key()) {
+                v.push(d);
+            }
+        }
+    }
+    rows.into_iter()
+        .filter_map(|(ip, ds)| {
+            let owner = if ds.len() == 1 {
+                Some(ds[0])
+            } else {
+                let untagged: Vec<&Device> =
+                    ds.iter().copied().filter(|d| d.vlan_id.is_none()).collect();
+                (untagged.len() == 1).then(|| untagged[0])
+            };
+            owner.map(|d| (ip, d.key()))
+        })
+        .collect()
 }
 
 /// A sparse device update (same key as `dev`) carrying the service data, or `None` when no
@@ -257,14 +321,18 @@ mod tests {
         });
         let laptop = dev("10.0.0.5");
         let v6 = dev("fe80::1");
-        let devices = vec![laptop, open, yealink, phone_nbr, v6];
+        // A UDP-only PBX with no open TCP port, found by its name.
+        let mut pbx = dev("10.0.0.6");
+        pbx.dns_name = Some("freepbx01.corp.lan".into());
+        let devices = vec![laptop, open, yealink, phone_nbr, v6, pbx];
         let ips: Vec<String> = sip_candidates(&devices, false)
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(ips, vec!["10.0.0.2", "10.0.0.3", "10.0.0.4"]);
+        assert_eq!(ips, vec!["10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.6"]);
         // --sip-all: every IPv4 host.
-        assert_eq!(sip_candidates(&devices, true).len(), 4);
+        assert_eq!(sip_candidates(&devices, true).len(), 5);
+        assert!(crate::models::DEFAULT_PORTS.contains(&5060));
     }
 
     #[test]
@@ -355,5 +423,26 @@ mod tests {
             }
         }
         assert!(saw_summary);
+    }
+
+    /// Multi-VLAN scans: a service reply for an address several rows share goes to the
+    /// untagged row only, or nowhere when ambiguous.
+    #[test]
+    fn service_results_attach_only_to_unambiguous_rows() {
+        let mut a = dev("10.0.0.7");
+        a.vlan_id = Some(10);
+        let mut b = dev("10.0.0.7");
+        b.vlan_id = Some(20);
+        let untagged = dev("10.0.0.8");
+        let mut c = dev("10.0.0.8");
+        c.vlan_id = Some(30);
+        let solo = dev("10.0.0.9");
+        let owners = address_owners(&[a, b, untagged.clone(), c, solo.clone()]);
+        assert!(!owners.contains_key(&"10.0.0.7".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            owners[&"10.0.0.8".parse::<IpAddr>().unwrap()],
+            untagged.key()
+        );
+        assert_eq!(owners[&"10.0.0.9".parse::<IpAddr>().unwrap()], solo.key());
     }
 }

@@ -237,6 +237,7 @@ pub async fn wake_with(
     let mut sent = 0u32;
     let mut reached: Vec<String> = Vec::new();
     let mut last_err: Option<std::io::Error> = None;
+    let mut failures: Vec<String> = Vec::new();
     for round in 0..repeat {
         if round > 0 {
             tokio::time::sleep(REPEAT_GAP).await;
@@ -254,6 +255,10 @@ pub async fn wake_with(
                     }
                     Err(e) => {
                         tracing::debug!("Wake-on-LAN send to {to} failed: {e}");
+                        let line = format!("{to}: {e}");
+                        if failures.len() < 16 && !failures.contains(&line) {
+                            failures.push(line);
+                        }
                         last_err = Some(e);
                     }
                 }
@@ -270,6 +275,7 @@ pub async fn wake_with(
         packets_sent: sent,
         interface: iface.as_ref().map(|i| i.name.clone()),
         source_ip: (!source.is_unspecified()).then_some(IpAddr::V4(source)),
+        failures,
     })
 }
 

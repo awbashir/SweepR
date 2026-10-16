@@ -99,9 +99,41 @@ impl JobRegistry {
     }
 }
 
+/// Runs a closure when dropped: ends a job even when its task panics or its future is
+/// dropped half-way, so a registry slot can never leak.
+pub struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        OnDrop(Some(f))
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn slot_is_released_when_the_job_panics() {
+        let r = std::sync::Arc::new(JobRegistry::new("trace", 1));
+        let (id, _) = r.begin().unwrap();
+        let reg = r.clone();
+        let task = tokio::spawn(async move {
+            let _end = OnDrop::new(move || reg.end(id));
+            panic!("job crashed");
+        });
+        assert!(task.await.is_err());
+        assert!(!r.is_running(id));
+        assert!(r.begin().is_ok(), "the slot was released");
+    }
 
     #[test]
     fn jobs_are_capped_stopped_and_ended() {

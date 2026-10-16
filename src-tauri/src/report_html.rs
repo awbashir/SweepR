@@ -18,7 +18,7 @@ use crate::{
 
 const CSS: &str = include_str!("../templates/report.css");
 const JS: &str = include_str!("../templates/report.js");
-/// Most affected rows rendered per finding (the JSON keeps up to `audit::MAX_AFFECTED`).
+/// Most affected rows rendered per finding (the JSON export keeps up to `audit::MAX_AFFECTED`).
 const MAX_AFFECTED_ROWS: usize = 200;
 /// Most rows in the device-attachment table.
 const MAX_ATTACHMENT_ROWS: usize = 1000;
@@ -459,9 +459,12 @@ fn summary(h: &mut String, r: &Report) {
         h,
         "<div class=\"card grade-card\"><div class=\"stat\"><div class=\"label\">Risk grade</div></div>\
          <div class=\"grade grade-{g}\" role=\"img\" aria-label=\"Grade {g}\">{g}</div>\
-         <div class=\"score\">Score {sc} / 100</div>{cap}</div>",
+         <div class=\"score\">Score {sc} / 100</div>\
+         <div class=\"capped\">Graded on {ev} of {tot} checks</div>{cap}</div>",
         g = esc(&score.grade),
         sc = score.score,
+        ev = score.evaluated_checks,
+        tot = score.total_checks,
         cap = score
             .capped_by
             .as_deref()
@@ -709,6 +712,9 @@ fn switch_card(sw: &SwitchUtil, uplink: u32) -> String {
         sw.mac_total,
         sw.endpoints
     );
+    if let Some(line) = poe_line(sw) {
+        let _ = write!(s, "<div class=\"caption\">{}</div>", esc(&line));
+    }
     if !sw.busiest.is_empty() {
         let _ = write!(
             s,
@@ -741,6 +747,41 @@ fn switch_card(sw: &SwitchUtil, uplink: u32) -> String {
     }
     s.push_str("</div>");
     s
+}
+
+/// One line of PoE facts for a switch, when it reported any.
+pub(crate) fn poe_line(sw: &SwitchUtil) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(b) = &sw.poe_budget {
+        match (b.consumed_watts, b.nominal_watts) {
+            (Some(c), Some(n)) if n > 0.0 => parts.push(format!(
+                "{c:.0} W of {n:.0} W budget in use ({:.0}%)",
+                c * 100.0 / n
+            )),
+            (None, Some(n)) => parts.push(format!("{n:.0} W budget")),
+            (Some(c), None) => parts.push(format!("{c:.0} W in use")),
+            _ => {}
+        }
+        if let Some(p) = b.ports_delivering.filter(|p| *p > 0) {
+            parts.push(format!("{p} ports delivering"));
+        }
+    }
+    if sw.poe_ports_delivering > 0
+        && sw
+            .poe_budget
+            .as_ref()
+            .and_then(|b| b.ports_delivering)
+            .is_none()
+    {
+        parts.push(format!(
+            "{} mapped ports delivering{}",
+            sw.poe_ports_delivering,
+            sw.poe_watts
+                .map(|w| format!(" ({w:.1} W)"))
+                .unwrap_or_default()
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("PoE: {}", parts.join(" · ")))
 }
 
 fn switch_ports(h: &mut String, r: &Report) {
@@ -862,9 +903,17 @@ fn finding_detail(f: &Finding) -> String {
         }
         s.push_str("</tbody></table></div>");
         if f.affected_count > MAX_AFFECTED_ROWS.min(f.affected.len()) {
+            let where_ = if f.affected_truncated == 0 {
+                "complete list in the JSON export".to_string()
+            } else {
+                format!(
+                    "the JSON export lists the first {}",
+                    crate::audit::MAX_AFFECTED
+                )
+            };
             let _ = write!(
                 s,
-                "<div class=\"more\">and {} more (complete list in the JSON export)</div>",
+                "<div class=\"more\">and {} more ({where_})</div>",
                 f.affected_count - MAX_AFFECTED_ROWS.min(f.affected.len())
             );
         }
@@ -1127,8 +1176,11 @@ fn inventory_columns(r: &Report) -> Vec<Col> {
                     let _ = write!(
                         s,
                         " <span class=\"sub\">{}</span>",
-                        if days < 0 {
-                            format!("expired {} d ago", -days)
+                        if c.is_expired(env.now_ms) == Some(true) {
+                            match days.unsigned_abs() {
+                                0 => "expired today".to_string(),
+                                n => format!("expired {n} d ago"),
+                            }
                         } else {
                             format!("{days} d left")
                         }
@@ -1452,6 +1504,9 @@ fn appendix(h: &mut String, r: &Report) {
             r.input.skipped_records
         );
     }
+    for w in &r.input.warnings {
+        let _ = write!(h, "<li>{}</li>", esc(w));
+    }
     let partial: Vec<&str> = r
         .stats
         .switches
@@ -1491,6 +1546,30 @@ mod tests {
     use crate::audit::{tests::NOW, AuditInput};
     use crate::report::{render, ReportFormat, ReportOptions};
     use serde_json::json;
+
+    /// Optional columns appear only when some device has data: every scanned `Device`
+    /// serializes `null` for the optional fields, which must not count (review H1).
+    #[test]
+    fn null_optional_fields_do_not_add_columns() {
+        let mut d = crate::models::Device::new("10.0.0.5".parse().unwrap());
+        d.mac = Some("00:11:22:33:44:55".into());
+        let input =
+            AuditInput::from_json_value(json!([serde_json::to_value(&d).unwrap()])).unwrap();
+        let mut opts = ReportOptions::new(None, None);
+        opts.now_ms = NOW;
+        let report = crate::report::Report::build(&input, &opts);
+        let names: Vec<&str> = inventory_columns(&report).iter().map(|c| c.name).collect();
+        for absent in ["Web interface", "TLS certificate", "Voice VLAN"] {
+            assert!(!names.contains(&absent), "{absent} in {names:?}");
+        }
+        d.web_title = Some("Router".into());
+        let input =
+            AuditInput::from_json_value(json!([serde_json::to_value(&d).unwrap()])).unwrap();
+        let report = crate::report::Report::build(&input, &opts);
+        assert!(inventory_columns(&report)
+            .iter()
+            .any(|c| c.name == "Web interface"));
+    }
 
     const PAYLOADS: [&str; 4] = [
         "<script>alert(1)</script>",
