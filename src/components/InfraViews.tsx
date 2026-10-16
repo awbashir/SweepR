@@ -2,9 +2,10 @@
 
 import { useMemo, type ReactNode } from "react";
 import { Layers, Radar, Share2 } from "lucide-react";
-import type { CdpLldpNeighbor, VlanInfo } from "../types.ts";
+import type { CdpLldpNeighbor, SwitchPortMapping, VlanInfo } from "../types.ts";
+import { formatWatts, poeSummary, poeTone } from "../lib/services.ts";
 import type { DeviceRow } from "../lib/store.ts";
-import { Button, TextInput, cx } from "./ui.tsx";
+import { Button, TONE_TEXT_CLASS, TextInput, cx } from "./ui.tsx";
 
 function Table({ head, children, label }: { head: string[]; children: ReactNode; label: string }) {
   return (
@@ -44,6 +45,8 @@ function Empty({ icon, title, children }: { icon: ReactNode; title: string; chil
 export function VlanView({
   vlans,
   rows,
+  neighbors,
+  portMappings,
   running,
   discoveryTimeout,
   onDiscoveryTimeout,
@@ -52,6 +55,8 @@ export function VlanView({
 }: {
   vlans: VlanInfo[];
   rows: DeviceRow[];
+  neighbors: CdpLldpNeighbor[];
+  portMappings: SwitchPortMapping[];
   running: boolean;
   discoveryTimeout: number;
   onDiscoveryTimeout: (n: number) => void;
@@ -63,6 +68,39 @@ export function VlanView({
     for (const r of rows) if (r.device.vlanId !== null) m.set(r.device.vlanId, (m.get(r.device.vlanId) ?? 0) + 1);
     return m;
   }, [rows]);
+  // Voice VLAN use (devices / switch ports / neighbor adverts naming it) and PoE drawn by the
+  // devices on it (their data VLAN or their voice VLAN).
+  const voice = useMemo(() => {
+    const m = new Map<number, { phones: number; ports: number; adverts: number; watts: number; powered: number }>();
+    const get = (id: number) => {
+      let e = m.get(id);
+      if (!e) m.set(id, (e = { phones: 0, ports: 0, adverts: 0, watts: 0, powered: 0 }));
+      return e;
+    };
+    for (const r of rows) {
+      const d = r.device;
+      if (d.voiceVlan != null) get(d.voiceVlan).phones++;
+      const w = d.poe?.watts;
+      if (w != null) {
+        const id = d.voiceVlan ?? d.vlanId;
+        if (id != null) {
+          const e = get(id);
+          e.watts += w;
+          e.powered++;
+        }
+      }
+    }
+    const seenPorts = new Set<string>();
+    for (const pm of portMappings) {
+      if (pm.voiceVlan == null) continue;
+      const k = `${pm.switchName}|${pm.portName}`;
+      if (seenPorts.has(k)) continue;
+      seenPorts.add(k);
+      get(pm.voiceVlan).ports++;
+    }
+    for (const n of neighbors) if (n.voiceVlan != null) get(n.voiceVlan).adverts++;
+    return m;
+  }, [rows, portMappings, neighbors]);
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-2 border-b border-line-soft bg-bg px-3 py-1.5">
@@ -96,7 +134,7 @@ export function VlanView({
           needs raw access: run SweepR via <code className="font-mono">sudo</code>.
         </Empty>
       ) : (
-        <Table label="Discovered VLANs" head={["VLAN ID", "Name", "Sources", "Interface", "Switch", "Frames", "Devices", "Last seen"]}>
+        <Table label="Discovered VLANs" head={["VLAN ID", "Name", "Sources", "Interface", "Switch", "Frames", "Devices", "Voice", "PoE (W)", "Last seen"]}>
           {vlans.map((v, i) => (
             <tr key={v.id} className={cx(i % 2 === 1 && "bg-row-alt")}>
               <td className={cx(td, "font-medium tabular")}>{v.id}</td>
@@ -114,12 +152,40 @@ export function VlanView({
               <td className={td}>{v.switchName ?? ""}</td>
               <td className={cx(td, "tabular")}>{v.framesSeen.toLocaleString()}</td>
               <td className={cx(td, "tabular")}>{perVlan.get(v.id)?.toLocaleString() ?? ""}</td>
+              <td className={td}>
+                <VoiceCell v={voice.get(v.id)} />
+              </td>
+              <td className={cx(td, "font-mono text-[11.5px] tabular")}>
+                {(() => {
+                  const e = voice.get(v.id);
+                  return e && e.powered > 0 ? (
+                    <span title={`${e.powered.toLocaleString()} powered device${e.powered === 1 ? "" : "s"} on this VLAN (data or voice)`}>{formatWatts(e.watts)}</span>
+                  ) : (
+                    ""
+                  );
+                })()}
+              </td>
               <td className={cx(td, "text-muted")}>{ago(v.lastSeenMs)}</td>
             </tr>
           ))}
         </Table>
       )}
     </div>
+  );
+}
+
+function VoiceCell({ v }: { v: { phones: number; ports: number; adverts: number } | undefined }) {
+  if (!v || v.phones + v.ports + v.adverts === 0) return null;
+  const parts = [
+    v.phones > 0 ? `${v.phones.toLocaleString()} device${v.phones === 1 ? "" : "s"}` : null,
+    v.ports > 0 ? `${v.ports.toLocaleString()} switch port${v.ports === 1 ? "" : "s"}` : null,
+    v.adverts > 0 ? `${v.adverts} CDP/LLDP advert${v.adverts === 1 ? "" : "s"}` : null,
+  ].filter(Boolean);
+  return (
+    <span className="flex items-center gap-1.5" title={`Voice VLAN for ${parts.join(", ")}`}>
+      <span className="rounded bg-accent-soft px-1.5 text-[10px] font-semibold text-accent uppercase">Voice</span>
+      {v.phones > 0 && <span className="tabular text-muted">{v.phones.toLocaleString()}</span>}
+    </span>
   );
 }
 
@@ -145,7 +211,7 @@ export function NeighborView({
   return (
     <Table
       label="CDP and LLDP neighbors"
-      head={["Protocol", "System Name", "Platform", "Remote Port", "Management IP", "Native VLAN", "Voice VLAN", "Capabilities", "Local Port", "Software", "Last seen"]}
+      head={["Protocol", "System Name", "Platform", "Remote Port", "Management IP", "Native VLAN", "Voice VLAN", "PoE (W)", "Capabilities", "Local Port", "Software", "Last seen"]}
     >
       {sorted.map((n, i) => (
         <tr key={`${n.protocol}|${n.deviceId}|${n.portId ?? ""}`} className={cx(i % 2 === 1 && "bg-row-alt")}>
@@ -166,6 +232,9 @@ export function NeighborView({
           </td>
           <td className={cx(td, "tabular")}>{n.nativeVlan ?? ""}</td>
           <td className={cx(td, "tabular")}>{n.voiceVlan ?? ""}</td>
+          <td className={cx(td, "font-mono text-[11.5px] tabular")}>
+            <NeighborPoe n={n} />
+          </td>
           <td className={td}>{n.capabilities.join(", ").replace(/_/g, " ")}</td>
           <td className={td}>{n.localInterface}</td>
           <td className={cx(td, "max-w-[280px] truncate")} title={n.softwareVersion ?? n.systemDescription ?? ""}>
@@ -175,5 +244,20 @@ export function NeighborView({
         </tr>
       ))}
     </Table>
+  );
+}
+
+/** Headline PoE of an advert: drawn power (coloured by load), else the budget it offers. */
+function NeighborPoe({ n }: { n: CdpLldpNeighbor }) {
+  const info = n.poeInfo ?? null;
+  const w = n.poeWatts ?? info?.watts ?? info?.maxWatts ?? null;
+  if (w === null) return null;
+  const drawn = info?.watts != null;
+  const tone = drawn ? poeTone(info) : "none";
+  return (
+    <span className={cx(drawn ? TONE_TEXT_CLASS[tone] : "text-muted")} title={info ? poeSummary(info) : `${formatWatts(w)} W`}>
+      {!drawn && info?.maxWatts != null ? "≤" : ""}
+      {formatWatts(w)}
+    </span>
   );
 }

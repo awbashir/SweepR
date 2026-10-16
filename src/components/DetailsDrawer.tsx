@@ -19,8 +19,10 @@ import { PORT_PRESETS, serviceName } from "../lib/ports.ts";
 import { parsePorts } from "../lib/parse.ts";
 import { Button, RoleIcon, SectionTitle, Select, TextInput, cx } from "./ui.tsx";
 import { IperfSection, LatencySection, TraceSection, WebSection } from "./DrawerTools.tsx";
+import { DhcpSection, PoeVoiceSection, ServicesSection, type ServiceQueryState } from "./DrawerServices.tsx";
+import { formatWatts, poeSummary } from "../lib/services.ts";
 
-export type DrawerSection = "latency" | "web" | "trace" | "iperf";
+export type DrawerSection = "latency" | "web" | "trace" | "iperf" | "services";
 
 export interface PortScanState {
   status: "running" | "done" | "error";
@@ -61,6 +63,8 @@ interface DrawerProps {
   onWake: () => void;
   onGrabWeb: () => void;
   onOpenWebUrl: (url: string) => void;
+  serviceQuery: ServiceQueryState | undefined;
+  onDiscoverServices: () => void;
   /** Start requests from the row menu (increasing tokens). */
   traceToken: number;
   iperfToken: number;
@@ -145,6 +149,8 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
     return m;
   }, [mappings, p.rows]);
   const macCounts = normalizePortMacCounts(p.snmp?.portMacCounts);
+  // PoE / voice VLAN columns only when some port reported them.
+  const camPoe = useMemo(() => mappings.some((m) => m.poe != null || m.voiceVlan != null), [mappings]);
 
   const preset = PORT_PRESETS.find((x) => x.id === p.portPreset);
   const custom = parsePorts(p.customPorts);
@@ -241,6 +247,9 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
 
       <LatencySection ip={d.ip} live={p.liveLatency} pinned={p.pinned} onTogglePin={p.onTogglePin} onEnableLive={p.onEnableLive} />
       <WebSection row={row} onGrab={p.onGrabWeb} onOpenUrl={p.onOpenWebUrl} onCopy={p.onCopy} />
+      <ServicesSection row={row} query={p.serviceQuery} onDiscover={p.onDiscoverServices} onOpenUrl={p.onOpenWebUrl} onCopy={p.onCopy} />
+      <PoeVoiceSection row={row} budget={p.snmp?.poeBudget} mappings={mappings} />
+      <DhcpSection fp={d.dhcpFingerprint} />
 
       <SectionTitle>Port Scanner</SectionTitle>
       <div className="flex items-center gap-1.5">
@@ -365,9 +374,12 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
             <p className="text-muted">No MAC → port mappings for this device yet. Query SNMP to read its bridge table.</p>
           ) : (
             <MiniTable
-              head={["Port", "VLAN", "MAC", "IP"]}
-              mono={[false, false, true, true]}
-              rows={mappings.map((m) => [m.portName, m.vlanId !== null ? String(m.vlanId) : "", m.mac, macToIp.get(normMac(m.mac)) ?? ""])}
+              head={camPoe ? ["Port", "VLAN", "MAC", "IP", "PoE W", "Voice"] : ["Port", "VLAN", "MAC", "IP"]}
+              mono={[false, false, true, true, true, false]}
+              rows={mappings.map((m) => {
+                const base = [m.portName, m.vlanId !== null ? String(m.vlanId) : "", m.mac, macToIp.get(normMac(m.mac)) ?? ""];
+                return camPoe ? [...base, m.poe?.watts != null ? formatWatts(m.poe.watts) : "", m.voiceVlan != null ? String(m.voiceVlan) : ""] : base;
+              })}
               onRowClick={(i) => {
                 const ip = macToIp.get(normMac(mappings[i]?.mac));
                 if (ip) p.onSelectIp(ip);
@@ -410,6 +422,9 @@ function NeighborCard({ n, onSelectIp }: { n: CdpLldpNeighbor; onSelectIp: (ip: 
         </KV>
         <KV k="Native VLAN">{orDash(n.nativeVlan)}</KV>
         <KV k="Voice VLAN">{orDash(n.voiceVlan)}</KV>
+        {(n.poeWatts != null || n.poeInfo) && (
+          <KV k="PoE">{n.poeInfo ? poeSummary(n.poeInfo) || `${formatWatts(n.poeWatts)} W` : `${formatWatts(n.poeWatts)} W`}</KV>
+        )}
         <KV k="Capabilities">{orDash(n.capabilities.join(", ").replace(/_/g, " "))}</KV>
         <KV k="VTP domain">{orDash(n.vtpDomain)}</KV>
         <KV k="TTL">{n.ttlSecs} s</KV>
@@ -436,7 +451,7 @@ function MiniTable({
         <thead className="sticky top-0 bg-chrome">
           <tr>
             {head.map((h) => (
-              <th key={h} scope="col" className="border-b border-line px-2 py-[3px] text-left font-medium text-muted">
+              <th key={h} scope="col" className="border-b border-line px-2 py-[3px] text-left font-medium whitespace-nowrap text-muted">
                 {h}
               </th>
             ))}

@@ -14,12 +14,14 @@ import type {
   ScanEventPayload,
   ScanProgress,
   ScanSummary,
+  ServiceDiscovery,
   SnmpDeviceInfo,
   SwitchPortMapping,
   VlanInfo,
   WebIdentity,
 } from "../types.ts";
 import { deviceKey, ipSortKey } from "./ip.ts";
+import { deviceKindLabel, deviceKindOf, dhcpOsLabel, modelFirmware, withServiceDiscovery } from "./services.ts";
 
 export interface DeviceRow {
   key: string;
@@ -34,6 +36,12 @@ export interface DeviceRow {
   /** `Cisco-SW01 [Gi1/0/24]` */
   switchPort: string;
   ports: string;
+  /** Device kind label ("IP Phone"; "" when unknown). */
+  kind: string;
+  /** "SIP-T54W / 96.86.0.5" (SIP, then ONVIF, then UPnP; "" when unknown). */
+  modelFw: string;
+  /** "Windows (high)" ("" when unknown). */
+  dhcpOs: string;
   /** Numeric IP order (IPv4 before IPv6) then VLAN. */
   ipSort: string;
   /** Lower-case text of every visible column, for the search box. */
@@ -64,6 +72,9 @@ export interface StoreSnapshot {
   scanId: number | null;
   overrides: Overrides;
   snmp: Record<string, SnmpDeviceInfo>;
+  /** Wall-clock start / end of the latest job (report metadata). */
+  jobStartedMs: number | null;
+  jobFinishedMs: number | null;
 }
 
 const MAX_LOGS = 1000;
@@ -99,6 +110,11 @@ export function buildRow(key: string, device: Device, override: DeviceOverride |
   const comments = overrideText(override, "comments") ?? "";
   const switchPort = switchPortLabel(device.switchPort);
   const ports = device.openPorts.join(", ");
+  const kindId = deviceKindOf(device);
+  const kind = deviceKindLabel(kindId);
+  const modelFw = modelFirmware(device);
+  const dhcpOs = dhcpOsLabel(device.dhcpFingerprint);
+  const fp = device.dhcpFingerprint;
   const search = [
     device.ip,
     ...device.extraIps,
@@ -121,6 +137,23 @@ export function buildRow(key: string, device: Device, override: DeviceOverride |
     device.webServer,
     device.tlsCert?.subjectCn,
     ...(device.warnings ?? []),
+    kindId,
+    kind,
+    modelFw,
+    device.ssdp?.friendlyName,
+    device.ssdp?.manufacturer,
+    device.ssdp?.serialNumber,
+    device.onvif?.manufacturer,
+    device.onvif?.name,
+    device.onvif?.serialNumber,
+    device.sip?.vendor,
+    device.sip?.userAgent,
+    device.sip?.server,
+    device.voiceVlan != null ? `voice ${device.voiceVlan}` : null,
+    device.poe ? "poe" : null,
+    dhcpOs,
+    fp?.vendorClass,
+    fp?.hostname,
   ]
     .filter((v) => v !== null && v !== undefined && v !== "")
     .join("\u0001")
@@ -133,6 +166,9 @@ export function buildRow(key: string, device: Device, override: DeviceOverride |
     comments,
     switchPort,
     ports,
+    kind,
+    modelFw,
+    dhcpOs,
     ipSort: `${ipSortKey(device.ip)}@${vlanSort}`,
     search,
   };
@@ -186,6 +222,8 @@ export class ScanStore {
   private starting = false;
   private jobKind: JobKind | null = null;
   private scanId: number | null = null;
+  private jobStartedMs: number | null = null;
+  private jobFinishedMs: number | null = null;
   /** Events that arrived before `start_*` resolved with their job id. */
   private buffer: ScanEventPayload[] = [];
   /** Token of the latest `beginStart`; replies to older starts are ignored. */
@@ -270,6 +308,8 @@ export class ScanStore {
       scanId: this.scanId,
       overrides: this.overrides,
       snmp: this.snmp,
+      jobStartedMs: this.jobStartedMs,
+      jobFinishedMs: this.jobFinishedMs,
     };
     this.dirty = { rows: false, vlans: false, neighbors: false, mappings: false, other: false };
     return snap;
@@ -292,6 +332,8 @@ export class ScanStore {
     this.latestFailed = false;
     this.progress = null;
     this.summary = null;
+    this.jobStartedMs = Date.now();
+    this.jobFinishedMs = null;
     this.markDirty("other");
     return ++this.startToken;
   }
@@ -377,6 +419,7 @@ export class ScanStore {
         break;
       case "finished":
         this.summary = event.data;
+        this.jobFinishedMs = Date.now();
         this.running = false;
         this.starting = false;
         if (this.progress) this.progress = { ...this.progress, phase: "done" };
@@ -458,6 +501,15 @@ export class ScanStore {
     const dev = this.devices.get(key);
     if (!dev) return;
     this.devices.set(key, withWebIdentity(dev, wi));
+    this.rowCache.delete(key);
+    this.markDirty("rows");
+  }
+
+  /** Merge a `discover_services` result into the device (local only, like `setOpenPorts`). */
+  setServices(key: string, sd: ServiceDiscovery): void {
+    const dev = this.devices.get(key);
+    if (!dev) return;
+    this.devices.set(key, withServiceDiscovery(dev, sd));
     this.rowCache.delete(key);
     this.markDirty("rows");
   }

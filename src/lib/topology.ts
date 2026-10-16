@@ -15,10 +15,13 @@ import type {
   Device,
   DeviceRole,
   SnmpDeviceInfo,
+  PoeInfo,
   SwitchPortMapping,
   VlanInfo,
 } from "../types.ts";
 import { normMac } from "./infra.ts";
+import { budgetUsage, deviceKindOf, portPoeTotal } from "./services.ts";
+import type { Tone } from "./latency.ts";
 import { ipSortKey } from "./ip.ts";
 import { formatPorts } from "./parse.ts";
 
@@ -64,6 +67,8 @@ export type ClusterKind = "vlan" | "port" | "wireless" | "unattached";
 export type TopoStatus = "ok" | "warn" | "unknown";
 
 export interface TopoMember {
+  deviceKind: string | null;
+  poeWatts: number | null;
   key: string;
   label: string;
   ip: string;
@@ -101,6 +106,12 @@ export interface TopoNode {
   expanded: boolean;
   /** Members not shown in an expanded cluster ("+N more"). */
   more: number;
+  /** Endpoint kind from service discovery (`voip_phone`, `camera`, ...). */
+  deviceKind: string | null;
+  /** PoE the endpoint draws. */
+  poe: PoeInfo | null;
+  /** Switches: PoE budget (SNMP) or the PoE drawn on its ports (CAM entries). */
+  poeUsage: { consumed: number | null; nominal: number | null; pct: number | null; tone: Tone; ports: number } | null;
 }
 
 export type TopoEdgeKind = "trunk" | "access" | "wireless" | "inferred";
@@ -496,6 +507,8 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
   /** Port the backend chose for a MAC (`device.switchPort`), preferred on ties. */
   const preferred = new Map<string, Loc>();
   let camEntries = 0;
+  /** CAM entries carrying PoE, per switch node (PoE drawn when SNMP has no budget). */
+  const portPoe = new Map<string, SwitchPortMapping[]>();
 
   const addCam = (m: SwitchPortMapping, isPreferred: boolean): void => {
     const mac = normMac(m.mac);
@@ -520,6 +533,11 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
       vs.add(m.vlanId);
     }
     if (isPreferred) preferred.set(mac, { sw, port });
+    if (m.poe && m.poe.watts !== null) {
+      let pp = portPoe.get(sw);
+      if (!pp) portPoe.set(sw, (pp = []));
+      pp.push({ ...m, portName: port });
+    }
   };
   for (const m of input.portMappings) {
     addCam(m, false);
@@ -839,6 +857,9 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
     members: [],
     expanded: false,
     more: 0,
+    deviceKind: null,
+    poe: null,
+    poeUsage: null,
   });
 
   // Anchor for endpoints nobody knows the switch of.
@@ -869,6 +890,11 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
     out.vlans = [...(infraVlans.get(n.id) ?? [])].sort((a, b) => a - b);
     out.deviceKey = n.row?.key ?? null;
     out.memberKeys = n.row ? [n.row.key, ...n.aliasKeys] : [];
+    if (n.role === "switch") {
+      const usage = budgetUsage(n.snmp?.poeBudget);
+      const drawn = usage ? null : portPoeTotal(portPoe.get(n.id) ?? []);
+      out.poeUsage = usage ?? (drawn ? { consumed: drawn.watts, nominal: null, pct: null, tone: "none", ports: drawn.ports } : null);
+    }
     if (n.synthetic) {
       out.status = "unknown";
       out.note = "Known only from CAM tables / CDP-LLDP; not answering the scan.";
@@ -888,6 +914,8 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
   };
 
   const memberOf = (ep: Endpoint): TopoMember => ({
+    deviceKind: deviceKindOf(ep.row.device),
+    poeWatts: ep.row.device.poe?.watts ?? null,
     key: ep.row.key,
     label: displayName(ep.row.device, ep.row.hostname),
     ip: ep.row.device.ip,
@@ -910,6 +938,8 @@ export function buildTopology(input: TopologyInput, opts: TopologyOptions = {}):
     out.deviceKey = ep.row.key;
     out.memberKeys = [ep.row.key];
     out.port = ep.port;
+    out.deviceKind = deviceKindOf(d);
+    out.poe = d.poe ?? null;
     nodes.push(out);
     nodeOfKey.set(ep.row.key, id);
     const unknown = ep.unattached;

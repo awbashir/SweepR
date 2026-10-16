@@ -1,10 +1,12 @@
 // SNMP settings and "Open custom URL" dialogs.
 
 import { useState, type ReactNode } from "react";
-import type { InterfaceInfo, SnmpAuthProtocol, SnmpConfig, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, WakeOptions } from "../types.ts";
+import { LoaderCircle } from "lucide-react";
+import type { InterfaceInfo, ReportFormat, SnmpAuthProtocol, SnmpConfig, SnmpPrivProtocol, SnmpV3Credentials, SnmpVersion, WakeOptions } from "../types.ts";
 import { DEFAULT_SNMP, interfaceLabel, snmpV3Problem } from "../settings.ts";
 import { ipv4ToNumber } from "../lib/ip.ts";
 import { parseSecureOn, parseWolMac } from "../lib/wol.ts";
+import { DEFAULT_REPORT_TITLE } from "../lib/report.ts";
 import { Modal } from "./Modal.tsx";
 import { Button, Select, TextInput, Toggle } from "./ui.tsx";
 
@@ -396,6 +398,120 @@ export function WakeDialog({
           A directed broadcast (e.g. <code className="font-mono">10.20.0.255</code>) reaches a remote subnet only if its router forwards
           directed broadcasts.
         </p>
+      </form>
+    </Modal>
+  );
+}
+
+export interface ReportDialogValues {
+  title: string;
+  org: string;
+  onlyShown: boolean;
+}
+
+const REPORT_FORMAT_LABEL: Record<ReportFormat, string> = {
+  html: "HTML report",
+  pdf: "PDF summary",
+  json: "JSON findings",
+};
+
+/** Title / organization for the audit report, then the backend's save dialog. */
+export function ReportDialog({
+  format,
+  total,
+  shown,
+  initial,
+  busy,
+  error,
+  onGenerate,
+  onClose,
+}: {
+  format: ReportFormat;
+  total: number;
+  /** Devices matching the current search / role filter. */
+  shown: number;
+  initial: { title: string; org: string };
+  /** Status text while building / saving (`null` when idle). */
+  busy: string | null;
+  error: string | null;
+  onGenerate: (v: ReportDialogValues) => void;
+  onClose: () => void;
+}) {
+  const [title, setTitle] = useState(initial.title);
+  const [org, setOrg] = useState(initial.org);
+  const [onlyShown, setOnlyShown] = useState(false);
+  const filtered = shown !== total;
+  const count = onlyShown && filtered ? shown : total;
+  const submit = (): void => {
+    if (busy === null) onGenerate({ title, org, onlyShown: onlyShown && filtered });
+  };
+  return (
+    <Modal
+      title={`Audit Report · ${REPORT_FORMAT_LABEL[format]}`}
+      onClose={busy === null ? onClose : () => undefined}
+      width={460}
+      footer={
+        <>
+          {busy !== null && (
+            <span className="mr-auto flex items-center gap-1.5 text-muted" aria-live="polite">
+              <LoaderCircle size={13} className="animate-spin" aria-hidden />
+              {busy}
+            </span>
+          )}
+          <Button onClick={onClose} disabled={busy !== null}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={submit} disabled={busy !== null || count === 0}>
+            Save Report…
+          </Button>
+        </>
+      }
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <Row label="Title" htmlFor="report-title">
+          <TextInput
+            id="report-title"
+            value={title}
+            maxLength={200}
+            placeholder={DEFAULT_REPORT_TITLE}
+            onChange={(e) => setTitle(e.target.value)}
+            className="flex-1"
+          />
+        </Row>
+        <Row label="Organization" htmlFor="report-org">
+          <TextInput
+            id="report-org"
+            value={org}
+            maxLength={200}
+            placeholder="Customer or site (optional)"
+            onChange={(e) => setOrg(e.target.value)}
+            className="flex-1"
+          />
+        </Row>
+        {filtered && (
+          <Row label="">
+            <label className="flex items-center gap-1.5 text-muted">
+              <input
+                type="checkbox"
+                checked={onlyShown}
+                onChange={(e) => setOnlyShown(e.target.checked)}
+                className="accent-[var(--accent)]"
+              />
+              Only the {shown.toLocaleString()} devices matching the current filter
+            </label>
+          </Row>
+        )}
+        <p className="mt-2 text-[11px] text-muted">
+          {count.toLocaleString()} device{count === 1 ? "" : "s"}, VLANs, CDP/LLDP neighbors, MAC-to-port entries and SNMP results go into the
+          report with your hostnames, comments and live latency. SNMP communities and SNMPv3 passwords are never included. You choose where
+          to save it next.
+        </p>
+        {error && <p className="selectable mt-2 text-danger">{error}</p>}
       </form>
     </Modal>
   );

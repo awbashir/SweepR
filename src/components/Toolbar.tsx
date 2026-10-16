@@ -3,7 +3,10 @@
 import { forwardRef, useRef, useState } from "react";
 import {
   Activity,
+  ChevronDown,
   Download,
+  FileChartColumn,
+  ScanSearch,
   Ellipsis,
   Eraser,
   FileBraces,
@@ -21,7 +24,7 @@ import {
   Power,
   X,
 } from "lucide-react";
-import type { DeviceRole, ExportFormat, InterfaceInfo } from "../types.ts";
+import type { DeviceRole, ExportFormat, InterfaceInfo, ReportFormat } from "../types.ts";
 import { ROLE_LABEL } from "../types.ts";
 import { interfaceLabel, subnetHint, vlanSelectionFrom, type ScanSettings, type VlanMode } from "../settings.ts";
 import { parsePorts, parseRange } from "../lib/parse.ts";
@@ -52,6 +55,10 @@ interface ToolbarProps {
   latencyIntervalMs: number;
   onLatencyInterval: (ms: number) => void;
   onWakeByMac: () => void;
+  /** Audit report for all `reportCount` devices. */
+  onReport: (format: ReportFormat) => void;
+  reportCount: number;
+  reportBusy: boolean;
 }
 
 export function Toolbar(p: ToolbarProps) {
@@ -59,6 +66,65 @@ export function Toolbar(p: ToolbarProps) {
   const [exportMenu, setExportMenu] = useState<MenuState | null>(null);
   const exportBtn = useRef<HTMLButtonElement>(null);
   const moreBtn = useRef<HTMLButtonElement>(null);
+  const discoveryBtn = useRef<HTMLButtonElement>(null);
+  const reportBtn = useRef<HTMLButtonElement>(null);
+
+  // Built on every render so the check marks follow the settings while the menu is open.
+  const discoveryItems = (): MenuState["items"] => [
+    { kind: "header", label: "Deeper discovery during scans" },
+    {
+      kind: "check",
+      label: "Discover UPnP/WSD/ONVIF/SIP services",
+      checked: s.discoverServices,
+      keepOpen: true,
+      disabled: p.running,
+      onSelect: () => p.onSettings({ discoverServices: !s.discoverServices }),
+    },
+    {
+      kind: "check",
+      label: "Probe SIP on all hosts",
+      checked: s.discoverServices && s.sipAll,
+      keepOpen: true,
+      disabled: p.running || !s.discoverServices,
+      onSelect: () => p.onSettings({ sipAll: !s.sipAll }),
+    },
+    {
+      kind: "check",
+      label: "Passive DHCP fingerprinting (needs root)",
+      checked: s.dhcpFingerprint,
+      keepOpen: true,
+      disabled: p.running,
+      onSelect: () => p.onSettings({ dhcpFingerprint: !s.dhcpFingerprint }),
+    },
+    {
+      kind: "check",
+      label: "Resolve DNS / mDNS / NetBIOS names",
+      checked: s.resolveNames,
+      keepOpen: true,
+      disabled: p.running,
+      onSelect: () => p.onSettings({ resolveNames: !s.resolveNames }),
+    },
+  ];
+  const [discoveryAt, setDiscoveryAt] = useState<{ x: number; y: number } | null>(null);
+  const openDiscovery = (): void => {
+    const r = discoveryBtn.current?.getBoundingClientRect();
+    setDiscoveryAt({ x: r ? r.left : 0, y: r ? r.bottom + 4 : 0 });
+  };
+
+  const openReport = (): void => {
+    const r = reportBtn.current?.getBoundingClientRect();
+    setExportMenu({
+      x: r ? r.left : 0,
+      y: r ? r.bottom + 4 : 0,
+      label: "Audit report",
+      items: [
+        { kind: "header", label: `Audit report · ${p.reportCount.toLocaleString()} device${p.reportCount === 1 ? "" : "s"}` },
+        { kind: "item", label: "HTML Report…", icon: FileChartColumn, onSelect: () => p.onReport("html") },
+        { kind: "item", label: "PDF Summary…", icon: FileText, onSelect: () => p.onReport("pdf") },
+        { kind: "item", label: "JSON Findings…", icon: FileBraces, onSelect: () => p.onReport("json") },
+      ],
+    });
+  };
 
   const openMore = (): void => {
     const r = moreBtn.current?.getBoundingClientRect();
@@ -134,8 +200,8 @@ export function Toolbar(p: ToolbarProps) {
           </option>
         ))}
       </Select>
-      <label className="flex min-w-[150px] flex-1 items-center gap-1.5" title="CIDR, start-end range or comma list; empty scans the interface subnet">
-        <span className="hidden whitespace-nowrap text-muted min-[1280px]:inline">Scan from</span>
+      <label className="flex min-w-[130px] flex-1 items-center gap-1.5" title="CIDR, start-end range or comma list; empty scans the interface subnet">
+        <span className="hidden whitespace-nowrap text-muted min-[1680px]:inline">Scan from</span>
         <TextInput
           value={s.range}
           onChange={(e) => p.onSettings({ range: e.target.value })}
@@ -192,6 +258,18 @@ export function Toolbar(p: ToolbarProps) {
       <Button icon={KeyRound} onClick={p.onOpenSnmp} pressed={s.snmpEnabled} title="SNMP settings">
         SNMP{s.snmpEnabled ? ` ${s.snmp.version}` : ""}
       </Button>
+      <Button
+        ref={discoveryBtn}
+        icon={ScanSearch}
+        onClick={openDiscovery}
+        aria-haspopup="menu"
+        aria-expanded={discoveryAt !== null}
+        aria-label="Discovery options"
+        title={`Discovery options: services ${s.discoverServices ? "on" : "off"}${s.discoverServices && s.sipAll ? " (SIP on all hosts)" : ""}, DHCP fingerprinting ${s.dhcpFingerprint ? "on" : "off"}`}
+      >
+        <span className="hidden min-[1760px]:inline">Discovery</span>
+        <ChevronDown size={11} aria-hidden className="-ml-0.5 text-muted" />
+      </Button>
       <Separator />
       <div className="flex items-center rounded-[6px]" title="Ping the visible, selected and pinned devices continuously">
         <Toggle
@@ -230,6 +308,22 @@ export function Toolbar(p: ToolbarProps) {
       >
         Export
       </Button>
+      <span
+        className="inline-flex"
+        title={p.reportCount === 0 ? "Scan first: the audit report needs discovered devices" : "Audit report (HTML, PDF or JSON)"}
+      >
+        <Button
+          ref={reportBtn}
+          icon={FileChartColumn}
+          onClick={openReport}
+          disabled={p.reportCount === 0 || p.reportBusy}
+          aria-haspopup="menu"
+          aria-expanded={exportMenu?.label === "Audit report"}
+          aria-label="Report…"
+        >
+          <span className="hidden min-[1680px]:inline">Report…</span>
+        </Button>
+      </span>
       <Button
         ref={moreBtn}
         variant="ghost"
@@ -248,6 +342,12 @@ export function Toolbar(p: ToolbarProps) {
         title="Details drawer (⌘I)"
       />
       {exportMenu && <ContextMenu menu={exportMenu} onClose={() => setExportMenu(null)} />}
+      {discoveryAt && (
+        <ContextMenu
+          menu={{ x: discoveryAt.x, y: discoveryAt.y, label: "Discovery options", items: discoveryItems() }}
+          onClose={() => setDiscoveryAt(null)}
+        />
+      )}
     </div>
   );
 }

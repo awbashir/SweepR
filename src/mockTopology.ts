@@ -7,7 +7,7 @@
 // Big scans (e.g. 10.0.0.0/16, ~50k hosts): 4 distribution switches and one access switch with
 // two APs per /24.
 
-import type { CdpLldpNeighbor, DeviceRole, SwitchPortMapping } from "./types.ts";
+import type { CdpLldpNeighbor, DeviceRole, PoeInfo, SwitchPortMapping } from "./types.ts";
 import { numberToIpv4 } from "./lib/ip.ts";
 
 export type MockTier = "firewall" | "router" | "core" | "dist" | "access" | "ap";
@@ -284,7 +284,28 @@ export class MockNet {
   }
 
   private entry(sw: MockInfra, port: string, mac: string, vlanId: number): SwitchPortMapping {
-    return { switchName: sw.name, switchIp: sw.ip, portName: port, portIndex: portIndex(port), vlanId, mac };
+    return { switchName: sw.name, switchIp: sw.ip, portName: port, portIndex: portIndex(port), vlanId, mac, poe: null, voiceVlan: null };
+  }
+
+  /** PoE an access point draws from its switch port (802.3at, class 4). */
+  apPoe(ap: MockInfra): PoeInfo {
+    const h = hash(`poe${ap.ip}`);
+    return {
+      watts: Math.round((12 + (h % 110) / 10) * 10) / 10,
+      maxWatts: 30,
+      class: 4,
+      status: "delivering",
+      source: null,
+      priority: null,
+      switchName: ap.parent?.name ?? null,
+      port: ap.parentPort,
+    };
+  }
+
+  /** Nominal PoE budget of a switch model (W); `null` for switches without PoE. */
+  poeNominal(sw: MockInfra): number | null {
+    if (sw.tier !== "access") return null;
+    return sw.platform.includes("Aruba") ? 370 : 740;
   }
 
   /** CAM entries for the infrastructure MACs (every switch in small nets; the relevant ones in big nets). */
@@ -299,7 +320,11 @@ export class MockNet {
         }
         // The AP's MAC is learned on its switch port; for everyone else x itself is the edge.
         const port = this.portOn(sw, x.tier === "ap" ? x.parent! : x, x.tier === "ap" ? x.parentPort : null);
-        if (port) out.push(this.entry(sw, port, x.mac, 1));
+        if (port) {
+          const e = this.entry(sw, port, x.mac, 1);
+          if (x.tier === "ap" && x.parent === sw) e.poe = this.apPoe(x);
+          out.push(e);
+        }
       }
     }
     return out;
@@ -343,6 +368,11 @@ export class MockNet {
       voiceVlan: x.role === "switch" ? 30 : null,
       capabilities: x.caps,
       vtpDomain: cdp ? "CORP" : null,
+      // A PoE switch port advertises the power it can supply (CDP Power Available / LLDP 802.3).
+      poeWatts: x.platform.endsWith("48P") ? 30 : null,
+      poeInfo: x.platform.endsWith("48P")
+        ? { watts: null, maxWatts: 30, class: null, status: null, source: "pse", priority: "low", switchName: null, port: null }
+        : null,
       ttlSecs: cdp ? 180 : 120,
       lastSeenMs: Date.now(),
     };
