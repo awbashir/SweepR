@@ -479,8 +479,10 @@ npm run dmg:universal    # Apple Silicon + Intel (adds the two Rust targets via 
 `packaging/macos/build-dmg.sh` builds the `.app` with Tauri, compiles the
 **SweepR (Administrator)** launcher (`admin-launcher.applescript`), adds the installer and
 uninstaller scripts and packs everything with `hdiutil`. The *macOS DMG* GitHub Actions
-workflow (`.github/workflows/macos-dmg.yml`) does the same on a macOS runner when started by
-hand or when a `v*` tag is pushed, and attaches the image to the release. The app is ad-hoc
+workflow (`.github/workflows/macos-dmg.yml`) does the same on a macOS runner: pull requests
+that touch the app get the image as a workflow artifact, and pushing a `v*` tag (or running
+the workflow from the Actions tab with a `tag` such as `v0.1`) publishes it as a GitHub
+release, creating the tag if needed. The app is ad-hoc
 signed (`signingIdentity: "-"`); set Tauri's `APPLE_SIGNING_IDENTITY` / `APPLE_CERTIFICATE`
 environment variables to sign with a Developer ID instead.
 
