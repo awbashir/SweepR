@@ -447,9 +447,18 @@ function Main() {
     async (mac: string, opts: WakeOptions): Promise<boolean> => {
       try {
         const r = await backend.wakeDevice(mac, opts);
-        const detail = `${r.packetsSent} packet${r.packetsSent === 1 ? "" : "s"} to ${r.targets.join(", ")}${r.interface ? ` via ${r.interface}` : ""}`;
-        toast.push("success", `Magic packet sent to ${r.mac}`, detail);
-        store.log("info", `Wake-on-LAN ${r.mac}: ${detail}`);
+        const failures = Array.isArray(r.failures) ? r.failures : [];
+        const failedTargets = new Set(failures.map((f) => f.split(": ")[0]));
+        const sentTo = r.targets.filter((t) => !failedTargets.has(t));
+        const detail = `${r.packetsSent} packet${r.packetsSent === 1 ? "" : "s"} to ${(sentTo.length > 0 ? sentTo : r.targets).join(", ")}${r.interface ? ` via ${r.interface}` : ""}`;
+        if (failures.length > 0) {
+          const failed = `Failed: ${failures.join("; ")}`;
+          toast.push("warn", `Magic packet sent to ${r.mac} (${failures.length} destination${failures.length === 1 ? "" : "s"} failed)`, `${detail}. ${failed}`);
+          store.log("warn", `Wake-on-LAN ${r.mac}: ${detail}. ${failed}`);
+        } else {
+          toast.push("success", `Magic packet sent to ${r.mac}`, detail);
+          store.log("info", `Wake-on-LAN ${r.mac}: ${detail}`);
+        }
         return true;
       } catch (e) {
         toast.push("error", `Wake-on-LAN for ${mac} failed`, errorMessage(e));
@@ -527,14 +536,17 @@ function Main() {
           finishedMs: isScan ? snap.jobFinishedMs : null,
           cancelled: isScan && (snap.summary?.cancelled ?? false),
           toolVersion,
+          summary: snap.scanMeta,
+          snmpAgents: snap.snmpAgents,
         });
         // Defence in depth: the metadata must never carry the community or v3 passwords.
-        if (leaksSecret(meta, [...snmpSecrets(settings.snmp), ...snmpSecrets(scan?.config.snmp)])) {
+        const secrets = [...snmpSecrets(settings.snmp), ...snmpSecrets(scan?.config.snmp)];
+        if (leaksSecret(meta, secrets)) {
           throw "internal error: the report metadata contained an SNMP secret; nothing was sent";
         }
         const t0 = performance.now();
         const args = await buildReportArgs(
-          { rows, latency: (ip) => latencyStore.get(ip)?.stats, vlans: snap.vlans, neighbors: snap.neighbors, portMappings: snap.portMappings, snmp: snap.snmp },
+          { rows, latency: (ip) => latencyStore.get(ip)?.stats, vlans: snap.vlans, neighbors: snap.neighbors, portMappings: snap.portMappings, snmp: snap.snmp, snmpAgents: snap.snmpAgents },
           meta,
           { format, title: v.title, org: v.org },
           async ({ done, total }) => {
@@ -542,6 +554,9 @@ function Main() {
             await yieldToEventLoop();
           },
         );
+        if (leaksSecret(args.snmpInfos, secrets)) {
+          throw "internal error: the SNMP data contained an SNMP secret; nothing was sent";
+        }
         const buildMs = performance.now() - t0;
         if (rows.length >= 5000) store.log("info", `Report input: ${rows.length.toLocaleString()} devices prepared in ${buildMs.toFixed(0)} ms`);
         setReportBusy(format === "pdf" ? "Rendering the PDF…" : "Building the report…");
@@ -924,7 +939,7 @@ function Main() {
                 neighbors={snap.neighbors}
                 vlans={snap.vlans}
                 portMappings={snap.portMappings}
-                snmp={snap.snmp}
+                snmp={snap.snmpView}
                 running={snap.running}
                 roleFilter={roleFilter}
                 search={deferredSearch}
@@ -982,7 +997,7 @@ function Main() {
             neighbors={snap.neighbors}
             vlans={snap.vlans}
             portMappings={snap.portMappings}
-            snmp={selectedKey !== null ? snap.snmp[selectedKey] : undefined}
+            snmp={selectedKey !== null ? snap.snmpView[selectedKey] : undefined}
             snmpQuery={selectedKey !== null ? snmpQueries[selectedKey] : undefined}
             portScan={selectedKey !== null ? portScans[selectedKey] : undefined}
             portPreset={ui.portPreset}

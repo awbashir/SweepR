@@ -25,11 +25,16 @@ export interface LatencyEntry {
   source: number;
   /** Window inherited from earlier monitors (frozen), oldest first. */
   carry: History;
-  /** The current monitor's window (`sample.history`). */
+  /**
+   * The current monitor's window: replaced by `sample.history` when an update carries it
+   * (first update, then at most every 30 s), otherwise extended by `sample.newSamples`.
+   */
   live: History;
   /** `carry` + `live`: at most `HISTORY_LEN`, oldest first, `null` = lost. */
   history: History;
   stats: LatencyStats;
+  /** `ts` of the newest sample folded in (duplicate / out-of-order updates are dropped). */
+  lastTs: number;
 }
 
 /** Min / avg / max / jitter / loss over a window (jitter: mean |Δ| of consecutive replies). */
@@ -73,15 +78,33 @@ function tail<T>(a: readonly T[], n: number): readonly T[] {
 }
 
 /**
- * Fold one backend sample into a host's entry. Within one monitor the backend's window is
- * authoritative; when a host moves to a newer monitor (the selection changed) the old window is
- * carried over so the sparkline continues. Returns `null` for a sample of an older monitor.
+ * Fold one backend sample into a host's entry. Within one monitor the ring follows the
+ * backend: `history` (the whole window, sent on a host's first update and then at most every
+ * 30 s) replaces it, `newSamples` (every sample since the previous update) are appended in
+ * between, and an update with neither (oldest backends) appends `rttMs`. The ring is trimmed to
+ * the backend's window size (`sent`), so a duplicate never lengthens it; samples lost in a gap
+ * (a dropped update) are missing until the next `history` resend, while the statistics always
+ * come from the payload. When a host moves to a newer monitor (the selection changed) the old
+ * window is carried over so the sparkline continues. Returns `null` for a sample of an older
+ * monitor and for a duplicate / out-of-order update.
  */
 export function applySample(prev: LatencyEntry | undefined, sample: LatencySample, monitorId: number): LatencyEntry | null {
   if (prev && monitorId < prev.source) return null;
+  const same = prev !== undefined && prev.source === monitorId;
+  const full = Array.isArray(sample.history) && sample.history.length > 0 ? sample.history : null;
+  if (same && (sample.ts < prev.lastTs || (sample.ts === prev.lastTs && full === null))) return null;
   let carry: History = prev?.carry ?? [];
-  if (prev && monitorId !== prev.source) carry = tail([...prev.carry, ...prev.live], HISTORY_LEN);
-  const live: History = tail(sample.history.length > 0 ? sample.history : [sample.rttMs], HISTORY_LEN);
+  if (prev && !same) carry = tail([...prev.carry, ...prev.live], HISTORY_LEN);
+  let live: History;
+  if (full) {
+    live = tail(full, HISTORY_LEN);
+  } else {
+    const fresh = Array.isArray(sample.newSamples) && sample.newSamples.length > 0 ? sample.newSamples : [sample.rttMs];
+    const base = same ? prev.live : [];
+    live = tail(base.length === 0 ? fresh : [...base, ...fresh], HISTORY_LEN);
+    // The backend's window holds `sent` samples: never show more than that.
+    if (sample.sent > 0 && live.length > sample.sent) live = tail(live, sample.sent);
+  }
   carry = tail(carry, HISTORY_LEN - live.length);
   const history = carry.length === 0 ? live : [...carry, ...live];
   // Without carried samples the backend's statistics describe exactly this window.
@@ -100,7 +123,7 @@ export function applySample(prev: LatencyEntry | undefined, sample: LatencySampl
           updatedMs: sample.ts,
         }
       : { ...computeStats(history, sample.method, sample.ts), lastMs: sample.rttMs };
-  return { ip: sample.ip, source: monitorId, carry, live, history, stats };
+  return { ip: sample.ip, source: monitorId, carry, live, history, stats, lastTs: sample.ts };
 }
 
 // --- store -------------------------------------------------------------------------------------

@@ -3,7 +3,8 @@
 
 import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import { Copy, ExternalLink, Globe, LoaderCircle, Power, ScanLine, Server, Terminal, X } from "lucide-react";
-import type { CdpLldpNeighbor, SnmpDeviceInfo, SwitchPortMapping, VlanInfo } from "../types.ts";
+import type { CdpLldpNeighbor, SwitchPortMapping, VlanInfo } from "../types.ts";
+import type { SnmpView } from "../lib/snmpAgents.ts";
 import { ROLE_LABEL } from "../types.ts";
 import type { DeviceRow } from "../lib/store.ts";
 import {
@@ -17,10 +18,10 @@ import {
 } from "../lib/infra.ts";
 import { PORT_PRESETS, serviceName } from "../lib/ports.ts";
 import { parsePorts } from "../lib/parse.ts";
-import { Button, RoleIcon, SectionTitle, Select, TextInput, cx } from "./ui.tsx";
+import { Button, MiniBadge, RoleIcon, SectionTitle, Select, TextInput, cx } from "./ui.tsx";
 import { IperfSection, LatencySection, TraceSection, WebSection } from "./DrawerTools.tsx";
 import { DhcpSection, PoeVoiceSection, ServicesSection, type ServiceQueryState } from "./DrawerServices.tsx";
-import { formatWatts, poeSummary } from "../lib/services.ts";
+import { formatWatts, netServiceBadges, poeSummary } from "../lib/services.ts";
 
 export type DrawerSection = "latency" | "web" | "trace" | "iperf" | "services";
 
@@ -43,7 +44,8 @@ interface DrawerProps {
   neighbors: CdpLldpNeighbor[];
   vlans: VlanInfo[];
   portMappings: SwitchPortMapping[];
-  snmp: SnmpDeviceInfo | undefined;
+  /** A `query_snmp` result, or what the scan's SNMP poll returned (`fromScan`). */
+  snmp: SnmpView | undefined;
   snmpQuery: SnmpQueryState | undefined;
   portScan: PortScanState | undefined;
   portPreset: string;
@@ -183,9 +185,14 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
           <div className="selectable truncate text-[14px] font-semibold" title={row.hostname || d.dnsName || d.ip}>
             {row.hostname || d.dnsName || d.mdnsName || d.smbName || d.ip}
           </div>
-          <div className="text-muted">
-            {ROLE_LABEL[d.role]}
-            {d.vendor ? ` · ${d.vendor}` : ""}
+          <div className="flex flex-wrap items-center gap-1 text-muted">
+            <span>
+              {ROLE_LABEL[d.role]}
+              {d.vendor ? ` · ${d.vendor}` : ""}
+            </span>
+            {netServiceBadges(d).map((b) => (
+              <MiniBadge key={b.id} label={b.label} title={b.title} />
+            ))}
           </div>
         </div>
       </div>
@@ -338,12 +345,17 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
           <KV k="sysDescr">{orDash(p.snmp.sysDescr)}</KV>
           <KV k="Uptime">{formatUptime(p.snmp.sysUptimeTicks)}</KV>
           <KV k="sysObjectID">{p.snmp.sysObjectId ? <span className="font-mono">{p.snmp.sysObjectId}</span> : null}</KV>
-          <KV k="Role">{ROLE_LABEL[p.snmp.role]}</KV>
+          <KV k="Role">{ROLE_LABEL[p.snmp.role] ?? p.snmp.role}</KV>
           {p.snmp.partial && (
             <KV k="Partial">
               <span className="text-warn" title={(p.snmp.warnings ?? []).join("\n")}>
                 Some tables could not be read completely: {(p.snmp.warnings ?? []).join("; ")}
               </span>
+            </KV>
+          )}
+          {p.snmp.fromScan && (
+            <KV k="Source">
+              <span className="text-muted">The scan's SNMP poll. Query SNMP for uptime, VLANs and the MAC table.</span>
             </KV>
           )}
         </dl>

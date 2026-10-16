@@ -367,8 +367,8 @@ export function PoeVoiceSection({
       )}
       {!usage && portTotal && (
         <p className="mt-1 text-muted">
-          {formatWatts(portTotal.watts)} W drawn on {portTotal.ports} port{portTotal.ports === 1 ? "" : "s"} (from its port table). Query SNMP for the
-          switch's PoE budget.
+          {formatWatts(portTotal.watts)} W drawn on {portTotal.ports} port{portTotal.ports === 1 ? "" : "s"} (from its port table). The switch's PoE budget
+          arrives with a scan that polls it over SNMP, or with Query SNMP.
         </p>
       )}
       {p && <p className="sr-only">{poeSummary(p)}</p>}

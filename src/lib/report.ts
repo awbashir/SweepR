@@ -1,6 +1,7 @@
 // Builds the `generate_report` input from the GUI's state: devices as exported (overrides and
-// live latency applied), VLANs, CDP/LLDP neighbors, CAM entries, cached SNMP polls and the scan
-// metadata. Secrets never leave the GUI: the SNMP community is reduced to its classification
+// live latency applied), VLANs, CDP/LLDP neighbors, CAM entries, cached SNMP polls, the SNMP
+// agents the scan polled (`snmp_agent` events) and the scan metadata (including interface /
+// gateway / scanner host from the scan's `finished` summary). Secrets never leave the GUI: the SNMP community is reduced to its classification
 // and SNMPv3 credentials are dropped. Framework-free for tests.
 
 import type {
@@ -11,6 +12,7 @@ import type {
   ReportFormat,
   ReportMeta,
   ScanConfig,
+  SnmpAgentStatus,
   SnmpConfig,
   SnmpDeviceInfo,
   SwitchPortMapping,
@@ -18,7 +20,8 @@ import type {
   VlanSelection,
 } from "../types.ts";
 import { formatPorts } from "./parse.ts";
-import { exportDevice, type DeviceRow } from "./store.ts";
+import { reportSnmpAgents, reportSnmpInfos } from "./snmpAgents.ts";
+import { exportDevice, type DeviceRow, type ScanSummaryMeta } from "./store.ts";
 
 export const REPORT_FORMATS: ReadonlyArray<{ format: ReportFormat; label: string; ext: string }> = [
   { format: "html", label: "HTML report", ext: "html" },
@@ -68,6 +71,10 @@ export interface ScanContext {
   finishedMs: number | null;
   cancelled: boolean;
   toolVersion: string | null;
+  /** Interface / gateway / scanner host from the latest full scan's `finished` event. */
+  summary?: ScanSummaryMeta | null;
+  /** SNMP agents the latest full scan polled (`snmp_agent` events). */
+  snmpAgents?: readonly SnmpAgentStatus[];
 }
 
 /** Scan metadata for the report (never the SNMP community or SNMPv3 passwords). */
@@ -75,8 +82,12 @@ export function buildReportMeta(ctx: ScanContext): ReportMeta {
   const meta: ReportMeta = {};
   if (ctx.toolVersion) meta.toolVersion = ctx.toolVersion;
   const c = ctx.config;
-  const iface = c?.interface ?? ctx.iface;
+  // The backend's own account of the scan wins; absent fields never clear known values.
+  const sum = ctx.summary ?? null;
+  const iface = sum?.interface || c?.interface || ctx.iface;
   if (iface) meta.interface = iface;
+  if (sum?.gateway) meta.gateway = sum.gateway;
+  if (sum?.scannerHost) meta.scannerHost = sum.scannerHost;
   if (c) {
     const ranges = c.range ? c.range.split(",").map((r) => r.trim()).filter(Boolean) : ctx.defaultRanges;
     if (ranges.length > 0) meta.ranges = ranges;
@@ -93,6 +104,8 @@ export function buildReportMeta(ctx: ScanContext): ReportMeta {
   if (ctx.startedMs !== null) meta.startedMs = ctx.startedMs;
   if (ctx.finishedMs !== null) meta.finishedMs = ctx.finishedMs;
   if (ctx.cancelled) meta.cancelled = true;
+  const agents = reportSnmpAgents(ctx.snmpAgents ?? []);
+  if (agents.length > 0) meta.snmpAgents = agents;
   return meta;
 }
 
@@ -122,6 +135,8 @@ export interface ReportSource {
   portMappings: readonly SwitchPortMapping[];
   /** Cached `query_snmp` results by device key (`ip` or `ip@vlan`). */
   snmp: Readonly<Record<string, SnmpDeviceInfo>>;
+  /** Agents the latest scan polled: answered ones add `snmpInfos` entries (queries win). */
+  snmpAgents?: readonly SnmpAgentStatus[];
 }
 
 export interface ReportOptions {
@@ -162,7 +177,10 @@ export async function buildReportArgs(
     }
     if (end < total) await pause({ done: end, total });
   }
-  const snmpInfos = Object.entries(src.snmp).map(([key, info]) => ({ ...info, ip: ipOfKey(key) }));
+  const snmpInfos = reportSnmpInfos(
+    Object.entries(src.snmp).map(([key, info]) => ({ ...info, ip: ipOfKey(key) })),
+    src.snmpAgents ?? [],
+  );
   const title = opts.title?.trim();
   const org = opts.org?.trim();
   const args: GenerateReportArgs = {

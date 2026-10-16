@@ -10,9 +10,13 @@ import type {
   ExportFormat,
   InterfaceInfo,
   Overrides,
+  PoeBudget,
   ScanConfig,
   ScanEvent,
   ScanEventPayload,
+  ScanSummary,
+  SnmpAgentStatus,
+  SnmpConfig,
   SnmpDeviceInfo,
   SwitchPortMapping,
   VlanInfo,
@@ -20,7 +24,7 @@ import type {
 } from "./types.ts";
 import { ipv4ToNumber, numberToIpv4 } from "./lib/ip.ts";
 import { parseRange, type Ipv4Span } from "./lib/parse.ts";
-import { MockNet, macFor } from "./mockTopology.ts";
+import { MockNet, macFor, type MockInfra } from "./mockTopology.ts";
 import { createMockTools, mockWebIdentity } from "./mockTools.ts";
 import { withWebIdentity } from "./lib/store.ts";
 import { addMockIgd, addMockServices, mockDiscoverServices, mockReportContent, type MockServiceOptions } from "./mockServices.ts";
@@ -201,6 +205,11 @@ function makeDevice(
     dev.openPorts = withNames ? infra.ports : [];
     dev.sources = withSnmp ? ["arp", "snmp", "dns"] : ["arp", "dns"];
     if (infra.tier === "router" && svc.discoverServices && withNames) addMockIgd(dev);
+    // The firewall hands out addresses and advertises the IPv6 prefix.
+    if (infra.tier === "firewall") {
+      if (svc.dhcpFingerprint) dev.dhcpServer = true;
+      dev.ipv6Router = true;
+    }
     return dev;
   }
   const v = pick(r, HOST_VENDORS);
@@ -231,6 +240,8 @@ function makeDevice(
   }
   if (r() < 0.15) dev.extraIps = [`fe80::${(ipNum & 0xffff).toString(16)}:${Math.floor(r() * 0xffff).toString(16)}`];
   dev.sources = withNames ? ["arp", "dns"] : ["arp"];
+  // A rogue DHCP server on a desk (seen only by the passive DHCP listener).
+  if (svc.dhcpFingerprint && (ipNum & 0xff) === 77) dev.dhcpServer = true;
   if (withNames) {
     addMockServices(dev, label, svc);
     // The switch reports the port's PoE and voice VLAN in its CAM entry, too.
@@ -269,6 +280,33 @@ interface Job {
   cancelled: boolean;
   finished: boolean;
   startedAt: number;
+  /** Full scans: interface / gateway / scanner host for the `finished` summary. */
+  where?: Pick<ScanSummary, "interface" | "gateway" | "scannerHost">;
+}
+
+/** PoE budget of a mock switch: the measured draw of known ports plus some unseen load (ACC-SW02 runs hot). */
+function mockPoeBudget(net: MockNet, spec: MockInfra, cam: readonly SwitchPortMapping[]): PoeBudget | null {
+  const nominal = net.poeNominal(spec);
+  if (nominal === null) return null;
+  const perPort = new Map<string, number>();
+  for (const m of cam) if (m.poe?.watts != null) perPort.set(m.portName, m.poe.watts);
+  const known = [...perPort.values()].reduce((a, b) => a + b, 0);
+  // Ports we have no CAM entry for draw some power too.
+  const consumed = spec.name === "ACC-SW02" ? Math.max(known, 0.84 * nominal) : Math.min(0.6 * nominal, known + ((hash(`budget${spec.ip}`) % 20) / 100) * nominal);
+  const extra = Math.max(0, consumed - known);
+  return {
+    nominalWatts: nominal,
+    consumedWatts: Math.round(consumed * 10) / 10,
+    usageThresholdPct: 80,
+    portsDelivering: perPort.size + Math.round(extra / 9),
+  };
+}
+
+/** Community class as the backend reports it (`SnmpConfig::community_class`): never the community. */
+function communityClass(c: SnmpConfig): SnmpAgentStatus["communityClass"] {
+  if (c.version === "v3") return "v3";
+  const t = c.community.trim();
+  return t === "" ? "none" : t === "public" || t === "private" ? t : "custom";
 }
 
 function download(name: string, mime: string, text: string): void {
@@ -310,7 +348,7 @@ export function createMockBackend(): Backend {
     j.timers.forEach((t) => clearTimeout(t));
     emit(j, {
       type: "finished",
-      data: { devices, vlans, neighbors, elapsedMs: Date.now() - j.startedAt, cancelled: j.cancelled },
+      data: { devices, vlans, neighbors, elapsedMs: Date.now() - j.startedAt, cancelled: j.cancelled, ...j.where },
     });
   };
   const newJob = (): Job => {
@@ -371,6 +409,7 @@ export function createMockBackend(): Backend {
     const tick = big ? 30 : 25;
     const replyRate = big ? 0.8 : 0.6;
     const withSnmp = config.snmp !== null;
+    j.where = { interface: iface.name, scannerHost: "sweepr-mock.local" };
     const svc: MockServiceOptions = {
       discoverServices: config.discoverServices !== false,
       dhcpFingerprint: config.dhcpFingerprint === true,
@@ -382,6 +421,8 @@ export function createMockBackend(): Backend {
     const blocks = blocksOf(untaggedSpans.length > 0 ? untaggedSpans : [{ start: ifaceBlock(iface) + 1, end: ifaceBlock(iface) + 254 }], 1024);
     const net = new MockNet(blocks, big);
     lastNet = net;
+    const fw = net.infra.find((x) => x.tier === "firewall");
+    if (fw) j.where = { ...j.where, gateway: fw.ip };
     lastCam = new Map();
     const scannerSw = net.scannerSwitch;
     const recordCam = (entries: SwitchPortMapping[]): void => {
@@ -440,7 +481,9 @@ export function createMockBackend(): Backend {
       }
       if (withSnmp && !infraCamSent) {
         infraCamSent = true;
-        recordCam(net.infraCam());
+        const cam = net.infraCam();
+        recordCam(cam);
+        if (config.snmp) emitAgents(j, net, cam, config.snmp);
       }
       for (let k = 0; k < batch && ti < targets.length && sent < total; k++) {
         const t = targets[ti]!;
@@ -509,6 +552,49 @@ export function createMockBackend(): Backend {
       });
     };
     later(j, 150, step);
+  }
+
+  /**
+   * One `snmp_agent` event per polled agent (as the engine sends them): the switches answer
+   * (with their PoE budget), the firewall answers on a per-device custom community and the WAN
+   * router times out.
+   */
+  function emitAgents(j: Job, net: MockNet, cam: readonly SwitchPortMapping[], snmp: SnmpConfig): void {
+    const version = snmp.version;
+    const cls = communityClass(snmp);
+    const polled = net.infra.filter((x) => x.tier !== "ap").slice(0, 200);
+    polled.forEach((spec, i) =>
+      later(j, 300 + i * 40, () => {
+        const timeout = spec.tier === "router";
+        const own = spec.tier === "firewall";
+        const status: SnmpAgentStatus = timeout
+          ? {
+              ip: spec.ip,
+              version,
+              communityClass: cls,
+              answered: false,
+              partial: false,
+              sysName: null,
+              sysDescr: null,
+              role: null,
+              poeBudget: null,
+              warnings: ["no response (timeout after 2000 ms, 1 retry)"],
+            }
+          : {
+              ip: spec.ip,
+              version,
+              communityClass: own && version !== "v3" ? "custom" : cls,
+              answered: true,
+              partial: spec.name === "CORE-SW01" && net.big,
+              sysName: spec.name,
+              sysDescr: `${spec.platform} — ${spec.software}`,
+              role: spec.role,
+              poeBudget: spec.role === "switch" ? mockPoeBudget(net, spec, cam.filter((m) => m.switchIp === spec.ip)) : null,
+              warnings: spec.name === "CORE-SW01" && net.big ? ["dot1dTpFdbTable: walk truncated at 50,000 entries"] : [],
+            };
+        emit(j, { type: "snmp_agent", data: status });
+      }),
+    );
   }
 
   function runVlanDiscovery(j: Job, ifaceName: string | null, timeoutSecs: number, dhcpFp: boolean): void {
@@ -641,7 +727,7 @@ export function createMockBackend(): Backend {
         const spec = n === null ? undefined : net.infraAt(n);
         window.setTimeout(() => {
           if (!spec) {
-            reject(`SNMP request to ${ip} timed out (community '${snmp?.community ?? "public"}')`);
+            reject(`SNMP request to ${ip} timed out (${snmp?.version ?? "v2c"}, ${snmp?.timeoutMs ?? 2000} ms)`);
             return;
           }
           const vlans: VlanInfo[] = [1, 10, 20, 30, 99].map((id) => vlanInfo(id, "snmp", "en0", spec.name));
@@ -653,23 +739,7 @@ export function createMockBackend(): Backend {
             c.macCount += 1;
             counts.set(m.portName, c);
           }
-          // PoE budget: the measured draw of known ports plus some unseen load (ACC-SW02 runs hot).
-          const nominal = net.poeNominal(spec);
-          let poeBudget: SnmpDeviceInfo["poeBudget"] = null;
-          if (nominal !== null) {
-            const perPort = new Map<string, number>();
-            for (const m of all) if (m.poe?.watts != null) perPort.set(m.portName, m.poe.watts);
-            const known = [...perPort.values()].reduce((a, b) => a + b, 0);
-            // Ports we have no CAM entry for draw some power too.
-            const consumed = spec.name === "ACC-SW02" ? Math.max(known, 0.84 * nominal) : Math.min(0.6 * nominal, known + ((hash(`budget${spec.ip}`) % 20) / 100) * nominal);
-            const extra = Math.max(0, consumed - known);
-            poeBudget = {
-              nominalWatts: nominal,
-              consumedWatts: Math.round(consumed * 10) / 10,
-              usageThresholdPct: 80,
-              portsDelivering: perPort.size + Math.round(extra / 9),
-            };
-          }
+          const poeBudget = mockPoeBudget(net, spec, all);
           const info: SnmpDeviceInfo = {
             sysName: spec.name,
             sysDescr: `${spec.platform} — ${spec.software}`,
