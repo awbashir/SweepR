@@ -22,6 +22,7 @@ import type {
   WebIdentity,
 } from "../types.ts";
 import { deviceKey, ipSortKey } from "./ip.ts";
+import { isRoleGuess } from "./roles.ts";
 import { deviceKindLabel, deviceKindOf, dhcpOsLabel, modelFirmware, netServiceBadges, withServiceDiscovery } from "./services.ts";
 import { recordAgent, snmpViewFor, type SnmpView } from "./snmpAgents.ts";
 
@@ -207,7 +208,13 @@ export function exportDevice(row: DeviceRow, latency?: LatencyStats | null): Dev
 /** A device with a `grab_web_identity` result merged in (warnings de-duplicated). */
 export function withWebIdentity(dev: Device, wi: WebIdentity): Device {
   const warnings = [...new Set([...(dev.warnings ?? []), ...wi.warnings])];
-  const promote = dev.role === "host" && wi.roleHint !== null && wi.roleHint !== "host";
+  // Like the backend (`webid::device_update`): the hint applies to plain hosts and replaces a
+  // low-confidence guess, never a role the device reported (CDP / LLDP / SNMP).
+  const promote = (dev.role === "host" || isRoleGuess(dev)) && wi.roleHint !== null && wi.roleHint !== "host";
+  const provenance: Partial<Device> =
+    promote && wi.roleHint
+      ? { role: wi.roleHint, roleSource: "web", roleConfidence: "medium", roleEvidence: [`web UI identified as ${wi.identity ?? wi.roleHint}`] }
+      : {};
   return {
     ...dev,
     webTitle: wi.title ?? dev.webTitle,
@@ -215,7 +222,7 @@ export function withWebIdentity(dev: Device, wi: WebIdentity): Device {
     tlsCert: wi.tlsCert ?? dev.tlsCert,
     webIdentity: wi.identity ?? dev.webIdentity,
     warnings,
-    role: promote && wi.roleHint ? wi.roleHint : dev.role,
+    ...provenance,
     openPorts: [...new Set([...dev.openPorts, ...wi.services.filter((s) => s.status !== null).map((s) => s.port)])].sort((a, b) => a - b),
   };
 }

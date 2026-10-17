@@ -274,7 +274,31 @@ export interface Device {
   dhcpServer?: boolean | null;
   /** Sent an IPv6 router advertisement during the scan. */
   ipv6Router?: boolean | null;
+  /** Where `role` came from (null for a plain host / older saves). */
+  roleSource?: RoleSource | null;
+  /** How sure `role` is; an infrastructure role without one counts as "medium". */
+  roleConfidence?: RoleConfidence | null;
+  /** Human-readable reasons behind `role`; a host may carry "possible network device" hints. */
+  roleEvidence?: string[];
+  /** DNS-SD service types seen over mDNS ("_http._tcp", "_csco-sb._tcp"). */
+  mdnsServices?: string[];
 }
+
+/** Provenance of a device role. New strings may appear: render unknown ones as-is. */
+export type RoleSource = "cdp" | "lldp" | "snmp" | "web" | "mdns_service" | "name" | "oui_ports" | "user";
+
+export type RoleConfidence = "high" | "medium" | "low";
+
+export const ROLE_SOURCE_LABEL: Record<RoleSource, string> = {
+  cdp: "CDP",
+  lldp: "LLDP",
+  snmp: "SNMP",
+  web: "web identity",
+  mdns_service: "mDNS service",
+  name: "host name",
+  oui_ports: "OUI + ports",
+  user: "user",
+};
 
 export type InterfaceKind =
   | "ethernet"

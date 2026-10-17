@@ -22,6 +22,7 @@ import type {
   VlanInfo,
   VlanSource,
 } from "./types.ts";
+import { ROLE_LABEL, ROLE_SOURCE_LABEL } from "./types.ts";
 import { ipv4ToNumber, numberToIpv4 } from "./lib/ip.ts";
 import { parseRange, type Ipv4Span } from "./lib/parse.ts";
 import { MockNet, macFor, type MockInfra } from "./mockTopology.ts";
@@ -168,9 +169,70 @@ function blankDevice(ip: string, now: number): Device {
 
 const WEB_PORTS = [80, 443, 8443, 8080, 8000, 10443];
 
+/**
+ * Quiet small-business gear in every untagged /24 (always found): Cisco Business switches
+ * with their default `switchXXXXXX` mDNS names and only the web UI open (no SSH, no SNMP
+ * answer), and Ruijie / Reyee switches — the cases the backend's role hints classify
+ * (`src-tauri/src/role_hints.rs`), with the same provenance fields.
+ */
+function quietGearAt(ipNum: number, vlanId: number | null): ((dev: Device, withNames: boolean) => void) | undefined {
+  if (vlanId !== null) return undefined;
+  const tail = ipNum & 0xffffff;
+  const hex = tail.toString(16).padStart(6, "0");
+  const cisco = (name: string, services: string[], confidence: "low" | "medium") => (dev: Device, withNames: boolean): void => {
+    dev.vendor = "Cisco Systems, Inc";
+    dev.mac = macFor("70:1f:53", confidence === "medium" ? tail : tail ^ 0x10101);
+    dev.extraIps = [`fe80::721f:53ff:fe${hex.slice(0, 2)}:${hex.slice(2)}`];
+    if (!withNames) return;
+    dev.mdnsName = `${name}${hex}.local`;
+    dev.mdnsServices = services;
+    dev.openPorts = [80, 443];
+    dev.sources = ["arp", "mdns", "tcp"];
+    dev.role = "switch";
+    dev.roleSource = "name";
+    dev.roleConfidence = confidence;
+    dev.roleEvidence = [
+      `mDNS name '${name}${hex}.local': Cisco Business default switch host name${confidence === "medium" ? ", matching its MAC" : ""}`,
+      ...(services.includes("_csco-sb._tcp") ? ["mDNS service _csco-sb._tcp (Cisco Small Business network gear)"] : []),
+      "Cisco OUI (network vendor)",
+      "management ports only (80, 443)",
+    ];
+  };
+  switch (ipNum & 0xff) {
+    case 231:
+      return cisco("switch", ["_csco-sb._tcp", "_http._tcp"], "medium");
+    case 232:
+      return cisco("Switch", [], "low");
+    case 233:
+      return cisco("switch", ["_https._tcp"], "medium");
+    case 234:
+      return (dev, withNames) => {
+        dev.vendor = "Ruijie Networks Co.,LTD";
+        dev.mac = macFor("ec:b9:70", tail);
+        if (!withNames) return;
+        dev.openPorts = [80];
+        dev.webTitle = "Reyee";
+        dev.webIdentity = "Ruijie / Reyee";
+        dev.sources = ["arp", "tcp"];
+        dev.role = "switch";
+        dev.roleSource = "web";
+        dev.roleConfidence = "low";
+        dev.roleEvidence = ["web UI is Ruijie / Reyee (network equipment)", "switch is the vendor's usual role", "Ruijie OUI (network vendor)", "management ports only (80)"];
+      };
+    case 235:
+      return (dev) => {
+        dev.vendor = "Ruijie Networks Co.,LTD";
+        dev.mac = macFor("c0:b8:e6", tail);
+        dev.roleEvidence = ["possible network device: Ruijie OUI"];
+      };
+    default:
+      return undefined;
+  }
+}
+
 /** Enrichment: web title / TLS certificate for devices with a web port open (as the engine does). */
 function withWeb(dev: Device): Device {
-  if (!dev.openPorts.some((p) => WEB_PORTS.includes(p))) return dev;
+  if (!dev.openPorts.some((p) => WEB_PORTS.includes(p)) || (dev.roleEvidence?.length ?? 0) > 0) return dev;
   const wi = mockWebIdentity(dev.ip, dev.role === "host" ? null : dev.role, Date.now());
   if (wi.services.length === 0) return dev;
   return withWebIdentity(dev, wi);
@@ -210,6 +272,16 @@ function makeDevice(
       if (svc.dhcpFingerprint) dev.dhcpServer = true;
       dev.ipv6Router = true;
     }
+    if (withSnmp) {
+      dev.roleSource = "snmp";
+      dev.roleConfidence = "high";
+      dev.roleEvidence = [`SNMP agent classified it as ${ROLE_LABEL[infra.role]}`];
+    }
+    return dev;
+  }
+  const quiet = quietGearAt(ipNum, vlanId);
+  if (quiet) {
+    quiet(dev, withNames);
     return dev;
   }
   const v = pick(r, HOST_VENDORS);
@@ -499,7 +571,7 @@ export function createMockBackend(): Backend {
           addr = targets[ti]?.span.start ?? 0;
         }
         const r = rng(hash(`r${ipNum}`))();
-        const isInfra = t.vlan === null && net.infraAt(ipNum) !== undefined;
+        const isInfra = t.vlan === null && (net.infraAt(ipNum) !== undefined || quietGearAt(ipNum, null) !== undefined);
         if (!isInfra && r > replyRate) continue;
         const dev = makeDevice(ipNum, t.vlan, iface.name, isInfra || !big || r < 0.5, net, withSnmp, svc);
         if (isInfra && config.cdpLldp && dev.ip === scannerSw.ip) {
@@ -683,6 +755,7 @@ export function createMockBackend(): Backend {
           ["MAC", (d) => d.mac],
           ["VLAN", (d) => d.vlanId],
           ["Role", (d) => d.role],
+          ["Role Source", (d) => (d.role !== "host" && d.roleSource ? `${ROLE_SOURCE_LABEL[d.roleSource] ?? d.roleSource} (${d.roleConfidence ?? "medium"})` : "")],
           ["Hostname", (d) => d.hostname],
           ["Vendor", (d) => d.vendor],
           ["Switch Port", (d) => (d.switchPort ? `${d.switchPort.switchName} [${d.switchPort.portName}]` : "")],

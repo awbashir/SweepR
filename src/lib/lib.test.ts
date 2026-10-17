@@ -11,6 +11,8 @@ import { normalizePortMacCounts, neighborsForDevice } from "./infra.ts";
 import { crashTestArea, describeCrash, isChunkLoadError } from "./crash.ts";
 import { IP_COL_MAX, IP_COL_MIN, autoIpWidth } from "./columns.ts";
 import { netServiceBadges } from "./services.ts";
+import { effectiveConfidence, isRoleGuess, roleSummary, roleTooltip } from "./roles.ts";
+import { withWebIdentity } from "./store.ts";
 import type { CdpLldpNeighbor, Device, ScanEventPayload } from "../types.ts";
 
 function device(ip: string, patch: Partial<Device> = {}): Device {
@@ -397,4 +399,63 @@ test("custom URL template: a password is never persisted", () => {
   assert.deepEqual(withoutUrlPassword("ssh://admin@{ip}"), { value: "ssh://admin@{ip}", stripped: false }, "a user name alone is kept");
   assert.deepEqual(withoutUrlPassword("http://{ip}:8080/a:b@c"), { value: "http://{ip}:8080/a:b@c", stripped: false }, "only the authority");
   assert.deepEqual(withoutUrlPassword("http://{ip}:8080/"), { value: "http://{ip}:8080/", stripped: false });
+});
+
+test("roles: guesses are marked, summaries name the source, web identity replaces a guess", () => {
+  const guess = device("10.10.60.5", {
+    role: "switch",
+    vendor: "Cisco Systems, Inc",
+    mdnsName: "switch375bc6.local",
+    roleSource: "name",
+    roleConfidence: "low",
+    roleEvidence: [
+      "mDNS name 'switch375bc6.local': Cisco Business default switch host name",
+      "Cisco OUI (network vendor)",
+      "management ports only (80, 443)",
+    ],
+  });
+  assert.equal(isRoleGuess(guess), true);
+  assert.equal(effectiveConfidence(guess), "low");
+  assert.equal(roleSummary(guess), "Switch — from mDNS name + Cisco OUI (low confidence)");
+  const tip = roleTooltip(guess, ["DHCP server"]);
+  assert.match(tip, /^Switch — from mDNS name \+ Cisco OUI \(low confidence\) · DHCP server\n• mDNS name/);
+  assert.equal(tip.split("\n").length, 4);
+
+  const snmp = device("10.0.0.2", { role: "switch", roleSource: "snmp", roleConfidence: "high", roleEvidence: ["SNMP agent classified it as Switch"] });
+  assert.equal(isRoleGuess(snmp), false);
+  assert.equal(roleSummary(snmp), "Switch — from SNMP (high confidence)");
+  // Older saves: an infrastructure role without provenance is not a guess.
+  const legacy = device("10.0.0.3", { role: "firewall" });
+  assert.equal(effectiveConfidence(legacy), "medium");
+  assert.equal(isRoleGuess(legacy), false);
+  assert.equal(roleSummary(legacy), "Firewall");
+  // Hosts: plain, or with a "possible network device" hint.
+  assert.equal(roleSummary(device("10.0.0.4")), "Host");
+  assert.equal(effectiveConfidence(device("10.0.0.4")), null);
+  const hinted = device("10.0.0.5", { vendor: "Ruijie Networks Co.,LTD", roleEvidence: ["possible network device: Ruijie OUI"] });
+  assert.equal(roleSummary(hinted), "Host — possible network device: Ruijie OUI");
+  assert.equal(roleTooltip(hinted), "Host — possible network device: Ruijie OUI");
+  assert.equal(isRoleGuess(hinted), false);
+
+  // A manual web identity grab replaces a guess (and promotes a host), never a reported role.
+  const wi = {
+    ip: "10.10.60.5",
+    services: [],
+    title: "CBS350-24P-4G",
+    server: null,
+    tlsCert: null,
+    identity: "Cisco Business switch",
+    roleHint: "switch" as const,
+    warnings: [],
+  };
+  const promoted = withWebIdentity(guess, wi);
+  assert.equal(promoted.roleSource, "web");
+  assert.equal(promoted.roleConfidence, "medium");
+  assert.deepEqual(promoted.roleEvidence, ["web UI identified as Cisco Business switch"]);
+  const kept = withWebIdentity(snmp, { ...wi, roleHint: "firewall" });
+  assert.equal(kept.role, "switch");
+  assert.equal(kept.roleSource, "snmp");
+  const host = withWebIdentity(device("10.0.0.9"), { ...wi, ip: "10.0.0.9" });
+  assert.equal(host.role, "switch");
+  assert.equal(host.roleConfidence, "medium");
 });

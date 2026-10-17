@@ -6,6 +6,7 @@ import { Copy, ExternalLink, Globe, LoaderCircle, Power, ScanLine, Server, Termi
 import type { CdpLldpNeighbor, SwitchPortMapping, VlanInfo } from "../types.ts";
 import type { SnmpView } from "../lib/snmpAgents.ts";
 import { ROLE_LABEL } from "../types.ts";
+import { isRoleGuess, roleSummary, roleTooltip } from "../lib/roles.ts";
 import type { DeviceRow } from "../lib/store.ts";
 import {
   deviceNames,
@@ -186,8 +187,10 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
             {row.hostname || d.dnsName || d.mdnsName || d.smbName || d.ip}
           </div>
           <div className="flex flex-wrap items-center gap-1 text-muted">
-            <span>
-              {ROLE_LABEL[d.role]}
+            <span title={roleTooltip(d)}>
+              <span className={cx(isRoleGuess(d) && "underline decoration-dashed decoration-1 underline-offset-[3px]")}>
+                {roleSummary(d)}
+              </span>
               {d.vendor ? ` · ${d.vendor}` : ""}
             </span>
             {netServiceBadges(d).map((b) => (
@@ -238,9 +241,19 @@ function DrawerBody(p: DrawerProps & { row: DeviceRow }) {
         <KV k="VLAN">{d.vlanId ?? "Untagged"}</KV>
         <KV k="Hostname">{orDash(row.hostname)}</KV>
         <KV k="Vendor">{orDash(d.vendor)}</KV>
+        {(d.roleEvidence?.length ?? 0) > 0 && (
+          <KV k="Role evidence">
+            <ul className="list-disc space-y-0.5 pl-3.5">
+              {d.roleEvidence!.map((e) => (
+                <li key={e}>{e}</li>
+              ))}
+            </ul>
+          </KV>
+        )}
         <KV k="Switch / Port">{orDash(row.switchPort)}</KV>
         <KV k="DNS name">{orDash(d.dnsName)}</KV>
         <KV k="mDNS name">{orDash(d.mdnsName)}</KV>
+        {(d.mdnsServices?.length ?? 0) > 0 && <KV k="mDNS services">{d.mdnsServices!.join(", ")}</KV>}
         <KV k="SMB name">{orDash(d.smbName && (d.smbDomain ? `${d.smbDomain}\\${d.smbName}` : d.smbName))}</KV>
         <KV k="Open ports">{orDash(row.ports)}</KV>
         <KV k="Interface">{orDash(d.interface)}</KV>

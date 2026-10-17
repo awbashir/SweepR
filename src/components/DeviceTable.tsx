@@ -36,6 +36,7 @@ import { latencyStore, useLatency } from "../tools.ts";
 import { Sparkline } from "./Charts.tsx";
 import { ContextMenu, type MenuItem } from "./Menu.tsx";
 import { KindIcon, MiniBadge, RoleIcon, TONE_TEXT_CLASS, cx } from "./ui.tsx";
+import { isRoleGuess, roleTooltip } from "../lib/roles.ts";
 import { deviceKindOf, formatWatts, netServiceBadges, poeSummary, poeTone, type NetBadge } from "../lib/services.ts";
 
 export const ROW_H = 22;
@@ -748,11 +749,24 @@ function CellContent({ id, row, selected, width }: { id: ColId; row: DeviceRow; 
       return (
         <span
           className="flex min-w-0 flex-1 items-center gap-1.5"
-          title={[ROLE_LABEL[d.role], ...netServiceBadges(d).map((b) => b.label)].join(" · ")}
+          title={roleTooltip(d, netServiceBadges(d).map((b) => b.label))}
         >
           <RoleIcon role={d.role} inherit={selected} />
-          {/* The role label always stays; compact badges give way (clipped) before it. */}
-          <span className="shrink-0">{ROLE_LABEL[d.role]}</span>
+          {/* The role label always stays; compact badges give way (clipped) before it. A
+              low-confidence guess gets a dashed underline and a "?" so it reads as one. */}
+          {isRoleGuess(d) ? (
+            <span
+              className="shrink-0 underline decoration-dashed decoration-1 underline-offset-[3px]"
+              aria-label={`${ROLE_LABEL[d.role]} (guess, low confidence)`}
+            >
+              {ROLE_LABEL[d.role]}
+              <span className={cx("ml-px text-[10px]", !selected && "text-muted")} aria-hidden>
+                ?
+              </span>
+            </span>
+          ) : (
+            <span className="shrink-0">{ROLE_LABEL[d.role]}</span>
+          )}
           <RoleBadges badges={netServiceBadges(d)} selected={selected} />
           {(d.warnings?.length ?? 0) > 0 && (
             <span
