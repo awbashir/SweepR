@@ -401,7 +401,11 @@ fn hostname_hint(hostname: Option<&str>) -> Option<String> {
 
 /// Open a bounded, inbound-only pcap capture on `if_name` with the DHCP BPF filter installed.
 fn open_dhcp_capture(if_name: &str) -> Result<pcap::Capture<pcap::Active>> {
-    let mut cap = pcap::Capture::from_device(if_name)
+    // The Npcap device on Windows (and a clean error when Npcap is missing).
+    let device = crate::arp_vlan::capture_device(if_name).map_err(|e| {
+        anyhow::anyhow!("DHCP fingerprinting needs raw packet access on {if_name}: {e:#}")
+    })?;
+    let mut cap = pcap::Capture::from_device(device.as_str())
         .map_err(|e| anyhow::anyhow!("cannot open {if_name} for DHCP capture: {e}"))?
         .promisc(true)
         .immediate_mode(true)
@@ -427,9 +431,18 @@ fn open_dhcp_capture(if_name: &str) -> Result<pcap::Capture<pcap::Active>> {
 
 fn map_capture_error(err: pcap::Error, if_name: &str) -> anyhow::Error {
     let lower = err.to_string().to_ascii_lowercase();
-    if lower.contains("permission") || lower.contains("not permitted") || lower.contains("bpf") {
+    if lower.contains("permission")
+        || lower.contains("not permitted")
+        || lower.contains("bpf")
+        || lower.contains("access is denied")
+    {
         anyhow::anyhow!(
-            "DHCP fingerprinting needs raw packet access (root / BPF) on {if_name}: {err}"
+            "DHCP fingerprinting needs raw packet access ({}) on {if_name}: {err}",
+            if cfg!(windows) {
+                "Npcap / Administrator"
+            } else {
+                "root / BPF"
+            }
         )
     } else {
         anyhow::anyhow!("cannot capture DHCP on {if_name}: {err}")
@@ -854,6 +867,10 @@ mod tests {
     /// dead capture, so no privileges are needed.
     #[test]
     fn bpf_filter_accepts_tagged_dhcp() {
+        // Windows: wpcap.dll is delay-loaded and only present with Npcap installed.
+        if crate::platform::capture_driver_status().is_err() {
+            return;
+        }
         let cap = pcap::Capture::dead(pcap::Linktype::ETHERNET).unwrap();
         let prog = cap.compile(DHCP_FILTER, true).unwrap();
         let mac = [0x00, 0x1a, 0x2b, 0x03, 0x04, 0x08];

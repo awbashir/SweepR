@@ -1,8 +1,8 @@
 //! Continuous latency monitor (ping with rolling statistics and sparkline history).
 //!
 //! [`run_monitor`] pings every host of a [`MonitorConfig`] on a fixed interval (0.5-10 s)
-//! with unprivileged ICMP / ICMPv6 echo (`surge-ping`, one shared socket per address family,
-//! as the scan's ICMP sweep does). A host that never answers ICMP falls back to TCP connect
+//! with unprivileged ICMP / ICMPv6 echo ([`crate::icmp`]: `surge-ping`, one shared socket per
+//! address family, as the scan's ICMP sweep does; the ICMP helper API on Windows). A host that never answers ICMP falls back to TCP connect
 //! round trips (SYN → SYN-ACK or RST) on a known open port, or on a short list of common
 //! ports. Each host keeps a ring buffer of its last [`HISTORY_LEN`] samples, from which
 //! last / avg / min / max / jitter / loss are computed.
@@ -21,11 +21,11 @@ use std::{
 
 use anyhow::{bail, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use surge_ping::{Client, Config, PingIdentifier, PingSequence, ICMP};
 use tokio::{net::TcpStream, sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    icmp::{EchoClient, EchoPinger, Family},
     limits::SocketBudget,
     models::{now_ms, LatencySample, LatencyStats, ProbeMethod},
 };
@@ -353,9 +353,9 @@ async fn find_tcp_port(
 /// Shared, per-monitor probing resources.
 #[derive(Clone)]
 struct Probe {
-    v4: Option<Client>,
-    v6: Option<Client>,
-    ident: PingIdentifier,
+    v4: Option<EchoClient>,
+    v6: Option<EchoClient>,
+    ident: u16,
     timeout: Duration,
     interval: Duration,
     count: Option<u32>,
@@ -376,12 +376,8 @@ async fn host_loop(
         IpAddr::V4(_) => probe.v4.as_ref(),
         IpAddr::V6(_) => probe.v6.as_ref(),
     };
-    let mut pinger = match client {
-        Some(c) => {
-            let mut p = c.pinger(ip, probe.ident).await;
-            p.timeout(probe.timeout);
-            Some(p)
-        }
+    let mut pinger: Option<EchoPinger> = match client {
+        Some(c) => Some(c.pinger(ip, probe.ident, probe.timeout).await),
         None => None,
     };
     let mut ticker = tokio::time::interval(probe.interval);
@@ -423,7 +419,7 @@ async fn host_loop(
             (Some(p), None) => {
                 let rtt = tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = p.ping(PingSequence(seq), PING_PAYLOAD) => r.ok().map(|(_, d)| d.as_secs_f64() * 1000.0),
+                    r = p.ping(seq, PING_PAYLOAD) => r.map(|d| d.as_secs_f64() * 1000.0),
                 };
                 seq = seq.wrapping_add(1);
                 match rtt {
@@ -498,12 +494,11 @@ async fn host_loop(
 
 /// An ICMP client for one address family, holding a socket permit for its lifetime.
 async fn icmp_client(
-    kind: ICMP,
+    kind: Family,
     budget: &SocketBudget,
-) -> Option<(Client, tokio::sync::OwnedSemaphorePermit)> {
+) -> Option<(EchoClient, tokio::sync::OwnedSemaphorePermit)> {
     let permit = budget.acquire().await?;
-    let config = Config::builder().kind(kind).build();
-    match Client::new(&config) {
+    match EchoClient::new(kind) {
         Ok(c) => Some((c, permit)),
         Err(e) => {
             tracing::debug!("ICMP socket unavailable ({kind:?}): {e}; using TCP round trips");
@@ -547,19 +542,19 @@ pub async fn run_monitor_reserved(
     let want_v4 = cfg.icmp && cfg.ips.iter().any(IpAddr::is_ipv4);
     let want_v6 = cfg.icmp && cfg.ips.iter().any(IpAddr::is_ipv6);
     let v4 = if want_v4 {
-        icmp_client(ICMP::V4, budget).await
+        icmp_client(Family::V4, budget).await
     } else {
         None
     };
     let v6 = if want_v6 {
-        icmp_client(ICMP::V6, budget).await
+        icmp_client(Family::V6, budget).await
     } else {
         None
     };
     let probe = Probe {
         v4: v4.as_ref().map(|(c, _)| c.clone()),
         v6: v6.as_ref().map(|(c, _)| c.clone()),
-        ident: PingIdentifier((std::process::id() as u16) ^ (now_ms() as u16).rotate_left(5)),
+        ident: (std::process::id() as u16) ^ (now_ms() as u16).rotate_left(5),
         timeout: cfg.probe_timeout(),
         interval: cfg.interval,
         count: cfg.count,

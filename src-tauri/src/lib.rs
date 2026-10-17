@@ -6,12 +6,14 @@ pub mod dhcp_fp;
 pub mod engine;
 pub mod enricher;
 pub mod export;
+pub mod icmp;
 pub mod iperf;
 pub mod jobs;
 pub mod latency;
 pub mod limits;
 pub mod models;
 pub mod owner;
+pub mod platform;
 pub mod progress;
 pub mod report;
 pub mod report_html;
@@ -25,6 +27,8 @@ pub mod ssdp;
 pub mod sweep;
 pub mod trace;
 pub mod webid;
+#[cfg(windows)]
+pub mod win;
 pub mod wol;
 pub mod wsd;
 

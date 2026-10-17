@@ -381,16 +381,39 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
         Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", path.display())),
     };
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         // Closes the race between the check above and the open.
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.truncate(true).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open a link / junction itself (never its target) and truncate only after checking.
+        opts.truncate(false)
+            .custom_flags(crate::platform::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    opts.truncate(true);
     let file = opts
         .open(path)
         .with_context(|| format!("cannot create {}", path.display()))?;
+    #[cfg(windows)]
+    {
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot inspect {}", path.display()))?;
+        if crate::platform::is_reparse_point(&meta) || !meta.is_file() {
+            bail!(
+                "refusing to write {}: not a regular file (symbolic link or junction?)",
+                path.display()
+            );
+        }
+        file.set_len(0)
+            .with_context(|| format!("cannot truncate {}", path.display()))?;
+    }
     if is_new {
         crate::owner::give_back_file(&file);
     }

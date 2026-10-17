@@ -64,10 +64,8 @@ const LATENCY_EVENT: &str = "latency-update";
 const TRACE_EVENT: &str = "trace-update";
 const IPERF_EVENT: &str = "iperf-update";
 
-const ROOT_HINT: &str = "hint: active layer-2 scanning (ARP, 802.1Q, NDP) and CDP/LLDP capture \
-     need root: run `sudo sweepr ...`. On macOS, BPF device access (e.g. Wireshark's ChmodBPF) \
-     is enough for passive capture only; active probes also need the interface MAC address, \
-     which macOS hides from non-root processes.";
+/// Printed after a raw-access failure (root / sudo on macOS and Linux, Npcap on Windows).
+const ROOT_HINT: &str = sweepr_core::platform::ROOT_HINT;
 
 /// Write a diagnostic line to stderr. Failures are ignored: a closed stderr (e.g.
 /// `sweepr ... 2>&1 | head -1`) must not panic like `eprintln!` would.
@@ -366,7 +364,7 @@ struct ScanArgs {
     sip_all: bool,
 
     /// Passively fingerprint DHCP clients (option 55 / vendor class) during the listen window
-    /// (needs root / BPF, like the other sniffers)
+    /// (needs raw capture: root / BPF, or Npcap on Windows, like the other sniffers)
     #[arg(long)]
     dhcp_fingerprint: bool,
 
@@ -890,7 +888,7 @@ impl LiveRenderer {
                 };
                 diag!("{tag}: {}", sanitize_log(&message));
                 if level == LogLevel::Warn
-                    && message.contains("requires root")
+                    && message.contains(sweepr_core::platform::RAW_ACCESS_PREFIX)
                     && !self.l2_permission_warned
                 {
                     self.l2_permission_warned = true;
@@ -1601,6 +1599,7 @@ async fn cmd_ping(args: PingArgs, cancel: CancellationToken) -> Result<()> {
 fn trace_method_label(m: TraceMethod) -> &'static str {
     match m {
         TraceMethod::Raw => "raw ICMP probes",
+        TraceMethod::System if cfg!(windows) => "tracert (three probes per hop and round)",
         TraceMethod::System => {
             "the system traceroute (unprivileged; run as root for raw ICMP probes)"
         }
@@ -2861,6 +2860,10 @@ fn stop_iperf(jobs: State<'_, UtilityJobs>, run_id: u64) -> bool {
 }
 
 fn run_gui() -> ExitCode {
+    // Started from Explorer / a shortcut, the console-subsystem binary gets a console window
+    // of its own; release it (a terminal launch keeps its console for logs).
+    #[cfg(windows)]
+    sweepr_core::win::detach_console_if_owned();
     sweepr_core::init_tracing();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

@@ -25,6 +25,7 @@ import { ScanStore, exportDevice, type DeviceRow } from "./lib/store.ts";
 import { urlHost } from "./lib/ip.ts";
 import { formatPorts, parsePorts, vlanSelectionLabel, withoutUrlPassword } from "./lib/parse.ts";
 import { PORT_PRESETS } from "./lib/ports.ts";
+import { rawAccessHint } from "./lib/platform.ts";
 import {
   DEFAULT_SETTINGS,
   buildScanConfig,
@@ -1167,6 +1168,7 @@ function Welcome({
   isMock: boolean;
   onStart: () => void;
 }) {
+  const rawHint = rawAccessHint();
   return (
     <div className="flex max-w-[520px] flex-col items-center gap-3 px-6 text-center">
       <h2 className="text-[16px] font-semibold">No devices yet</h2>
@@ -1188,8 +1190,9 @@ function Welcome({
         <ShieldAlert size={16} className="mt-px shrink-0 text-warn" aria-hidden />
         <p>
           Raw ARP, 802.1Q VLAN tagging, IPv6 NDP and CDP/LLDP capture need raw packet access. Without it SweepR falls back to an ICMP
-          sweep and can miss hosts. On macOS run SweepR via <code className="font-mono">sudo</code>, e.g.{" "}
-          <code className="selectable font-mono">sudo /Applications/SweepR.app/Contents/MacOS/sweepr --gui</code>.
+          sweep and can miss hosts. {rawHint.lead}{" "}
+          {rawHint.command && <code className="selectable font-mono">{rawHint.command}</code>}
+          {rawHint.tail}
         </p>
       </div>
       <p className="text-[11px] text-muted">

@@ -154,8 +154,8 @@ fn plan_ports(ports: &[u16]) -> Result<Vec<u16>> {
     Ok(out)
 }
 
-/// UDP socket with `SO_BROADCAST`, bound to `source` (and, on macOS, pinned to the interface
-/// so even 255.255.255.255 leaves through it).
+/// UDP socket with `SO_BROADCAST`, bound to `source` (and, on macOS / Windows, pinned to the
+/// interface with `IP_BOUND_IF` / `IP_UNICAST_IF` so even 255.255.255.255 leaves through it).
 fn broadcast_socket(source: Ipv4Addr, iface: Option<&InterfaceInfo>) -> Result<Socket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("cannot open a UDP socket")?;
@@ -175,7 +175,14 @@ fn broadcast_socket(source: Ipv4Addr, iface: Option<&InterfaceInfo>) -> Result<S
             tracing::debug!("SO_BINDTODEVICE failed: {e}");
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    #[cfg(windows)]
+    if let Some(i) = iface.filter(|i| i.index != 0) {
+        // IP_UNICAST_IF also steers limited broadcasts; binding to the address is the fallback.
+        if let Err(e) = crate::win::set_unicast_if_v4(&sock, i.index) {
+            tracing::debug!("IP_UNICAST_IF failed: {e}");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", windows)))]
     let _ = iface;
     sock.bind(&SocketAddr::V4(SocketAddrV4::new(source, 0)).into())
         .with_context(|| format!("cannot bind a UDP socket to {source}"))?;

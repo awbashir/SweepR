@@ -6,6 +6,24 @@ import type { CdpLldpNeighbor, SwitchPortMapping, VlanInfo } from "../types.ts";
 import { formatWatts, poeSummary, poeTone } from "../lib/services.ts";
 import type { DeviceRow } from "../lib/store.ts";
 import { Button, TONE_TEXT_CLASS, TextInput, cx } from "./ui.tsx";
+import { PLATFORM } from "../lib/platform.ts";
+
+/** "run SweepR via sudo" / "install Npcap" for this OS. */
+function RawAccess() {
+  if (PLATFORM === "windows") return <>install Npcap (npcap.com)</>;
+  if (PLATFORM === "linux") {
+    return (
+      <>
+        run SweepR via <code className="font-mono">sudo</code> or grant it <code className="font-mono">cap_net_raw,cap_net_admin</code>
+      </>
+    );
+  }
+  return (
+    <>
+      run SweepR via <code className="font-mono">sudo</code>
+    </>
+  );
+}
 
 function Table({ head, children, label }: { head: string[]; children: ReactNode; label: string }) {
   return (
@@ -131,7 +149,7 @@ export function VlanView({
       {vlans.length === 0 ? (
         <Empty icon={<Layers size={32} strokeWidth={1.25} />} title="No VLANs discovered yet">
           Run passive discovery on a trunk port to collect 802.1Q tags, Cisco VTP and DTP, or scan with “Auto-Detect VLANs”. Packet capture
-          needs raw access: run SweepR via <code className="font-mono">sudo</code>.
+          needs raw access: <RawAccess />.
         </Empty>
       ) : (
         <Table label="Discovered VLANs" head={["VLAN ID", "Name", "Sources", "Interface", "Switch", "Frames", "Devices", "Voice", "PoE (W)", "Last seen"]}>
@@ -204,7 +222,7 @@ export function NeighborView({
     return (
       <Empty icon={<Share2 size={32} strokeWidth={1.25} />} title="No CDP / LLDP neighbors yet">
         Turn on <strong>CDP/LLDP</strong> in the toolbar and start a scan, or run passive discovery from the VLANs view. Switches typically
-        advertise every 30–60 seconds. Capturing needs raw packet access: run SweepR via <code className="font-mono">sudo</code>.
+        advertise every 30–60 seconds. Capturing needs raw packet access: <RawAccess />.
       </Empty>
     );
   }

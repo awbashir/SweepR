@@ -9,10 +9,12 @@
 //! * **System** ([`TraceMethod::System`]): without that privilege, an unprivileged socket
 //!   never sees ICMP Time Exceeded, so the system tool runs once per round:
 //!   `traceroute -n -q 1 -w 1 -m <max> <ip>` (macOS ships a setuid `/usr/sbin/traceroute`
-//!   and `traceroute6`; Linux uses `traceroute` or, failing that, `tracepath`). The target is
-//!   always a validated IP literal and arguments are passed as a vector, never through a
-//!   shell, so nothing can be injected. The output parsers are bounded and hostile-input
-//!   safe.
+//!   and `traceroute6`; Linux uses `traceroute` or, failing that, `tracepath`). On Windows
+//!   this is always the engine: `tracert -d -h <max> -w 1000 <ip>` (`System32\tracert.exe`,
+//!   no Administrator rights needed; it sends three probes per hop, so each round adds three
+//!   samples per hop). The target is always a validated IP literal and arguments are passed
+//!   as a vector, never through a shell, so nothing can be injected. The output parsers are
+//!   bounded and hostile-input safe.
 //!
 //! Hop names come from reverse DNS through the system resolver ([`PtrResolver`]).
 
@@ -346,6 +348,95 @@ pub fn parse_traceroute_line(line: &str, max_hops: u8) -> Option<Vec<HopObservat
     (!out.is_empty()).then_some(out)
 }
 
+/// One probe column of Windows `tracert`: `<1` / `12` followed by a unit token (`ms`, or a
+/// localized one). `<1 ms` is recorded as 0.5 ms (tracert's resolution is 1 ms).
+fn parse_tracert_rtt(value: &str, unit: Option<&&str>) -> Option<f64> {
+    let unit = unit?;
+    let is_unit = !unit.is_empty()
+        && *unit != "*"
+        && !unit.bytes().all(|b| b.is_ascii_digit())
+        && !unit.starts_with('<')
+        && parse_ip_token(unit).is_none();
+    if !is_unit {
+        return None;
+    }
+    if value == "<1" {
+        return Some(0.5);
+    }
+    if value.is_empty() || value.len() > 6 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    parse_rtt(value)
+}
+
+/// Parse one hop line of Windows `tracert -d` (any language: only the shape is used):
+///
+/// ```text
+///   1    <1 ms    <1 ms    <1 ms  192.168.1.1
+///   2     9 ms     8 ms     *     100.64.0.1
+///   3     *        *        *     Request timed out.
+///   4  192.168.1.1  reports: Destination host unreachable.
+/// ```
+///
+/// Returns one observation per probe column (`*` = lost); a "reports: ... unreachable" line
+/// is one answered probe without a round-trip time. Header, footer and error lines
+/// ("Transmit error: code 1231.") give `None`.
+pub fn parse_tracert_line(line: &str, max_hops: u8) -> Option<Vec<HopObservation>> {
+    if line.len() > MAX_LINE_LEN {
+        return None;
+    }
+    let tokens: Vec<&str> = line.split_whitespace().take(MAX_TOKENS + 1).collect();
+    if tokens.len() > MAX_TOKENS || tokens.len() < 2 {
+        return None;
+    }
+    let ttl = parse_ttl(tokens[0], max_hops)?;
+    let mut probes: Vec<Option<f64>> = Vec::new();
+    let mut ip: Option<IpAddr> = None;
+    let mut i = 1;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "*" {
+            probes.push(None);
+        } else if let Some(rtt) = parse_tracert_rtt(t, tokens.get(i + 1)) {
+            probes.push(Some(rtt));
+            i += 1; // the unit
+        } else if ip.is_none() {
+            ip = parse_ip_token(t);
+        }
+        i += 1;
+    }
+    let lost = HopObservation {
+        ttl,
+        ip: None,
+        rtt_ms: None,
+    };
+    let out: Vec<HopObservation> = match ip {
+        Some(ip) if probes.is_empty() => vec![HopObservation {
+            ttl,
+            ip: Some(ip),
+            rtt_ms: None,
+        }],
+        Some(ip) => probes
+            .iter()
+            .map(|p| match p {
+                Some(rtt) => HopObservation {
+                    ttl,
+                    ip: Some(ip),
+                    rtt_ms: Some(*rtt),
+                },
+                None => lost,
+            })
+            .collect(),
+        // Without an address only losses can be attributed.
+        None => probes
+            .iter()
+            .filter(|p| p.is_none())
+            .map(|_| lost)
+            .collect(),
+    };
+    (!out.is_empty()).then_some(out)
+}
+
 /// Parse one line of Linux `tracepath -n`:
 ///
 /// ```text
@@ -396,6 +487,8 @@ pub fn parse_tracepath_line(line: &str, max_hops: u8) -> Option<HopObservation> 
 pub enum Flavor {
     Traceroute,
     Tracepath,
+    /// Windows `tracert`.
+    Tracert,
 }
 
 /// A system traceroute program and the arguments for one round.
@@ -419,6 +512,12 @@ impl SystemTracer {
             }
             Flavor::Tracepath => {
                 for a in ["-n", "-m"] {
+                    args.push(a.into());
+                }
+            }
+            Flavor::Tracert => {
+                // -d: no reverse DNS (hop names come from our resolver); -w: ms per probe.
+                for a in ["-d", "-w", "1000", "-h"] {
                     args.push(a.into());
                 }
             }
@@ -461,6 +560,11 @@ pub fn find_system_tracer(v6: bool) -> Option<SystemTracer> {
         flavor,
         extra,
     };
+    if cfg!(windows) {
+        let program = crate::platform::system32_tool("TRACERT.EXE");
+        let family = if v6 { "-6" } else { "-4" };
+        return is_executable(&program).then(|| tracer(program, Flavor::Tracert, vec![family]));
+    }
     if v6 {
         if let Some(p) = find_program("traceroute6") {
             return Some(tracer(p, Flavor::Traceroute, vec![]));
@@ -501,7 +605,8 @@ async fn system_round(
     tx: &mpsc::Sender<Msg>,
     cancel: &CancellationToken,
 ) -> Result<usize> {
-    let mut child = Command::new(&tracer.program)
+    let mut cmd = Command::new(&tracer.program);
+    let mut child = crate::platform::hide_console(&mut cmd)
         .args(tracer.args(target, max_hops))
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -524,8 +629,13 @@ async fn system_round(
         buf
     });
     let mut lines = BufReader::new(stdout.take(MAX_OUTPUT_BYTES)).lines();
+    // tracert sends three probes per hop, each waiting up to PROBE_WAIT.
+    let per_hop = match tracer.flavor {
+        Flavor::Tracert => 3.2,
+        Flavor::Traceroute | Flavor::Tracepath => 1.5,
+    };
     let deadline = tokio::time::Instant::now()
-        + PROBE_WAIT.mul_f64(f64::from(max_hops) * 1.5)
+        + PROBE_WAIT.mul_f64(f64::from(max_hops) * per_hop)
         + Duration::from_secs(5);
     let mut seen = 0usize;
     loop {
@@ -543,6 +653,7 @@ async fn system_round(
         let obs: Vec<HopObservation> = match tracer.flavor {
             Flavor::Traceroute => parse_traceroute_line(&line, max_hops).unwrap_or_default(),
             Flavor::Tracepath => parse_tracepath_line(&line, max_hops).into_iter().collect(),
+            Flavor::Tracert => parse_tracert_line(&line, max_hops).unwrap_or_default(),
         };
         for o in obs {
             seen += 1;
@@ -929,8 +1040,15 @@ pub async fn run_trace(
     let (mtx, mut mrx) = mpsc::channel::<Msg>(1024);
     let worker_cancel = cancel.child_token();
 
-    // Raw sockets when privileged, else the system tool.
-    let (method, worker) = match open_raw(target) {
+    // Raw sockets when privileged, else the system tool. Windows always uses tracert: raw
+    // ICMP sockets there need Administrator rights, an explicit bind and a firewall rule
+    // before Time Exceeded messages arrive.
+    let raw = if cfg!(windows) {
+        Err(io::Error::other("raw ICMP sockets are not used on Windows"))
+    } else {
+        open_raw(target)
+    };
+    let (method, worker) = match raw {
         Ok(sock) => {
             let (o, c, m) = (opts, worker_cancel.clone(), mtx.clone());
             let h = tokio::task::spawn_blocking(move || raw_worker(sock, target, o, m, c));
@@ -950,7 +1068,9 @@ pub async fn run_trace(
     };
     drop(mtx);
     let mut error = worker.is_none().then(|| {
-        if cfg!(target_os = "linux") {
+        if cfg!(windows) {
+            "tracert.exe was not found in the Windows system directory".to_string()
+        } else if cfg!(target_os = "linux") {
             "no traceroute tool found: install `traceroute` (or `iputils-tracepath`), or run \
              SweepR as root / with CAP_NET_RAW"
                 .to_string()
@@ -1248,6 +1368,87 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
             .map(|a| a.into_string().unwrap())
             .collect();
         assert_eq!(args, ["-6", "-n", "-m", "8", "2001:db8::1"]);
+        let tr = SystemTracer {
+            program: r"C:\Windows\System32\TRACERT.EXE".into(),
+            flavor: Flavor::Tracert,
+            extra: vec!["-4"],
+        };
+        let args: Vec<String> = tr
+            .args("8.8.8.8".parse().unwrap(), 30)
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert_eq!(args, ["-4", "-d", "-w", "1000", "-h", "30", "8.8.8.8"]);
+    }
+
+    /// `tracert -d -h 30 -w 1000 8.8.8.8` on Windows 11 (English), CRLF line ends.
+    const TRACERT_OUTPUT: &str = "\r
+Tracing route to 8.8.8.8 over a maximum of 30 hops\r
+\r
+  1    <1 ms    <1 ms    <1 ms  192.168.1.1 \r
+  2     9 ms     8 ms     *     100.64.0.1 \r
+  3     *        *        *     Request timed out.\r
+  4    11 ms    12 ms    10 ms  72.14.215.85 \r
+  5    12 ms    11 ms    11 ms  8.8.8.8 \r
+\r
+Trace complete.\r
+";
+
+    fn tr(line: &str) -> Vec<HopObservation> {
+        parse_tracert_line(line, 30).unwrap_or_default()
+    }
+
+    #[test]
+    fn parses_windows_tracert() {
+        let all: Vec<HopObservation> = TRACERT_OUTPUT.lines().flat_map(tr).collect();
+        assert_eq!(all.len(), 15, "three probes per hop");
+        let gw: IpAddr = "192.168.1.1".parse().unwrap();
+        assert_eq!(
+            (all[0].ttl, all[0].ip, all[0].rtt_ms),
+            (1, Some(gw), Some(0.5))
+        );
+        let cgn: IpAddr = "100.64.0.1".parse().unwrap();
+        assert_eq!(all[3].rtt_ms, Some(9.0));
+        assert_eq!((all[4].ip, all[4].rtt_ms), (Some(cgn), Some(8.0)));
+        assert_eq!((all[5].ttl, all[5].ip, all[5].rtt_ms), (2, None, None));
+        assert!(all[6..9].iter().all(|o| o.ttl == 3 && o.ip.is_none()));
+        assert_eq!(all[14].ip, Some("8.8.8.8".parse().unwrap()));
+        assert_eq!(all[14].rtt_ms, Some(11.0));
+        // Header, footer, blank lines and transmit errors are not hops.
+        for line in [
+            "Tracing route to 8.8.8.8 over a maximum of 30 hops",
+            "over a maximum of 30 hops:",
+            "Trace complete.",
+            "",
+            "  1  Transmit error: code 1231.",
+            "  1  General failure.",
+        ] {
+            assert!(parse_tracert_line(line, 30).is_none(), "{line:?}");
+        }
+        // "reports: Destination host unreachable": answered, no round-trip time.
+        let unreach = tr("  2  192.168.1.1  reports: Destination host unreachable.");
+        assert_eq!(
+            unreach,
+            vec![HopObservation {
+                ttl: 2,
+                ip: Some(gw),
+                rtt_ms: None
+            }]
+        );
+        // IPv6 hops and a localized unit / timeout text (German, Russian).
+        let v6 = tr("  1     1 ms    <1 ms    <1 ms  2001:db8:1::1 ");
+        assert_eq!(v6.len(), 3);
+        assert_eq!(v6[0].ip, Some("2001:db8:1::1".parse().unwrap()));
+        assert_eq!(v6[0].rtt_ms, Some(1.0));
+        let de = tr("  3     *        *        *     Zeitüberschreitung der Anforderung.");
+        assert_eq!(de.len(), 3);
+        let ru = tr("  2    10 мс     9 мс    11 мс  10.0.0.1");
+        assert_eq!(ru.len(), 3);
+        assert_eq!(ru[2].rtt_ms, Some(11.0));
+        // TTLs out of range and hostile input.
+        assert!(parse_tracert_line("  31    1 ms  1 ms  1 ms  10.0.0.1", 30).is_none());
+        assert!(parse_tracert_line(&format!("  1 {}", "1 ms ".repeat(100)), 30).is_none());
+        assert!(parse_tracert_line(&"9".repeat(4096), 30).is_none());
     }
 
     #[test]

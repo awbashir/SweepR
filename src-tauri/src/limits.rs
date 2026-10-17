@@ -13,6 +13,9 @@
 //!
 //! Code that still hits `EMFILE` / `ENFILE` treats it as retryable ([`is_fd_exhausted`]) and
 //! reports it once ([`warn_fd_exhausted_once`]).
+//!
+//! Windows has no `RLIMIT_NOFILE` (raising it is a no-op there) and the budget is sized as for
+//! the raised Unix limit.
 
 use std::{
     io,
@@ -124,7 +127,12 @@ impl SocketBudget {
     pub fn global() -> &'static SocketBudget {
         static GLOBAL: OnceLock<SocketBudget> = OnceLock::new();
         GLOBAL.get_or_init(|| {
-            let permits = permits_for_limit(nofile_limit().map(|(soft, _)| soft));
+            // Windows has no descriptor limit for sockets (they are kernel handles, bounded
+            // only by memory): size the budget as for the raised Unix limit.
+            let soft = nofile_limit()
+                .map(|(soft, _)| soft)
+                .or(cfg!(windows).then_some(NOFILE_TARGET));
+            let permits = permits_for_limit(soft);
             tracing::debug!("socket budget: {permits} concurrent sockets");
             SocketBudget::new(permits)
         })
@@ -141,9 +149,13 @@ impl SocketBudget {
     }
 }
 
-/// `true` when `err` means the process or the system ran out of file descriptors.
+/// `true` when `err` means the process or the system ran out of file descriptors (on
+/// Windows also Winsock's `WSAEMFILE`, "too many open sockets").
 pub fn is_fd_exhausted(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(code) if code == libc::EMFILE || code == libc::ENFILE)
+    const WSAEMFILE: i32 = 10024;
+    matches!(err.raw_os_error(), Some(code) if code == libc::EMFILE
+        || code == libc::ENFILE
+        || (cfg!(windows) && code == WSAEMFILE))
 }
 
 static FD_WARNED: AtomicBool = AtomicBool::new(false);
