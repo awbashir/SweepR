@@ -16,6 +16,7 @@ pub mod progress;
 pub mod report;
 pub mod report_html;
 pub mod report_pdf;
+pub mod role_hints;
 pub mod save;
 pub mod services;
 pub mod sip;

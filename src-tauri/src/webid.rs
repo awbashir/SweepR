@@ -38,8 +38,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     limits::SocketBudget,
     models::{
-        now_ms, sanitize_text, Device, DeviceRole, ScanEvent, TlsCertInfo, WebIdentity, WebScheme,
-        WebService,
+        now_ms, sanitize_text, Device, DeviceRole, RoleConfidence, RoleSource, ScanEvent,
+        TlsCertInfo, WebIdentity, WebScheme, WebService,
     },
     progress::ProgressScope,
 };
@@ -1092,8 +1092,13 @@ pub async fn probe_port(
 
 struct Rule {
     /// Lower-case needles. Needles of 4 characters or fewer, and needles written `=word`,
-    /// must match whole words ("unifi" must not match "Unified ...").
+    /// must match whole words ("unifi" must not match "Unified ..."). A needle written
+    /// `^prefix` matches a word that starts with `prefix` followed by a digit (model numbers:
+    /// `^cbs` matches "CBS350-24P", `^gwn76` matches "GWN7605").
     needles: &'static [&'static str],
+    /// When non-empty, one of these (substring) must also appear: a vendor name gating a
+    /// short model prefix.
+    with: &'static [&'static str],
     identity: &'static str,
     role: Option<DeviceRole>,
 }
@@ -1105,10 +1110,31 @@ const fn rule(
 ) -> Rule {
     Rule {
         needles,
+        with: &[],
         identity,
         role,
     }
 }
+
+const fn rule_with(
+    needles: &'static [&'static str],
+    with: &'static [&'static str],
+    identity: &'static str,
+    role: Option<DeviceRole>,
+) -> Rule {
+    Rule {
+        needles,
+        with,
+        identity,
+        role,
+    }
+}
+
+const RUIJIE: &[&str] = &["ruijie", "reyee"];
+const TPLINK: &[&str] = &["tp-link", "tplink", "omada"];
+const NETGEAR: &[&str] = &["netgear"];
+const ZYXEL: &[&str] = &["zyxel"];
+const HUAWEI: &[&str] = &["huawei"];
 
 /// Ordered: more specific products first.
 const RULES: &[Rule] = &[
@@ -1195,7 +1221,205 @@ const RULES: &[Rule] = &[
     rule(&["=unifi", "ubiquiti"], "Ubiquiti UniFi", None),
     rule(&["openwrt", "luci"], "OpenWrt", Some(DeviceRole::Router)),
     rule(&["dd-wrt"], "DD-WRT", Some(DeviceRole::Router)),
+    // Cisco: Business / Small Business switches (CBS, SG, SF), Catalyst, RV routers,
+    // Business Wireless APs. The Business Dashboard is a management *server*, and a
+    // Catalyst 9800 is a wireless controller: no role.
+    rule(
+        &["cisco business dashboard"],
+        "Cisco Business Dashboard",
+        None,
+    ),
+    rule(
+        &["catalyst 9800", "wireless lan controller"],
+        "Cisco wireless controller",
+        None,
+    ),
+    rule(
+        &["^cbw"],
+        "Cisco Business Wireless AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    rule_with(
+        &["^rv"],
+        &["cisco", "small business", "router"],
+        "Cisco RV router",
+        Some(DeviceRole::Router),
+    ),
+    rule(
+        &[
+            "^cbs",
+            "cisco business",
+            "cisco small business",
+            "small business managed switch",
+        ],
+        "Cisco Business switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^sg", "^sf"],
+        &["cisco"],
+        "Cisco Small Business switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule(&["catalyst"], "Cisco Catalyst", Some(DeviceRole::Switch)),
+    // Ruijie / Reyee: AP (RG-RAP / RG-AP / RG-EAP), gateway (RG-EG), switch (RG-S, RG-ES,
+    // RG-NBS) by model prefix; the bare brand (or the EWEB UI) has no role.
+    rule(
+        &["rg-rap", "rg-ap", "rg-eap", "rg-wall"],
+        "Ruijie / Reyee AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    rule_with(
+        &["^rap", "^eap"],
+        RUIJIE,
+        "Ruijie / Reyee AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    rule(
+        &["rg-eg"],
+        "Ruijie / Reyee gateway",
+        Some(DeviceRole::Router),
+    ),
+    rule_with(
+        &["^eg"],
+        RUIJIE,
+        "Ruijie / Reyee gateway",
+        Some(DeviceRole::Router),
+    ),
+    rule(
+        &["rg-s", "rg-es", "rg-nbs"],
+        "Ruijie / Reyee switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^es", "^nbs", "^s"],
+        RUIJIE,
+        "Ruijie / Reyee switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule(&["ruijie", "reyee", "=eweb"], "Ruijie / Reyee", None),
+    // TP-Link Omada / JetStream.
+    rule_with(
+        &["^eap"],
+        TPLINK,
+        "TP-Link Omada AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    rule(
+        &[
+            "jetstream",
+            "tl-sg",
+            "t1500g",
+            "t1600g",
+            "t1700g",
+            "t2500g",
+            "t2600g",
+            "t3700g",
+        ],
+        "TP-Link JetStream switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^sg", "^tl"],
+        TPLINK,
+        "TP-Link Omada switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^er", "tl-r"],
+        TPLINK,
+        "TP-Link Omada router",
+        Some(DeviceRole::Router),
+    ),
     rule(&["omada"], "TP-Link Omada", None),
+    // Netgear ProSAFE / Insight managed switches and business APs.
+    rule(
+        &["prosafe"],
+        "Netgear ProSAFE switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^gs", "^gc", "^ms", "^xs", "^m4", "^m5"],
+        NETGEAR,
+        "Netgear managed switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^wac", "^wax", "^wbe"],
+        NETGEAR,
+        "Netgear AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    // D-Link business switches / APs.
+    rule(
+        &["=dgs", "=dxs", "des-1", "des-3"],
+        "D-Link switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule(
+        &["=dap", "=dba"],
+        "D-Link AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    // Zyxel switches / APs / firewalls (Nebula is the cloud management).
+    rule(
+        &["zywall", "usg flex"],
+        "Zyxel firewall",
+        Some(DeviceRole::Firewall),
+    ),
+    rule_with(
+        &["^gs", "^xgs", "^xs", "^xmg"],
+        ZYXEL,
+        "Zyxel switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^nwa", "^wax", "^wac"],
+        ZYXEL,
+        "Zyxel AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    rule(
+        &["zyxel nebula", "nebula control center"],
+        "Zyxel Nebula",
+        None,
+    ),
+    // H3C / Huawei (the bare brand also covers consumer routers and ONTs: no role).
+    rule(&["comware"], "H3C Comware switch", Some(DeviceRole::Switch)),
+    rule(
+        &["cloudengine"],
+        "Huawei CloudEngine switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule_with(
+        &["^s1", "^s2", "^s3", "^s5", "^s6"],
+        HUAWEI,
+        "Huawei switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule(&["h3c"], "H3C", None),
+    // Grandstream GWN: 76xx APs, 78xx switches, 70xx routers.
+    rule(
+        &["^gwn76"],
+        "Grandstream GWN AP",
+        Some(DeviceRole::AccessPoint),
+    ),
+    rule(
+        &["^gwn78"],
+        "Grandstream GWN switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule(
+        &["^gwn70"],
+        "Grandstream GWN router",
+        Some(DeviceRole::Router),
+    ),
+    rule(
+        &["allied telesis", "alliedware"],
+        "Allied Telesis switch",
+        Some(DeviceRole::Switch),
+    ),
+    rule(&["edgecore"], "Edgecore switch", Some(DeviceRole::Switch)),
     rule(&["meraki"], "Cisco Meraki", None),
     rule(
         &["arubaos", "aruba instant", "aruba networks"],
@@ -1220,6 +1444,36 @@ const RULES: &[Rule] = &[
     rule(&["gitlab"], "GitLab", None),
     rule(&["jellyfin"], "Jellyfin", None),
     rule(&["plex"], "Plex Media Server", None),
+    rule(&["netgear"], "Netgear", None),
+    rule(&["zyxel"], "Zyxel", None),
+    rule(&["huawei"], "Huawei", None),
+    // Generic managed-switch web UIs.
+    rule(
+        &[
+            "managed switch",
+            "smart switch",
+            "web smart",
+            "easy smart",
+            "smart managed",
+            "^xgs",
+        ],
+        "Managed switch",
+        Some(DeviceRole::Switch),
+    ),
+];
+
+/// Identities that name a network-equipment OS or product line without saying which role
+/// (used by the role classifier as a weak "this is network gear" signal).
+pub const NETWORK_IDENTITIES: &[&str] = &[
+    "Ruijie / Reyee",
+    "TP-Link Omada",
+    "Cisco Meraki",
+    "Ubiquiti UniFi",
+    "Ubiquiti EdgeOS",
+    "Aruba",
+    "Zyxel Nebula",
+    "H3C",
+    "Cisco wireless controller",
 ];
 
 fn words(s: &str) -> Vec<&str> {
@@ -1240,13 +1494,22 @@ pub fn identify(texts: &[&str]) -> Option<(&'static str, Option<DeviceRole>)> {
     let has = |needle: &str| {
         if let Some(word) = needle.strip_prefix('=') {
             hay_words.contains(&word)
+        } else if let Some(prefix) = needle.strip_prefix('^') {
+            hay_words.iter().any(|w| {
+                w.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+            })
         } else if needle.len() <= 4 && needle.chars().all(|c| c.is_ascii_alphanumeric()) {
             hay_words.contains(&needle)
         } else {
             hay.contains(needle)
         }
     };
-    if let Some(r) = RULES.iter().find(|r| r.needles.iter().any(|n| has(n))) {
+    let matches = |r: &Rule| {
+        r.needles.iter().any(|n| has(n))
+            && (r.with.is_empty() || r.with.iter().any(|w| hay.contains(w)))
+    };
+    if let Some(r) = RULES.iter().find(|r| matches(r)) {
         return Some((r.identity, r.role));
     }
     // FortiGate's factory certificate: CN = the serial number (FGT..., FG...), issuer Fortinet.
@@ -1351,8 +1614,9 @@ pub async fn grab_web_identity(
 }
 
 /// The sparse device update carrying `id` for `device` (same key), or `None` when there is
-/// nothing to add. The role hint only applies to a device that is still a plain host, so it
-/// never overrides CDP / LLDP / SNMP / fingerprint evidence.
+/// nothing to add. The role hint (medium confidence, source `web`) only applies to a device
+/// that is still a plain host or carries a low-confidence guess, so it never overrides CDP /
+/// LLDP / SNMP / product-specific fingerprint evidence.
 pub fn device_update(device: &Device, id: &WebIdentity) -> Option<Device> {
     let mut update = Device::new(device.ip);
     update.vlan_id = device.vlan_id;
@@ -1365,8 +1629,18 @@ pub fn device_update(device: &Device, id: &WebIdentity) -> Option<Device> {
         update.add_warning(w.clone());
     }
     if let Some(role) = id.role_hint {
-        if device.role == DeviceRole::Host {
-            update.role = role;
+        if device.role == DeviceRole::Host
+            || device.effective_role_confidence() == Some(RoleConfidence::Low)
+        {
+            update.set_role(
+                role,
+                RoleSource::Web,
+                RoleConfidence::Medium,
+                vec![format!(
+                    "web UI identified as {}",
+                    id.identity.as_deref().unwrap_or(role.label())
+                )],
+            );
         }
     }
     let changed = update.web_title.is_some()
@@ -1831,6 +2105,72 @@ zQA2Rh3qfkc=
     }
 
     #[test]
+    fn network_gear_web_uis_are_identified() {
+        use DeviceRole::{AccessPoint as Ap, Firewall as Fw, Router as Rt, Switch as Sw};
+        let id = |t: &[&str]| identify(t);
+        let role = |t: &[&str]| identify(t).and_then(|(_, r)| r);
+        // Cisco Business / Small Business / Catalyst.
+        assert_eq!(
+            id(&["CBS350-24P-4G"]).unwrap(),
+            ("Cisco Business switch", Some(Sw))
+        );
+        assert_eq!(role(&["Cisco CBS250-8T-D"]), Some(Sw));
+        assert_eq!(role(&["Cisco Small Business", "SG350-28P"]), Some(Sw));
+        assert_eq!(role(&["SG300-10 Cisco Systems"]), Some(Sw));
+        assert_eq!(role(&["Catalyst 9300 Web UI"]), Some(Sw));
+        assert_eq!(
+            id(&["Cisco Catalyst 9800-L Wireless Controller"])
+                .unwrap()
+                .1,
+            None
+        );
+        assert_eq!(id(&["Cisco Business Dashboard"]).unwrap().1, None);
+        assert_eq!(role(&["Cisco RV340 router"]), Some(Rt));
+        assert_eq!(role(&["CBW240AC Cisco Business Wireless"]), Some(Ap));
+        // "SG" model words need the Cisco name; TP-Link SG with TP-Link.
+        assert_eq!(role(&["SG2008 configuration"]), None);
+        assert_eq!(role(&["TP-Link Omada SG2210P"]), Some(Sw));
+        // Ruijie / Reyee by model prefix; the bare brand / EWEB has no role.
+        assert_eq!(id(&["Reyee"]).unwrap(), ("Ruijie / Reyee", None));
+        assert_eq!(id(&["EWEB"]).unwrap(), ("Ruijie / Reyee", None));
+        assert_eq!(role(&["Ruijie RG-ES226GC-P"]), Some(Sw));
+        assert_eq!(role(&["Reyee NBS3200-24GT4XS"]), Some(Sw));
+        assert_eq!(role(&["RG-S2910-24GT4XS-E"]), Some(Sw));
+        assert_eq!(role(&["Reyee RG-RAP2260(G)"]), Some(Ap));
+        assert_eq!(role(&["Ruijie EAP602"]), Some(Ap));
+        assert_eq!(role(&["Reyee EG105GW-E"]), Some(Rt));
+        assert_eq!(role(&["RG-EG210G-E"]), Some(Rt));
+        // TP-Link, Netgear, D-Link, Zyxel, H3C, Huawei, Grandstream.
+        assert_eq!(role(&["TL-SG3428 JetStream"]), Some(Sw));
+        assert_eq!(role(&["Omada EAP225"]), Some(Ap));
+        assert_eq!(id(&["Omada Controller"]).unwrap(), ("TP-Link Omada", None));
+        assert_eq!(role(&["NETGEAR ProSAFE GS724T"]), Some(Sw));
+        assert_eq!(role(&["NETGEAR GS108Tv3"]), Some(Sw));
+        assert_eq!(role(&["NETGEAR WAX615"]), Some(Ap));
+        assert_eq!(id(&["NETGEAR Router R7000"]).unwrap(), ("Netgear", None));
+        assert_eq!(role(&["D-Link DGS-1210-28"]), Some(Sw));
+        assert_eq!(role(&["DAP-2610"]), Some(Ap));
+        assert_eq!(role(&["Gestion des utilisateurs"]), None);
+        assert_eq!(role(&["ZyXEL GS1900-24E"]), Some(Sw));
+        assert_eq!(role(&["Zyxel NWA210AX"]), Some(Ap));
+        assert_eq!(role(&["ZyWALL USG FLEX 100"]), Some(Fw));
+        assert_eq!(role(&["H3C Comware Platform Software"]), Some(Sw));
+        assert_eq!(id(&["H3C"]).unwrap(), ("H3C", None));
+        assert_eq!(role(&["HUAWEI S5720-28X-LI"]), Some(Sw));
+        assert_eq!(id(&["HUAWEI HG8245H"]).unwrap(), ("Huawei", None));
+        assert_eq!(role(&["GWN7605"]), Some(Ap));
+        assert_eq!(role(&["GWN7813P"]), Some(Sw));
+        assert_eq!(role(&["GWN7062"]), Some(Rt));
+        assert_eq!(
+            role(&["24-Port Gigabit Smart Managed Plus Switch"]),
+            Some(Sw)
+        );
+        // Model prefixes need a digit right after them.
+        assert_eq!(role(&["Ruijie es"]), None);
+        assert!(NETWORK_IDENTITIES.contains(&"Ruijie / Reyee"));
+    }
+
+    #[test]
     fn device_updates_never_override_better_roles() {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         let wid = WebIdentity {
@@ -1851,9 +2191,27 @@ zQA2Rh3qfkc=
         assert_eq!(u.web_identity.as_deref(), Some("pfSense"));
         assert_eq!(u.warnings.len(), 1);
         assert!(u.sources.is_empty());
+        assert_eq!(u.role_source, Some(RoleSource::Web));
+        assert_eq!(u.role_confidence, Some(RoleConfidence::Medium));
+        assert_eq!(
+            u.role_evidence,
+            vec!["web UI identified as pfSense".to_string()]
+        );
         let mut sw = Device::new(ip);
         sw.role = DeviceRole::Switch;
         assert_eq!(device_update(&sw, &wid).unwrap().role, DeviceRole::Host);
+        // A low-confidence guess is replaced by the web identification.
+        let mut guess = Device::new(ip);
+        guess.set_role(
+            DeviceRole::Switch,
+            RoleSource::OuiPorts,
+            RoleConfidence::Low,
+            vec!["oui".into()],
+        );
+        let u = device_update(&guess, &wid).unwrap();
+        guess.merge(&u);
+        assert_eq!(guess.role, DeviceRole::Firewall);
+        assert_eq!(guess.role_source, Some(RoleSource::Web));
         let empty = summarize(ip, vec![], NOW_2027);
         assert!(device_update(&host, &empty).is_none());
         assert_eq!(plan_ports(None).unwrap(), DEFAULT_WEB_PORTS);

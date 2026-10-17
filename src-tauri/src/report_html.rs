@@ -1063,7 +1063,15 @@ fn inventory_columns(r: &Report) -> Vec<Col> {
             name: "Role",
             visible: true,
             numeric: false,
-            cell: |d, _| (None, d.role.label().to_string()),
+            // A low-confidence guess (host name / OUI) is marked so readers can tell it from
+            // a role the device reported itself.
+            cell: |d, _| {
+                let low = d.role.is_infrastructure() && !d.is_confident_infra();
+                (
+                    None,
+                    format!("{}{}", d.role.label(), if low { " (guess)" } else { "" }),
+                )
+            },
         },
         Col {
             name: "VLAN",

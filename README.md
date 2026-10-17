@@ -137,15 +137,37 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
   limit, which SweepR raises at startup toward `min(hard limit, 10240)` (macOS defaults to
   256). A connect that still fails with "too many open files" is retried and, if it keeps
   failing, reported as unknown — never as closed.
+- **Role hints for quiet network gear** (`src/role_hints.rs`): small business switches
+  (Cisco Business / Small Business CBS / SG, Ruijie Reyee, TP-Link JetStream, Netgear
+  ProSAFE, ...) often expose only a web UI and answer neither SNMP nor CDP / LLDP. After
+  enrichment a table-driven classifier combines weak signals: host-name tokens from every
+  name source (Cisco's default `switch` + 6 hex digits — strongest when they are the
+  device's own MAC tail — model names such as `sg350`, `cbs250`, `catalyst`, `usw-24`,
+  `rg-s2910`, generic words such as `switch`, `sw-01`, `rtr`, `gw`, `ap-floor2`, `fw`),
+  DNS-SD service types seen over mDNS (`_csco-sb._tcp`), the web identity, and the OUI
+  vendor class (dedicated network vendors such as Cisco / Juniper / Ruijie add weight;
+  TP-Link, Netgear, D-Link, Zyxel, Huawei, Grandstream also make end devices and add none;
+  other vendors only count a web identification or pfSense / OPNsense / FortiGate VM /
+  OpenWrt names). Host evidence vetoes every guess (SMB / RDP / VNC / AFP / printing
+  ports, a phone / printer / camera / TV / NAS device kind, SIP / ONVIF identities, CDP
+  telephones, phone-maker OUIs, `SEP…` / `laptop` / `desktop` names, printer / AirPlay /
+  SMB mDNS services). The result carries `roleSource` / `roleConfidence` /
+  `roleEvidence`: a guess is `low` or `medium`, CDP / LLDP / SNMP are `high` and always
+  win, and nothing ever downgrades infrastructure to a host. A network-vendor host with no
+  role signal keeps role `host` with a "possible network device" line in `roleEvidence`.
+  Each guess is logged (`role guess <ip>: Switch (low confidence) from ...`), and the SNMP
+  summary names the candidates that never answered. Phone-only OUIs (Yealink, Snom, Poly,
+  Fanvil, ...) that did not answer SIP get `deviceKind: "voip_phone"`.
 - **SNMP** (`--snmp-community` / `--snmp-version` / `--snmp-user`, or the
   `sweepr snmp <IP>` subcommand): polls the system MIB, VLAN tables (Q-BRIDGE and Cisco
   VTP) and the bridge / CAM tables (v1 GETNEXT, v2c/v3 GETBULK) to classify infrastructure
   by role and map endpoint MACs to named switch ports (`Gi1/0/24`). During a scan only
   likely infrastructure is polled (the default gateway, CDP/LLDP neighbors' management
   addresses, devices already classified as infrastructure, network-vendor MACs and hosts
-  with TCP 22/23/80/443/8291 open) unless `--snmp-all` is given; each host first gets a
-  short reachability probe, and a summary line reports how many hosts answered, timed out
-  or failed authentication. Walks are bounded (row and byte caps, at most 50,000 MAC
+  with TCP 22/23/80/443/8291 open — network-vendor MACs such as Cisco, Ruijie, TP-Link or
+  Netgear are polled even with no TCP port open) unless `--snmp-all` is given; each host
+  first gets a short reachability probe, and a summary line reports how many hosts
+  answered, timed out (naming the first 12 silent ones) or failed authentication. Walks are bounded (row and byte caps, at most 50,000 MAC
   entries per device, per-device deadline, end-of-MIB / loop detection) so a hostile agent
   cannot hang or exhaust memory; a walk that fails part-way keeps what it collected and the
   result is marked partial. A device's switch port ignores uplinks / trunks (ports that
@@ -223,9 +245,13 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
     timeouts, a 64 KiB body cap and at most two same-host redirects; no credentials are ever
     sent, and certificates are read without being trusted. Known appliances (Proxmox VE,
     Synology DSM, QNAP, TrueNAS, iDRAC, iLO, ESXi / vCenter, UniFi, pfSense / OPNsense,
-    FortiGate, MikroTik, Pi-hole, Home Assistant, ...) are named in `webIdentity`; firewall /
-    router appliances also suggest a role, which is only applied to devices still classified
-    as plain hosts. Expired, soon-to-expire (< 30 days), not-yet-valid and self-signed
+    FortiGate, MikroTik, Pi-hole, Home Assistant, Cisco Business / Catalyst, Ruijie / Reyee,
+    TP-Link Omada / JetStream, Netgear ProSAFE, D-Link DGS, Zyxel, H3C / Huawei, Grandstream
+    GWN, ...) are named in `webIdentity`; network appliances also suggest a role (switch /
+    AP / gateway by model prefix where the UI names one, e.g. Ruijie `RG-S` / `RG-ES` /
+    `RG-NBS` switches, `RG-RAP` / `RG-AP` / `EAP` APs, `RG-EG` / `EG` gateways), applied
+    with `roleSource: "web"`, `roleConfidence: "medium"` only to devices still classified as
+    plain hosts or carrying a low-confidence guess. Expired, soon-to-expire (< 30 days), not-yet-valid and self-signed
     certificates are listed in `warnings`.
   - **iPerf3** (`sweepr iperf`, GUI `start_iperf`): runs the installed `iperf3` client
     (looked up on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`) with validated arguments
@@ -520,6 +546,7 @@ src-tauri/
   src/latency.rs   latency monitor (ICMP / TCP fallback, rolling stats, sparklines)
   src/trace.rs     MTR-style traceroute (raw ICMP as root, system traceroute otherwise)
   src/webid.rs     HTTP title / Server header / TLS certificate grabber, appliance identification
+  src/role_hints.rs weak-evidence role classifier (host names, mDNS services, web identity, OUI)
   src/iperf.rs     iperf3 client runner and JSON parsers
   src/jobs.rs      registry of running utility jobs (monitors, traces, iperf3 runs)
   src/owner.rs     hands files created under sudo back to the invoking user
@@ -819,7 +846,30 @@ interface Device {
   dhcpFingerprint: DhcpFingerprint | null;
   dhcpServer: boolean | null;        // seen answering as a DHCP server (OFFER / ACK / NAK)
   ipv6Router: boolean | null;        // sent an IPv6 router advertisement during the scan
+  // Role provenance (additive; null / [] on input from older frontends and saves).
+  roleSource: RoleSource | null;     // where `role` came from; null for a plain host
+  roleConfidence: "high" | "medium" | "low" | null; // null for a plain host; an
+                                     // infrastructure role without one counts as "medium"
+  roleEvidence: string[];            // human-readable reasons (max 8); a host may carry
+                                     // "possible network device: <vendor> OUI" hints
+  mdnsServices: string[];            // DNS-SD service types seen over mDNS (max 16),
+                                     // e.g. "_http._tcp", "_csco-sb._tcp"
 }
+
+type RoleSource =
+  | "cdp" | "lldp" | "snmp"          // the device described itself: "high"
+  | "web"                            // web UI identification: "medium"
+  | "mdns_service" | "name"          // role hints (src/role_hints.rs): "low" / "medium"
+  | "oui_ports"                      // OUI + management ports: "low" (SSH / Telnet) or
+                                     // "medium" (FortiGate 10443, Winbox, Palo Alto)
+  | "user";                          // reserved (the GUI does not edit roles yet)
+
+// Merge rule: a more confident role replaces a less confident one (whatever the role);
+// between equal confidence the old priority applies (firewall > switch > AP > router);
+// a host observation never replaces infrastructure. CSV / XLSX exports have a "Role Source"
+// column ("host name (low)", "SNMP (high)"). The audit does not fire infrastructure-only
+// rules (SWR-SVC-005, SWR-MGT-001, the NetBIOS "high" grade) on low-confidence roles; the
+// HTML report marks them "Switch (guess)". Role counts include guesses.
 
 // Additive: new strings may appear; render unknown ones as-is.
 type DeviceKind =

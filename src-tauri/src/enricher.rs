@@ -31,7 +31,8 @@ use crate::{
     limits::{self, SocketBudget},
     models::{
         format_mac, now_ms, parse_mac, sanitize_override, sanitize_text, Device, DeviceOverride,
-        DeviceRole, DiscoverySource, ScanConfig, ScanEvent, MAX_CONCURRENCY,
+        DeviceRole, DiscoverySource, RoleConfidence, RoleSource, ScanConfig, ScanEvent,
+        MAX_CONCURRENCY, MAX_MDNS_SERVICES,
     },
     progress::ProgressScope,
 };
@@ -396,12 +397,46 @@ impl PtrResolver {
 const MAX_MDNS_TYPES: usize = 64;
 const MAX_MDNS_HOSTS: usize = 4096;
 
+/// What one host advertised over mDNS: its host name and the DNS-SD service types seen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MdnsHost {
+    pub name: String,
+    /// Service types without the `.local.` suffix (`_http._tcp`, `_csco-sb._tcp`), at most
+    /// [`MAX_MDNS_SERVICES`], in discovery order.
+    pub services: Vec<String>,
+}
+
+/// `_http._tcp.local.` -> `_http._tcp` (sanitized, lowercase); `None` when unusable.
+pub fn normalize_service_type(ty: &str) -> Option<String> {
+    let t = ty.trim().trim_end_matches('.');
+    let t = t.strip_suffix(".local").unwrap_or(t);
+    let t = sanitize_text(t).to_ascii_lowercase();
+    (t.starts_with('_') && t.len() <= 64 && !t.contains(' ')).then_some(t)
+}
+
+/// Record one resolved service for `host` at `ip` in `map` (bounded).
+fn record_mdns(map: &mut HashMap<IpAddr, MdnsHost>, ip: IpAddr, host: &str, service: Option<&str>) {
+    if map.len() >= MAX_MDNS_HOSTS && !map.contains_key(&ip) {
+        return;
+    }
+    let entry = map.entry(ip).or_insert_with(|| MdnsHost {
+        name: host.to_string(),
+        services: Vec::new(),
+    });
+    if let Some(svc) = service.and_then(normalize_service_type) {
+        if entry.services.len() < MAX_MDNS_SERVICES && !entry.services.contains(&svc) {
+            entry.services.push(svc);
+        }
+    }
+}
+
 /// Browse the local mDNS realm for `duration`, returning a map of IP address to the
-/// advertised host name. Runs the service daemon on a blocking thread (it owns its own
-/// background thread and sync channels), so callers should `spawn_blocking` this.
-pub fn mdns_discover_blocking(duration: Duration) -> HashMap<IpAddr, String> {
+/// advertised host name and service types. Runs the service daemon on a blocking thread (it
+/// owns its own background thread and sync channels), so callers should `spawn_blocking`
+/// this.
+pub fn mdns_discover_blocking(duration: Duration) -> HashMap<IpAddr, MdnsHost> {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
-    let mut map: HashMap<IpAddr, String> = HashMap::new();
+    let mut map: HashMap<IpAddr, MdnsHost> = HashMap::new();
     let Ok(daemon) = ServiceDaemon::new() else {
         return map;
     };
@@ -431,10 +466,12 @@ pub fn mdns_discover_blocking(duration: Duration) -> HashMap<IpAddr, String> {
                         continue;
                     }
                     for addr in info.get_addresses() {
-                        if map.len() >= MAX_MDNS_HOSTS {
-                            break;
-                        }
-                        map.entry(addr.to_ip_addr()).or_insert_with(|| host.clone());
+                        record_mdns(
+                            &mut map,
+                            addr.to_ip_addr(),
+                            &host,
+                            Some(info.ty_domain.as_str()),
+                        );
                     }
                 }
             }
@@ -583,6 +620,14 @@ pub fn is_network_vendor(vendor: &str) -> bool {
         "cambium",
         "mellanox",
         "dell emc networking",
+        "force10",
+        "ruijie",
+        "reyee",
+        "accton",
+        "grandstream",
+        "alcatel-lucent enterprise",
+        "hirschmann",
+        "planet technology",
     ];
     let v = vendor.to_ascii_lowercase();
     VENDORS.iter().any(|n| v.contains(n))
@@ -600,34 +645,60 @@ const HOST_PORTS: &[u16] = &[139, 445, 548, 3389, 5900, 515, 631, 9100];
 /// The OUI alone is never enough: Fortinet's OUI also covers FortiSwitch / FortiAP / phones,
 /// Ubiquiti's covers UniFi switches, gateways, cameras and APs, and HP's covers printers.
 pub fn fingerprint_role(vendor: Option<&str>, open_ports: &[u16]) -> Option<DeviceRole> {
+    fingerprint(vendor, open_ports).map(|(role, _, _)| role)
+}
+
+/// [`fingerprint_role`] with its confidence and a human-readable reason: product-specific
+/// management services (FortiGate 10443, Palo Alto, MikroTik Winbox / API) are `medium`; a
+/// networking OUI with SSH / Telnet open is only a `low` guess (it could be a router, a
+/// wireless controller or an AP as well as a switch).
+pub fn fingerprint(
+    vendor: Option<&str>,
+    open_ports: &[u16],
+) -> Option<(DeviceRole, RoleConfidence, String)> {
     let v = vendor?.to_ascii_lowercase();
     let has = |p: u16| open_ports.contains(&p);
     if HOST_PORTS.iter().any(|p| has(*p)) {
         return None;
     }
+    let medium = |role, why: &str| Some((role, RoleConfidence::Medium, why.to_string()));
 
     // FortiGate: the SSL-VPN / admin port 10443 is a FortiGate-only service (FortiSwitch and
     // FortiAP expose plain 22/80/443).
     if (v.contains("fortinet") || v.contains("fortigate")) && has(10443) {
-        return Some(DeviceRole::Firewall);
+        return medium(
+            DeviceRole::Firewall,
+            "Fortinet OUI with FortiGate admin port 10443",
+        );
     }
     // Palo Alto Networks hardware is firewalls; still require its management plane.
     if v.contains("palo alto") && (has(443) || has(22)) {
-        return Some(DeviceRole::Firewall);
+        return medium(
+            DeviceRole::Firewall,
+            "Palo Alto Networks OUI with management open",
+        );
     }
     // MikroTik Winbox (8291) / RouterOS API (8728) only run on RouterOS devices.
     if (v.contains("mikrotik") || v.contains("routerboard")) && (has(8291) || has(8728)) {
-        return Some(DeviceRole::Router);
+        return medium(
+            DeviceRole::Router,
+            "MikroTik OUI with Winbox / RouterOS API open",
+        );
     }
     // Vendors whose OUIs are (almost) only network gear: CLI management (SSH / Telnet).
     // Generic HP / HPE OUIs are left out: they also cover printers and ProLiant iLO.
     let networking = v.contains("aruba")
         || v.contains("juniper")
-        || v.contains("cisco")
+        || (v.contains("cisco") && !v.contains("linksys") && !v.contains("meraki"))
         || v.contains("arista")
         || v.contains("extreme networks");
     if networking && (has(22) || has(23)) {
-        return Some(DeviceRole::Switch);
+        let cli = if has(22) { "SSH" } else { "Telnet" };
+        return Some((
+            DeviceRole::Switch,
+            RoleConfidence::Low,
+            format!("network-vendor OUI with {cli} management open"),
+        ));
     }
     None
 }
@@ -763,7 +834,7 @@ pub async fn enrich_devices_with(
 struct EnrichCtx<'a> {
     resolve: bool,
     resolver: Option<&'a hickory_resolver::TokioResolver>,
-    mdns: &'a HashMap<IpAddr, String>,
+    mdns: &'a HashMap<IpAddr, MdnsHost>,
     ports: &'a [u16],
     connect_timeout: Duration,
     name_timeout: Duration,
@@ -806,15 +877,24 @@ async fn enrich_one(device: &Device, ctx: &EnrichCtx<'_>) -> (Option<Device>, us
                 }
             }
         }
-        // mDNS name from the browsed map (primary or extra IP).
-        if device.mdns_name.is_none() {
-            let hit = std::iter::once(&device.ip)
-                .chain(&device.extra_ips)
-                .find_map(|ip| ctx.mdns.get(ip).cloned());
-            if let Some(name) = hit {
-                update.mdns_name = Some(name);
+        // mDNS name and service types from the browsed map (primary and extra IPs).
+        for hit in std::iter::once(&device.ip)
+            .chain(&device.extra_ips)
+            .filter_map(|ip| ctx.mdns.get(ip))
+        {
+            if device.mdns_name.is_none() && update.mdns_name.is_none() {
+                update.mdns_name = Some(hit.name.clone());
                 update.add_source(DiscoverySource::Mdns);
                 changed = true;
+            }
+            for svc in &hit.services {
+                let known =
+                    device.mdns_services.contains(svc) || update.mdns_services.contains(svc);
+                if !known && update.mdns_services.len() < MAX_MDNS_SERVICES {
+                    update.mdns_services.push(svc.clone());
+                    update.add_source(DiscoverySource::Mdns);
+                    changed = true;
+                }
             }
         }
         // NetBIOS node status (IPv4 only).
@@ -855,8 +935,8 @@ async fn enrich_one(device: &Device, ctx: &EnrichCtx<'_>) -> (Option<Device>, us
             let vendor = update.vendor.as_deref().or(device.vendor.as_deref());
             let mut all_open = device.open_ports.clone();
             all_open.extend(&update.open_ports);
-            if let Some(role) = fingerprint_role(vendor, &all_open) {
-                update.role = role;
+            if let Some((role, confidence, why)) = fingerprint(vendor, &all_open) {
+                update.set_role(role, RoleSource::OuiPorts, confidence, vec![why]);
                 changed = true;
             }
         }
@@ -1311,6 +1391,67 @@ mod tests {
         assert_eq!(fingerprint_role(None, &[22, 443, 161]), None);
         assert_eq!(fingerprint_role(Some("Cisco Systems, Inc"), &[80]), None);
         assert_eq!(fingerprint_role(Some("Dell Inc."), &[22, 443]), None);
+        // Confidence: product-specific ports are medium, OUI + SSH is a low guess.
+        let conf = |v: &str, p: &[u16]| fingerprint(Some(v), p).map(|(_, c, _)| c);
+        assert_eq!(
+            conf("Fortinet, Inc.", &[10443]),
+            Some(RoleConfidence::Medium)
+        );
+        assert_eq!(
+            conf("Routerboard.com", &[8291]),
+            Some(RoleConfidence::Medium)
+        );
+        assert_eq!(conf("Cisco Systems, Inc", &[22]), Some(RoleConfidence::Low));
+        // Cisco web UI only (the reported switches): no fingerprint, the role-hint pass
+        // needs a second signal.
+        assert_eq!(
+            fingerprint_role(Some("Cisco Systems, Inc"), &[80, 443]),
+            None
+        );
+        assert_eq!(fingerprint_role(Some("Cisco-Linksys, LLC"), &[22]), None);
+        assert_eq!(fingerprint_role(Some("Cisco Meraki"), &[22]), None);
+        // The extended network-vendor list (SNMP candidates).
+        for v in [
+            "Ruijie Networks Co.,LTD",
+            "TP-LINK TECHNOLOGIES CO.,LTD.",
+            "Allied Telesis Inc.",
+            "Accton Technology Corp",
+            "Grandstream Networks, Inc.",
+        ] {
+            assert!(is_network_vendor(v), "{v}");
+        }
+        assert!(!is_network_vendor("Dell Inc."));
+    }
+
+    #[test]
+    fn mdns_service_types_are_kept_per_host() {
+        assert_eq!(
+            normalize_service_type("_csco-sb._tcp.local.").as_deref(),
+            Some("_csco-sb._tcp")
+        );
+        assert_eq!(
+            normalize_service_type("_HTTP._tcp.local").as_deref(),
+            Some("_http._tcp")
+        );
+        assert_eq!(normalize_service_type("bad type.local."), None);
+        assert_eq!(normalize_service_type(""), None);
+        let mut map = HashMap::new();
+        let ip: IpAddr = "10.10.60.5".parse().unwrap();
+        record_mdns(
+            &mut map,
+            ip,
+            "switch375bc6.local",
+            Some("_csco-sb._tcp.local."),
+        );
+        record_mdns(&mut map, ip, "other.local", Some("_http._tcp.local."));
+        record_mdns(&mut map, ip, "other.local", Some("_http._tcp.local."));
+        let h = &map[&ip];
+        assert_eq!(h.name, "switch375bc6.local", "the first host name wins");
+        assert_eq!(h.services, vec!["_csco-sb._tcp", "_http._tcp"]);
+        for i in 0..40 {
+            record_mdns(&mut map, ip, "x", Some(&format!("_s{i}._tcp.local.")));
+        }
+        assert_eq!(map[&ip].services.len(), MAX_MDNS_SERVICES);
     }
 
     #[tokio::test]

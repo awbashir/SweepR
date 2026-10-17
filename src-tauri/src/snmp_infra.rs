@@ -33,8 +33,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     limits::SocketBudget,
     models::{
-        now_ms, sanitize_text, DeviceRole, DiscoverySource, PortMacCount, ScanEvent, SnmpConfig,
-        SnmpDeviceInfo, SnmpVersion, SwitchPortMapping, VlanInfo, VlanSource, MAX_VLAN_ID,
+        now_ms, sanitize_text, DeviceRole, DiscoverySource, PortMacCount, RoleConfidence,
+        RoleSource, ScanEvent, SnmpConfig, SnmpDeviceInfo, SnmpVersion, SwitchPortMapping,
+        VlanInfo, VlanSource, MAX_VLAN_ID,
     },
     progress::ProgressScope,
 };
@@ -499,6 +500,9 @@ const NETWORK_ONLY_ENTERPRISES: &[u64] = &[
     25506, // H3C
     30065, // Arista
     1916,  // Extreme Networks
+    4881,  // Ruijie
+    207,   // Allied Telesis
+    259,   // Edgecore / Accton
 ];
 
 /// Classify a device from its sysObjectID, sysDescr text, sysServices bit field and whether
@@ -575,6 +579,10 @@ pub fn classify_role(
         "ruckus",
         "mikrotik cap",
         "wifi access",
+        "rg-rap",
+        "rg-ap",
+        "rg-eap",
+        "gwn76",
     ]) && !any(&["wireless lan controller", "wlc", "switch", "router"])
     {
         return DeviceRole::AccessPoint;
@@ -598,6 +606,14 @@ pub fn classify_role(
         "usw-",
         "unifi switch",
         "edgeswitch",
+        "rg-s",
+        "rg-es",
+        "rg-nbs",
+        "jetstream",
+        "prosafe",
+        "comware",
+        "cloudengine",
+        "gwn78",
     ]) || oid_in(sys_object_id, "1.3.6.1.4.1.11.2.3.7.11")
     // HP ProCurve / Aruba switch products
     {
@@ -616,6 +632,7 @@ pub fn classify_role(
         "mx240",
         "mx480",
         "gateway",
+        "rg-eg",
     ]) {
         return DeviceRole::Router;
     }
@@ -1613,7 +1630,7 @@ fn oid_le(a: &[u64], b: &[u64]) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// Outcome counts of one [`probe_candidates`] run.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnmpPollStats {
     pub polled: usize,
     pub ok: usize,
@@ -1622,16 +1639,47 @@ pub struct SnmpPollStats {
     pub no_response: usize,
     pub auth_failures: usize,
     pub errors: usize,
+    /// The first [`MAX_SILENT_LISTED`] candidates that never answered (sorted), so the log
+    /// shows *which* likely infrastructure devices kept their role guess.
+    pub silent_hosts: Vec<IpAddr>,
 }
+
+/// Silent candidates named in the summary line.
+pub const MAX_SILENT_LISTED: usize = 12;
 
 impl SnmpPollStats {
     /// The per-scan summary log line.
     pub fn summary(&self) -> String {
-        format!(
+        let mut line = format!(
             "SNMP: polled {} host(s): {} answered ({} partial), {} no response / timeout, {} \
              authentication failure(s), {} other error(s)",
             self.polled, self.ok, self.partial, self.no_response, self.auth_failures, self.errors
-        )
+        );
+        if !self.silent_hosts.is_empty() {
+            let mut ips = self.silent_hosts.clone();
+            ips.sort();
+            let shown: Vec<String> = ips.iter().map(ToString::to_string).collect();
+            let more = self.no_response.saturating_sub(shown.len());
+            line.push_str(&format!(
+                "; no answer from {}{} (wrong community, SNMP disabled or filtered: their \
+                 roles stay as guessed)",
+                shown.join(", "),
+                if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        line
+    }
+
+    fn note_silent(&mut self, ip: IpAddr, outcome: PollOutcome) {
+        if matches!(outcome, PollOutcome::Failed(PollFailure::NoResponse))
+            && self.silent_hosts.len() < MAX_SILENT_LISTED
+        {
+            self.silent_hosts.push(ip);
+        }
     }
 
     fn record(&mut self, outcome: PollOutcome) {
@@ -1679,8 +1727,15 @@ pub async fn probe_candidates(
     let logged = Arc::new(AtomicUsize::new(0));
     let mut tasks = tokio::task::JoinSet::new();
     let mut stats = SnmpPollStats::default();
-    let record = |stats: &mut SnmpPollStats, res: Result<PollOutcome, tokio::task::JoinError>| {
-        stats.record(res.unwrap_or(PollOutcome::Failed(PollFailure::Other)));
+    let record = |stats: &mut SnmpPollStats,
+                  res: Result<(IpAddr, PollOutcome), tokio::task::JoinError>| {
+        match res {
+            Ok((ip, outcome)) => {
+                stats.note_silent(ip, outcome);
+                stats.record(outcome);
+            }
+            Err(_) => stats.record(PollOutcome::Failed(PollFailure::Other)),
+        }
     };
 
     for ip in ips {
@@ -1726,7 +1781,7 @@ pub async fn probe_candidates(
                         .unwrap_or_default(),
                 }))
             };
-            match res {
+            let outcome = match res {
                 None => PollOutcome::Skipped,
                 Some(Ok(info)) => {
                     let _ = tx.send(status(true, Some(&info))).await;
@@ -1756,7 +1811,8 @@ pub async fn probe_candidates(
                     }
                     PollOutcome::Failed(kind)
                 }
-            }
+            };
+            (ip, outcome)
         });
         while let Some(res) = tasks.try_join_next() {
             record(&mut stats, res);
@@ -1773,7 +1829,14 @@ pub async fn probe_candidates(
 async fn emit_device_info(ip: IpAddr, info: &SnmpDeviceInfo, tx: &Sender<ScanEvent>) {
     // The infrastructure device itself: role plus a vendor guess from sysDescr.
     let mut dev = crate::models::Device::new(ip);
-    dev.role = info.role;
+    if info.role.is_infrastructure() {
+        let mut why = vec![format!("SNMP agent classified it as {}", info.role.label())];
+        if let Some(d) = info.sys_descr.as_deref().filter(|d| !d.is_empty()) {
+            let short: String = d.chars().take(80).collect();
+            why.push(format!("sysDescr: {short}"));
+        }
+        dev.set_role(info.role, RoleSource::Snmp, RoleConfidence::High, why);
+    }
     dev.vendor = info
         .sys_descr
         .as_deref()
@@ -1919,6 +1982,70 @@ mod tests {
 
     /// M6: vendors that also make printers, servers, APs or cameras are not switches by
     /// enterprise number alone.
+    #[test]
+    fn small_business_switch_classification() {
+        // Cisco Business / Small Business switches answer with "Managed Switch" texts.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.9.6.1.82.24.1"),
+                "CBS350-24P-4G 24-Port Gigabit PoE Managed Switch",
+                None,
+                false
+            ),
+            DeviceRole::Switch
+        );
+        // Cisco enterprise with nothing telling: still a switch (network-only enterprise).
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.9.6.1.1"), "", None, false),
+            DeviceRole::Switch
+        );
+        // Ruijie / Reyee by model prefix and enterprise number 4881.
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.4881.1.1.10.1.1"),
+                "RG-ES226GC-P",
+                None,
+                false
+            ),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.4881.1.1"),
+                "Reyee RG-RAP2200(F)",
+                None,
+                false
+            ),
+            DeviceRole::AccessPoint
+        );
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.4881.1.1"), "RG-EG105G-P V2", None, false),
+            DeviceRole::Router
+        );
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.4881.1.1"), "", None, false),
+            DeviceRole::Switch
+        );
+        // TP-Link (11863) / Netgear (4526) need a keyword or bridge evidence.
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.11863.1.1"), "", None, false),
+            DeviceRole::Host
+        );
+        assert_eq!(
+            classify_role(
+                Some("1.3.6.1.4.1.11863.5.1"),
+                "JetStream 24-Port",
+                None,
+                false
+            ),
+            DeviceRole::Switch
+        );
+        assert_eq!(
+            classify_role(Some("1.3.6.1.4.1.4526.100.4.1"), "GS724Tv4", None, true),
+            DeviceRole::Switch
+        );
+    }
+
     #[test]
     fn role_classification_avoids_vendor_only_false_positives() {
         // HP JetDirect printer: enterprise 11, sysServices 72 (L4 + L7).
@@ -2456,10 +2583,25 @@ mod tests {
                 partial: 1,
                 no_response: 1,
                 auth_failures: 1,
-                errors: 1
+                errors: 1,
+                silent_hosts: vec![],
             }
         );
         let line = s.summary();
+        assert!(!line.contains("no answer from"), "{line}");
+        let mut t = SnmpPollStats::default();
+        for i in 1..=14u8 {
+            let ip = IpAddr::from([10, 10, 60, i]);
+            let outcome = PollOutcome::Failed(PollFailure::NoResponse);
+            t.note_silent(ip, outcome);
+            t.record(outcome);
+        }
+        let silent = t.summary();
+        assert!(
+            silent.contains("no answer from 10.10.60.1, 10.10.60.2")
+                && silent.contains("and 2 more"),
+            "{silent}"
+        );
         assert!(
             line.contains("polled 5") && line.contains("1 authentication"),
             "{line}"

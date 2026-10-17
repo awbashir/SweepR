@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::{sanitize_text, Device};
 
 /// Number of columns in every tabular export.
-pub const NUM_COLUMNS: usize = 24;
+pub const NUM_COLUMNS: usize = 25;
 
 /// Column headers shared by every tabular export.
 pub const COLUMNS: [&str; NUM_COLUMNS] = [
@@ -25,6 +25,7 @@ pub const COLUMNS: [&str; NUM_COLUMNS] = [
     "MAC",
     "VLAN",
     "Role",
+    "Role Source",
     "Hostname",
     "Vendor",
     "Switch/Port",
@@ -48,19 +49,33 @@ pub const COLUMNS: [&str; NUM_COLUMNS] = [
 
 const COL_VLAN: usize = 3;
 /// Numeric columns written as numbers in XLSX.
-const COL_LATENCY: usize = 13;
-const COL_LOSS: usize = 14;
-const COL_POE: usize = 20;
-const COL_VOICE_VLAN: usize = 21;
+const COL_LATENCY: usize = 14;
+const COL_LOSS: usize = 15;
+const COL_POE: usize = 21;
+const COL_VOICE_VLAN: usize = 22;
 
 /// Columns always shown by [`render_table`], even when empty (IP, MAC, VLAN, Role).
 const ALWAYS_SHOWN: [usize; 4] = [0, 2, COL_VLAN, 4];
 
 /// Excel column widths (characters), aligned with [`COLUMNS`].
 const XLSX_WIDTHS: [f64; NUM_COLUMNS] = [
-    16.0, 30.0, 19.0, 7.0, 13.0, 22.0, 24.0, 28.0, 30.0, 26.0, 18.0, 16.0, 20.0, 12.0, 8.0, 32.0,
-    26.0, 13.0, 14.0, 30.0, 9.0, 11.0, 22.0, 36.0,
+    16.0, 30.0, 19.0, 7.0, 13.0, 20.0, 22.0, 24.0, 28.0, 30.0, 26.0, 18.0, 16.0, 20.0, 12.0, 8.0,
+    32.0, 26.0, 13.0, 14.0, 30.0, 9.0, 11.0, 22.0, 36.0,
 ];
+
+/// "SOURCE (CONFIDENCE)" of an infrastructure role, e.g. `host name (low)`, `SNMP (high)`;
+/// empty for plain hosts and for roles recorded without provenance.
+pub fn role_source_cell(d: &Device) -> String {
+    match (d.role.is_infrastructure(), d.role_source) {
+        (true, Some(src)) => format!(
+            "{} ({})",
+            src.label(),
+            d.effective_role_confidence()
+                .map_or("medium", |c| c.label())
+        ),
+        _ => String::new(),
+    }
+}
 
 /// `MODEL / FIRMWARE` from the most specific service source (SIP, ONVIF, then SSDP/UPnP).
 pub fn model_firmware(d: &Device) -> String {
@@ -209,6 +224,7 @@ pub fn device_row(d: &Device) -> [String; NUM_COLUMNS] {
         opt(&d.mac),
         d.vlan_id.map(|v| v.to_string()).unwrap_or_default(),
         d.role.label().to_string(),
+        role_source_cell(d),
         opt(&d.hostname),
         opt(&d.vendor),
         d.switch_port
@@ -435,7 +451,9 @@ pub fn render_table(devices: &[Device]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DeviceRole, DiscoverySource, LatencyStats, TlsCertInfo};
+    use crate::models::{
+        DeviceRole, DiscoverySource, LatencyStats, RoleConfidence, RoleSource, TlsCertInfo,
+    };
 
     fn devices() -> Vec<Device> {
         let mut a = Device::new("10.0.0.20".parse().unwrap());
@@ -457,7 +475,12 @@ mod tests {
             ..TlsCertInfo::default()
         });
         let mut b = Device::new("10.0.0.3".parse().unwrap());
-        b.role = DeviceRole::Switch;
+        b.set_role(
+            DeviceRole::Switch,
+            RoleSource::Name,
+            RoleConfidence::Low,
+            vec!["mDNS name 'switch375bc6.local'".into()],
+        );
         b.open_ports = vec![22, 443];
         b.comments = Some("core, \"stack\"".into());
         let mut c = Device::new("10.10.0.1".parse().unwrap());
@@ -473,17 +496,17 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "IP,Other IPs,MAC,VLAN,Role,Hostname,Vendor,Switch/Port,DNS,mDNS,SMB Name,SMB Domain,\
-             TCP Ports,Latency (ms),Loss %,Web Title,Cert CN,Cert Expires,Device Kind,\
+            "IP,Other IPs,MAC,VLAN,Role,Role Source,Hostname,Vendor,Switch/Port,DNS,mDNS,SMB Name,\
+             SMB Domain,TCP Ports,Latency (ms),Loss %,Web Title,Cert CN,Cert Expires,Device Kind,\
              Model/Firmware,PoE (W),Voice VLAN,OS (DHCP),Comments"
         );
         assert_eq!(
             lines[1],
-            "10.0.0.3,,,,Switch,,,,,,,,\"22, 443\",,,,,,,,,,,\"core, \"\"stack\"\"\""
+            "10.0.0.3,,,,Switch,host name (low),,,,,,,,\"22, 443\",,,,,,,,,,,\"core, \"\"stack\"\"\""
         );
         assert_eq!(
             lines[2],
-            "10.0.0.20,\"fe80::1, 2001:db8::20\",00:11:22:33:44:55,,Host,,,,,,,,,12.3,25.0,\
+            "10.0.0.20,\"fe80::1, 2001:db8::20\",00:11:22:33:44:55,,Host,,,,,,,,,,12.3,25.0,\
              Proxmox VE,pve.lan,2027-03-01 (expired),,,,,,"
         );
         assert!(lines[3].starts_with("10.10.0.1,,,10,Host"));
@@ -507,7 +530,7 @@ mod tests {
             write_csv(&[d], &mut out).unwrap();
             let mut r = csv::Reader::from_reader(out.as_slice());
             let row = r.records().next().unwrap().unwrap();
-            let hostname = &row[5];
+            let hostname = &row[6];
             assert!(hostname.starts_with('\''), "{evil:?} -> {hostname:?}");
             assert!(row[NUM_COLUMNS - 1].starts_with('\''));
         }
@@ -523,7 +546,7 @@ mod tests {
         let mut d = Device::new("10.0.0.1".parse().unwrap());
         d.hostname = Some("\u{1b}]0;pwned\u{7}\u{1b}[2Jhost".into());
         let row = device_row(&d);
-        assert_eq!(row[5], "]0;pwned[2Jhost");
+        assert_eq!(row[6], "]0;pwned[2Jhost");
         assert!(!render_table(&[d]).contains('\u{1b}'));
     }
 

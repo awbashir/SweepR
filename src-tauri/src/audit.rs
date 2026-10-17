@@ -19,7 +19,9 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::models::{normalize_mac, parse_mac, parse_ports, sanitize_text, DeviceRole};
+use crate::models::{
+    normalize_mac, parse_mac, parse_ports, sanitize_text, DeviceRole, RoleConfidence,
+};
 
 /// Most affected entries kept per finding (the true count is in `affected_count`; the JSON
 /// export carries every kept entry, renderers show fewer).
@@ -103,6 +105,13 @@ pub struct AuditDevice {
     pub neighbor: Option<AuditNeighbor>,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
+    /// How sure `role` is (`Device::role_confidence`). A `low` guess (host name / OUI) does
+    /// not fire infrastructure-specific rules; absent means "as sure as before" (medium).
+    #[serde(
+        deserialize_with = "de_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub role_confidence: Option<RoleConfidence>,
     /// Fields not modelled here (added by later scanner features), kept verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -873,6 +882,12 @@ impl AuditDevice {
                 p
             })
             .or_else(|| self.switch_port.as_ref().and_then(|p| p.poe.clone()))
+    }
+
+    /// Infrastructure whose role is more than a low-confidence guess: the condition for
+    /// rules that only make sense on (or are graded up for) real network gear.
+    pub fn is_confident_infra(&self) -> bool {
+        self.role.is_infrastructure() && self.role_confidence != Some(RoleConfidence::Low)
     }
 
     /// Looks like an IP phone: a `voip_phone` device kind, a SIP identity (that is not a
@@ -1861,7 +1876,7 @@ fn rule_smb_infra(ctx: &Ctx) -> RuleOutcome {
         .input
         .devices
         .iter()
-        .filter(|d| d.role.is_infrastructure() && (d.has_port(445) || d.has_port(139)))
+        .filter(|d| d.is_confident_infra() && (d.has_port(445) || d.has_port(139)))
         .map(|d| {
             let ports: Vec<&str> = [(445, "TCP 445"), (139, "TCP 139")]
                 .iter()
@@ -1900,7 +1915,7 @@ fn rule_netbios(ctx: &Ctx) -> RuleOutcome {
         &R_NETBIOS,
         &[139],
         |d| {
-            if d.role.is_infrastructure() {
+            if d.is_confident_infra() {
                 Severity::High
             } else {
                 Severity::Medium
@@ -2005,7 +2020,7 @@ fn rule_http_mgmt(ctx: &Ctx) -> RuleOutcome {
         .devices
         .iter()
         .filter(|d| {
-            d.role.is_infrastructure()
+            d.is_confident_infra()
                 && (d.has_port(80) || d.has_port(8080))
                 && !tls_ports.iter().any(|p| d.has_port(*p))
         })
@@ -3528,6 +3543,31 @@ pub(crate) mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].affected_count, 1);
         assert_eq!(f[0].affected[0].ip.as_deref(), Some("10.0.0.1"));
+    }
+
+    /// Low-confidence role guesses (host name / OUI) do not fire infrastructure-only rules;
+    /// medium / high (and legacy, unannotated) roles do.
+    #[test]
+    fn low_confidence_roles_do_not_fire_infrastructure_rules() {
+        let with = |conf: Option<&str>, ports: &[u16]| {
+            let mut d = dev("10.0.0.1", "00:11:22:00:00:01", "switch", ports);
+            if let Some(c) = conf {
+                d["roleConfidence"] = json!(c);
+                d["roleSource"] = json!("name");
+            }
+            run(json!({ "meta": base_meta(), "devices": [d] }))
+        };
+        assert!(find(&with(Some("low"), &[80]), "SWR-MGT-001").is_empty());
+        assert_eq!(find(&with(Some("medium"), &[80]), "SWR-MGT-001").len(), 1);
+        assert_eq!(find(&with(Some("high"), &[80]), "SWR-MGT-001").len(), 1);
+        assert_eq!(find(&with(None, &[80]), "SWR-MGT-001").len(), 1);
+        // SMB on a guessed switch is not "SMB on infrastructure"; NetBIOS stays medium.
+        let r = with(Some("low"), &[139, 445]);
+        assert!(find(&r, "SWR-SVC-005").is_empty());
+        assert_eq!(find(&r, "SWR-SVC-006")[0].severity, Severity::Medium);
+        assert_eq!(find(&with(None, &[445]), "SWR-SVC-005").len(), 1);
+        // A garbage confidence value reads as absent.
+        assert_eq!(find(&with(Some("sure"), &[80]), "SWR-MGT-001").len(), 1);
     }
 
     #[test]

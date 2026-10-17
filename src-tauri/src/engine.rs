@@ -22,12 +22,12 @@ use crate::{
     limits::SocketBudget,
     models::{
         normalize_mac, Capability, CdpLldpNeighbor, Device, DeviceOverride, DeviceRole,
-        DiscoverySource, InterfaceInfo, InterfaceKind, Ipv4Range, NeighborProtocol, ScanConfig,
-        ScanEvent, ScanPhase, ScanProgress, ScanSummary, SwitchPortMapping, VlanInfo, VlanSource,
-        MAX_LISTEN_SECS,
+        DiscoverySource, InterfaceInfo, InterfaceKind, Ipv4Range, NeighborProtocol, RoleConfidence,
+        RoleSource, ScanConfig, ScanEvent, ScanPhase, ScanProgress, ScanSummary, SwitchPortMapping,
+        VlanInfo, VlanSource, MAX_LISTEN_SECS,
     },
     progress::{ProgressCounter, ProgressScope},
-    services, snmp_infra, sweep, webid,
+    role_hints, services, snmp_infra, sweep, webid,
 };
 
 /// Shared, read-only map of user device overrides applied to every emitted [`Device`].
@@ -386,9 +386,11 @@ impl Aggregate {
         };
         macs.iter().filter(|m| m.as_str() != own_mac).any(|m| {
             self.devices_by_mac.get(m).is_some_and(|keys| {
+                // A low-confidence guess (host name / OUI) is not enough to call a port an
+                // uplink.
                 keys.iter()
                     .filter_map(|k| self.devices.get(k))
-                    .any(|d| infra(d.role))
+                    .any(|d| infra(d.role) && d.is_confident_infrastructure())
             }) || self.neighbors_by_mac.get(m).is_some_and(|keys| {
                 keys.iter()
                     .filter_map(|k| self.neighbors.get(k))
@@ -695,14 +697,33 @@ fn apply_neighbor(dev: &mut Device, n: &CdpLldpNeighbor) -> bool {
     }
     let before = (
         dev.role,
+        dev.role_confidence,
         dev.neighbor.clone(),
         dev.sources.len(),
         dev.voice_vlan,
         dev.poe.clone(),
     );
     let role = n.infer_role();
-    if role.priority() > dev.role.priority() {
-        dev.role = role;
+    if role.is_infrastructure() {
+        // The device's own advertisement: high confidence, beats every guess.
+        let (source, proto) = match n.protocol {
+            NeighborProtocol::Cdp => (RoleSource::Cdp, "CDP"),
+            NeighborProtocol::Lldp => (RoleSource::Lldp, "LLDP"),
+        };
+        let what = n
+            .platform
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| n.display_name());
+        let what: String = what.chars().take(80).collect();
+        let mut obs = Device::new(dev.ip);
+        obs.set_role(
+            role,
+            source,
+            RoleConfidence::High,
+            vec![format!("{proto} advertisement ({what})")],
+        );
+        dev.merge_role(&obs);
     }
     // An endpoint advertising itself (IP phone, AP, camera): its own LLDP-MED / CDP voice VLAN
     // and the PoE it draws describe it. A switch / router's advertisement describes *our* port,
@@ -727,6 +748,7 @@ fn apply_neighbor(dev: &mut Device, n: &CdpLldpNeighbor) -> bool {
     before
         != (
             dev.role,
+            dev.role_confidence,
             dev.neighbor.clone(),
             dev.sources.len(),
             dev.voice_vlan,
@@ -1333,6 +1355,58 @@ fn dhcp_log_line(d: &Device) -> String {
     )
 }
 
+/// Role guesses logged one by one (the rest are only counted).
+const MAX_ROLE_GUESS_LOGS: usize = 25;
+
+/// Send the [`role_hints::guess_update`] of every device in `devices` to `out` and return the
+/// log lines describing them (the first [`MAX_ROLE_GUESS_LOGS`] guesses, then a count).
+async fn role_guess_pass(
+    devices: &[Device],
+    overrides: Option<&HashMap<String, DeviceOverride>>,
+    out: &Sender<ScanEvent>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut guessed = 0usize;
+    let mut hinted = 0usize;
+    for d in devices {
+        let label = overrides
+            .and_then(|o| o.get(&d.key()))
+            .and_then(|o| o.hostname.as_deref());
+        let Some(update) = role_hints::guess_update(d, label) else {
+            continue;
+        };
+        let proposes_role = update.role.is_infrastructure() && update.role != d.role;
+        if proposes_role {
+            guessed += 1;
+            if guessed <= MAX_ROLE_GUESS_LOGS {
+                lines.push(format!(
+                    "role guess {}: {} ({} confidence) from {}",
+                    d.ip,
+                    update.role.label(),
+                    update.role_confidence.map_or("low", RoleConfidence::label),
+                    update.role_evidence.join("; ")
+                ));
+            }
+        } else if !update.role.is_infrastructure() && !update.role_evidence.is_empty() {
+            hinted += 1;
+        }
+        let _ = out.send(ScanEvent::device(update)).await;
+    }
+    if guessed > 0 || hinted > 0 {
+        lines.push(format!(
+            "role hints: {guessed} device(s) classified from host names / mDNS services / web \
+             identity / OUI (marked low or medium confidence; SNMP, CDP and LLDP override \
+             them), {hinted} more flagged as possible network devices{}",
+            if guessed > MAX_ROLE_GUESS_LOGS {
+                format!(" ({} guesses not listed)", guessed - MAX_ROLE_GUESS_LOGS)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    lines
+}
+
 /// TCP ports whose presence marks a likely managed network device (SSH, Telnet, HTTP(S),
 /// MikroTik Winbox) when choosing SNMP poll candidates.
 pub const SNMP_HINT_PORTS: &[u16] = &[22, 23, 80, 443, 8291];
@@ -1551,6 +1625,20 @@ async fn run_enrichment(
         state = aggregator.await.context("service aggregator crashed")?;
     }
     services_scope.finish();
+
+    // Step 3b: weak-evidence role guesses (host names, mDNS service types, web identity, OUI
+    // class). Low / medium confidence: SNMP below and CDP / LLDP override them in the merge.
+    if !cancel.is_cancelled() {
+        let enriched = state.sorted_devices();
+        let (gtx, grx) = mpsc::channel(EVENT_BUFFER);
+        let aggregator = tokio::spawn(aggregate(state, overrides.clone(), false, grx, tx.clone()));
+        let lines = role_guess_pass(&enriched, overrides.as_deref(), &gtx).await;
+        for line in lines {
+            let _ = gtx.send(ScanEvent::info(line)).await;
+        }
+        drop(gtx);
+        state = aggregator.await.context("role-hint aggregator crashed")?;
+    }
 
     // Step 4: SNMP infrastructure polling.
     if let (Some(snmp), false) = (&cfg.snmp, cancel.is_cancelled()) {
@@ -2049,6 +2137,117 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, ScanEvent::Neighbor(_))));
     }
 
+    /// The reported scan: Cisco Business switches with only their web UI open and a default
+    /// `switchXXXXXX` mDNS name become (guessed) switches; the guess is logged; CDP / SNMP
+    /// evidence arriving later still wins; phones and plain Cisco hosts stay hosts.
+    #[tokio::test]
+    async fn role_guess_pass_classifies_quiet_switches_and_yields_to_snmp_and_cdp() {
+        let cisco = |ip: &str, mac: &str, name: Option<&str>, ports: &[u16]| {
+            let mut d = Device::new(ip.parse().unwrap());
+            d.mac = Some(mac.into());
+            d.vendor = Some("Cisco Systems, Inc".into());
+            d.mdns_name = name.map(str::to_string);
+            d.open_ports = ports.to_vec();
+            d.extra_ips.push("fe80::1:2".parse().unwrap());
+            d
+        };
+        let quiet = cisco(
+            "10.10.60.5",
+            "70:1f:53:37:5b:c6",
+            Some("switch375bc6.local"),
+            &[80, 443],
+        );
+        let other = cisco(
+            "10.10.60.6",
+            "70:1f:53:fa:63:4c",
+            Some("SwitchFA634C.local"),
+            &[],
+        );
+        let cdp_sw = cisco(
+            "10.10.60.7",
+            "cc:cc:cc:cc:cc:cc",
+            Some("switch112233.local"),
+            &[443],
+        );
+        let plain = cisco("10.10.60.8", "70:1f:53:00:00:08", None, &[80, 443]);
+        let mut phone = cisco(
+            "10.10.60.9",
+            "70:1f:53:00:00:09",
+            Some("SEP701F53000009"),
+            &[80],
+        );
+        phone.mdns_name = None;
+        phone.dns_name = Some("SEP701F53000009".into());
+        let mut yealink = Device::new("10.10.60.10".parse().unwrap());
+        yealink.vendor = Some("Yealink(Xiamen) Network Technology Co.,Ltd.".into());
+        let devices = vec![quiet, other, cdp_sw, plain, phone, yealink];
+
+        let mut state = Aggregate::default();
+        for d in &devices {
+            state.devices.insert(d.key(), d.clone());
+        }
+        let (itx, irx) = mpsc::channel(256);
+        let (otx, mut orx) = mpsc::channel(1024);
+        let agg = tokio::spawn(aggregate(state, None, false, irx, otx));
+        let lines = role_guess_pass(&devices, None, &itx).await;
+        // CDP for one of them, and a high-confidence SNMP answer for another, afterwards.
+        itx.send(ScanEvent::Neighbor(switch_neighbor(
+            "cc:cc:cc:cc:cc:cc",
+            "10.10.60.7",
+        )))
+        .await
+        .unwrap();
+        let mut snmp = Device::new("10.10.60.6".parse().unwrap());
+        snmp.set_role(
+            DeviceRole::Router,
+            RoleSource::Snmp,
+            RoleConfidence::High,
+            vec!["SNMP agent classified it as Router".into()],
+        );
+        itx.send(ScanEvent::device(snmp)).await.unwrap();
+        drop(itx);
+        let state = agg.await.unwrap();
+        let _ = drain(&mut orx);
+
+        let d = &state.devices["10.10.60.5"];
+        assert_eq!(d.role, DeviceRole::Switch);
+        assert_eq!(d.role_source, Some(RoleSource::Name));
+        assert_eq!(d.role_confidence, Some(RoleConfidence::Medium)); // MAC tail matches
+        assert!(d.role_evidence.iter().any(|e| e.contains("switch375bc6")));
+        let d = &state.devices["10.10.60.6"];
+        assert_eq!(d.role, DeviceRole::Router, "SNMP wins over the name guess");
+        assert_eq!(d.role_source, Some(RoleSource::Snmp));
+        let d = &state.devices["10.10.60.7"];
+        assert_eq!(d.role, DeviceRole::Switch);
+        assert_eq!(d.role_source, Some(RoleSource::Lldp));
+        assert_eq!(d.role_confidence, Some(RoleConfidence::High));
+        let d = &state.devices["10.10.60.8"];
+        assert_eq!(d.role, DeviceRole::Host);
+        assert_eq!(
+            d.role_evidence.first().map(String::as_str),
+            Some("possible network device: Cisco OUI")
+        );
+        assert_eq!(state.devices["10.10.60.9"].role, DeviceRole::Host);
+        assert!(state.devices["10.10.60.9"].role_evidence.is_empty());
+        let y = &state.devices["10.10.60.10"];
+        assert_eq!(y.role, DeviceRole::Host);
+        assert_eq!(y.device_kind.as_deref(), Some("voip_phone"));
+        // Logged: one line per guess, then the summary.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("role guess 10.10.60.5: Switch (medium")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .starts_with("role hints: 3 device(s) classified"),
+            "{lines:?}"
+        );
+    }
+
     fn drain(orx: &mut Receiver<ScanEvent>) -> Vec<ScanEvent> {
         let mut events = Vec::new();
         while let Ok(ev) = orx.try_recv() {
@@ -2476,6 +2675,16 @@ mod tests {
         laptop.open_ports = vec![5000];
         let printer = dev("10.0.0.6");
         let devices = vec![laptop, printer, ssh, cisco, sw, mgmt, gw];
+        // Small-switch vendors with no TCP port open are candidates too (UDP 161 only).
+        let mut ruijie = dev("10.0.0.7");
+        ruijie.vendor = Some("Ruijie Networks Co.,LTD".into());
+        let mut quiet_cisco = dev("10.0.0.8");
+        quiet_cisco.vendor = Some("Cisco Systems, Inc".into());
+        quiet_cisco.mdns_name = Some("switch375bc6.local".into());
+        assert_eq!(
+            snmp_candidates(&[ruijie, quiet_cisco], &[], None, false),
+            vec![ip("10.0.0.7"), ip("10.0.0.8")]
+        );
         let picked = snmp_candidates(&devices, &[ip("10.9.9.9")], Some(ip("10.0.0.1")), false);
         assert_eq!(
             picked,

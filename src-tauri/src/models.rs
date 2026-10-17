@@ -189,6 +189,69 @@ impl fmt::Display for DeviceRole {
     }
 }
 
+/// Where a device's [`DeviceRole`] came from (`Device::role_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleSource {
+    /// Set by the user (reserved: the GUI does not edit roles yet).
+    User,
+    /// The device's own CDP advertisement.
+    Cdp,
+    /// The device's own LLDP advertisement.
+    Lldp,
+    /// SNMP sysObjectID / sysDescr / sysServices / BRIDGE-MIB.
+    Snmp,
+    /// Web interface identity (title, `Server` header, certificate).
+    Web,
+    /// DNS-SD service types advertised over mDNS.
+    MdnsService,
+    /// Host name tokens (DNS PTR, mDNS, NetBIOS, user label) with the vendor OUI.
+    Name,
+    /// OUI vendor plus the open management ports.
+    OuiPorts,
+}
+
+impl RoleSource {
+    /// Short human label ("CDP", "mDNS service", ...).
+    pub fn label(self) -> &'static str {
+        match self {
+            RoleSource::User => "user",
+            RoleSource::Cdp => "CDP",
+            RoleSource::Lldp => "LLDP",
+            RoleSource::Snmp => "SNMP",
+            RoleSource::Web => "web identity",
+            RoleSource::MdnsService => "mDNS service",
+            RoleSource::Name => "host name",
+            RoleSource::OuiPorts => "OUI + ports",
+        }
+    }
+}
+
+/// How sure a role is (`Device::role_confidence`). Ordered: `Low < Medium < High`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleConfidence {
+    /// A guess from weak hints (host name tokens, OUI + ports): treat as "probably".
+    Low,
+    /// A product identification (web UI, vendor-specific management port).
+    Medium,
+    /// The device described itself (CDP / LLDP / SNMP) or the user set it.
+    High,
+}
+
+impl RoleConfidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            RoleConfidence::Low => "low",
+            RoleConfidence::Medium => "medium",
+            RoleConfidence::High => "high",
+        }
+    }
+}
+
+/// Most `role_evidence` entries kept on one device.
+pub const MAX_ROLE_EVIDENCE: usize = 8;
+
 /// How a device (or piece of its data) was learned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -932,7 +995,27 @@ pub struct Device {
     /// rogue-RA audit rule. Additive.
     #[serde(default)]
     pub ipv6_router: Option<bool>,
+    /// Where `role` came from; `None` for a plain host (or a role from an older save).
+    /// Additive.
+    #[serde(default)]
+    pub role_source: Option<RoleSource>,
+    /// How sure `role` is; `None` for a plain host. An infrastructure role without one (older
+    /// saves) is treated as `medium`. Additive.
+    #[serde(default)]
+    pub role_confidence: Option<RoleConfidence>,
+    /// Human-readable reasons behind `role` (e.g. "mDNS name 'switch375bc6.local' is a Cisco
+    /// Business default host name", "Cisco OUI"). A host can carry hints too ("possible
+    /// network device: Ruijie OUI"). At most [`MAX_ROLE_EVIDENCE`]. Additive.
+    #[serde(default)]
+    pub role_evidence: Vec<String>,
+    /// DNS-SD service types the device advertised over mDNS (e.g. `_http._tcp`,
+    /// `_csco-sb._tcp`). At most [`MAX_MDNS_SERVICES`]. Additive.
+    #[serde(default)]
+    pub mdns_services: Vec<String>,
 }
+
+/// Most mDNS service types kept on one device.
+pub const MAX_MDNS_SERVICES: usize = 16;
 
 /// Most warnings kept on one device (hostile-input bound).
 pub const MAX_DEVICE_WARNINGS: usize = 32;
@@ -976,6 +1059,83 @@ impl Device {
             warnings: Vec::new(),
             dhcp_server: None,
             ipv6_router: None,
+            role_source: None,
+            role_confidence: None,
+            role_evidence: Vec::new(),
+            mdns_services: Vec::new(),
+        }
+    }
+
+    /// Set an infrastructure role with its provenance (replacing the previous evidence).
+    pub fn set_role(
+        &mut self,
+        role: DeviceRole,
+        source: RoleSource,
+        confidence: RoleConfidence,
+        evidence: Vec<String>,
+    ) {
+        self.role = role;
+        self.role_source = Some(source);
+        self.role_confidence = Some(confidence);
+        self.role_evidence = evidence;
+        self.role_evidence.truncate(MAX_ROLE_EVIDENCE);
+    }
+
+    /// Effective confidence of `role`: `None` for a plain host, `medium` for an
+    /// infrastructure role recorded without one (older saves, legacy code paths).
+    pub fn effective_role_confidence(&self) -> Option<RoleConfidence> {
+        if self.role.is_infrastructure() {
+            Some(self.role_confidence.unwrap_or(RoleConfidence::Medium))
+        } else {
+            None
+        }
+    }
+
+    /// `true` for an infrastructure role better than a low-confidence guess.
+    pub fn is_confident_infrastructure(&self) -> bool {
+        self.effective_role_confidence() > Some(RoleConfidence::Low)
+    }
+
+    /// Add one role-evidence line unless present (bounded by [`MAX_ROLE_EVIDENCE`]).
+    pub fn add_role_evidence(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if self.role_evidence.len() < MAX_ROLE_EVIDENCE && !self.role_evidence.contains(&line) {
+            self.role_evidence.push(line);
+        }
+    }
+
+    /// Fold `other`'s role observation into this one:
+    ///
+    /// * a plain-host observation never replaces an infrastructure role (no downgrade);
+    /// * otherwise the more confident observation wins, and between equally confident ones
+    ///   the higher [`DeviceRole::priority`] wins (the historical rule);
+    /// * the winner's source / confidence / evidence come with it; a same-role observation
+    ///   adds its evidence, and host-level hints ("possible network device") accumulate.
+    pub fn merge_role(&mut self, other: &Device) {
+        let (mine, theirs) = (
+            self.effective_role_confidence(),
+            other.effective_role_confidence(),
+        );
+        let take = other.role.is_infrastructure()
+            && (theirs > mine || (theirs == mine && other.role.priority() > self.role.priority()));
+        if take {
+            self.role = other.role;
+            self.role_source = other.role_source;
+            self.role_confidence = other.role_confidence;
+            self.role_evidence = other.role_evidence.clone();
+            self.role_evidence.truncate(MAX_ROLE_EVIDENCE);
+            return;
+        }
+        if other.role == self.role {
+            if self.role_source.is_none() {
+                self.role_source = other.role_source;
+            }
+            if self.role_confidence.is_none() {
+                self.role_confidence = other.role_confidence;
+            }
+            for e in &other.role_evidence {
+                self.add_role_evidence(e.clone());
+            }
         }
     }
 
@@ -1075,8 +1235,11 @@ impl Device {
         for w in &other.warnings {
             self.add_warning(w.clone());
         }
-        if other.role.priority() > self.role.priority() {
-            self.role = other.role;
+        self.merge_role(other);
+        for s in &other.mdns_services {
+            if self.mdns_services.len() < MAX_MDNS_SERVICES && !self.mdns_services.contains(s) {
+                self.mdns_services.push(s.clone());
+            }
         }
         for ip in other.extra_ips.iter().chain(std::iter::once(&other.ip)) {
             if *ip != self.ip && !self.extra_ips.contains(ip) {
@@ -2736,6 +2899,84 @@ mod tests {
     }
 
     #[test]
+    fn role_merge_respects_confidence_and_never_downgrades() {
+        use RoleConfidence::{High, Low, Medium};
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        let obs = |role, source, conf, why: &str| {
+            let mut d = Device::new(ip);
+            d.set_role(role, source, conf, vec![why.to_string()]);
+            d
+        };
+        // A low-confidence name guess lands on a plain host.
+        let mut d = Device::new(ip);
+        d.merge(&obs(DeviceRole::Switch, RoleSource::Name, Low, "name"));
+        assert_eq!(d.role, DeviceRole::Switch);
+        assert_eq!(d.role_confidence, Some(Low));
+        assert!(!d.is_confident_infrastructure());
+        // A plain-host observation (e.g. a later sparse update) never downgrades it.
+        d.merge(&Device::new(ip));
+        assert_eq!(d.role, DeviceRole::Switch);
+        assert_eq!(d.role_source, Some(RoleSource::Name));
+        // A higher-priority role at LOWER confidence does not win any more...
+        let mut snmp = Device::new(ip);
+        snmp.merge(&obs(DeviceRole::Switch, RoleSource::Snmp, High, "snmp"));
+        snmp.merge(&obs(DeviceRole::Firewall, RoleSource::Name, Low, "fw name"));
+        assert_eq!(snmp.role, DeviceRole::Switch);
+        assert_eq!(snmp.role_source, Some(RoleSource::Snmp));
+        assert_eq!(snmp.role_evidence, vec!["snmp".to_string()]);
+        // ...but more confident evidence replaces a guess, even with a lower priority.
+        d.merge(&obs(
+            DeviceRole::Router,
+            RoleSource::Snmp,
+            High,
+            "snmp router",
+        ));
+        assert_eq!(d.role, DeviceRole::Router);
+        assert_eq!(d.role_source, Some(RoleSource::Snmp));
+        assert_eq!(d.role_confidence, Some(High));
+        assert_eq!(d.role_evidence, vec!["snmp router".to_string()]);
+        // Equal confidence: the historical priority rule.
+        let mut e = obs(DeviceRole::Router, RoleSource::Web, Medium, "a");
+        e.merge(&obs(DeviceRole::Firewall, RoleSource::Web, Medium, "b"));
+        assert_eq!(e.role, DeviceRole::Firewall);
+        // Same role, same confidence: evidence accumulates.
+        e.merge(&obs(
+            DeviceRole::Firewall,
+            RoleSource::OuiPorts,
+            Medium,
+            "c",
+        ));
+        assert_eq!(e.role_source, Some(RoleSource::Web));
+        assert_eq!(e.role_evidence, vec!["b".to_string(), "c".to_string()]);
+        // A legacy infrastructure role without provenance counts as medium.
+        let mut legacy = Device::new(ip);
+        legacy.role = DeviceRole::Switch;
+        legacy.merge(&obs(DeviceRole::Firewall, RoleSource::Name, Low, "x"));
+        assert_eq!(legacy.role, DeviceRole::Switch);
+        assert!(legacy.is_confident_infrastructure());
+        // Host-level hints accumulate on a host.
+        let mut h = Device::new(ip);
+        let mut hint = Device::new(ip);
+        hint.add_role_evidence("possible network device: Ruijie OUI");
+        h.merge(&hint);
+        assert_eq!(h.role, DeviceRole::Host);
+        assert_eq!(h.role_evidence.len(), 1);
+        assert_eq!(h.role_confidence, None);
+        // Wire format.
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["roleSource"], "snmp");
+        assert_eq!(v["roleConfidence"], "high");
+        assert_eq!(
+            serde_json::to_value(RoleSource::MdnsService).unwrap(),
+            "mdns_service"
+        );
+        assert_eq!(
+            serde_json::to_value(RoleSource::OuiPorts).unwrap(),
+            "oui_ports"
+        );
+    }
+
+    #[test]
     fn device_merge_fills_gaps_and_unions() {
         let mut a = Device::new("10.0.0.1".parse().unwrap());
         a.add_source(DiscoverySource::Arp);
@@ -2893,6 +3134,10 @@ mod tests {
             "tlsCert",
             "webIdentity",
             "warnings",
+            "roleSource",
+            "roleConfidence",
+            "roleEvidence",
+            "mdnsServices",
         ] {
             assert!(v.get(key).is_some(), "{key} is always serialized");
         }
