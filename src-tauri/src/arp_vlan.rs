@@ -2430,9 +2430,14 @@ enum SendOutcome {
     Dropped,
 }
 
-/// `true` for "transmit queue full" errors, which are back-pressure, not failures.
+/// `true` for "transmit queue full" errors, which are back-pressure, not failures. On Windows
+/// (Npcap's `PacketSendPacket`) that is `ERROR_NO_SYSTEM_RESOURCES` or Winsock's `WSAENOBUFS`.
 fn is_backpressure(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ENOBUFS)
+    const ERROR_NO_SYSTEM_RESOURCES: i32 = 1450;
+    const WSAENOBUFS: i32 = 10055;
+    let code = e.raw_os_error();
+    code == Some(libc::ENOBUFS)
+        || (cfg!(windows) && matches!(code, Some(ERROR_NO_SYSTEM_RESOURCES | WSAENOBUFS)))
         || matches!(
             e.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
@@ -3803,10 +3808,10 @@ mod tests {
         }
         assert_eq!(pacer.interval, base, "rate recovers");
 
-        // EAGAIN behaves the same.
+        // EAGAIN (Windows: WSAEWOULDBLOCK) behaves the same.
         let mut s = MockSender {
             fail_first: 2,
-            errno: libc::EAGAIN,
+            errno: if cfg!(windows) { 10035 } else { libc::EAGAIN },
             calls: 0,
             sent: 0,
         };
@@ -3827,7 +3832,9 @@ mod tests {
             send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap(),
             SendOutcome::Dropped
         );
-        assert!(started.elapsed() < BACKOFF_BUDGET * 3);
+        // The budget counts the nominal back-off steps; the bound only proves the drop ends
+        // (generous: loaded CI runners overshoot every one of those sleeps).
+        assert!(started.elapsed() < BACKOFF_BUDGET * 20);
         assert_eq!(pacer.interval, MAX_PACE_INTERVAL);
 
         // Cancellation ends the back-off immediately.

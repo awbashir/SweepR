@@ -65,6 +65,9 @@ fn windows_link_setup() {
     for dll in ["wpcap.dll", "Packet.dll"] {
         println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
     }
+    // LNK4199 ("/DELAYLOAD ignored; no imports found") for targets that never capture, such
+    // as the report example.
+    println!("cargo:rustc-link-arg=/IGNORE:4199");
     // The delay-load helper from the MSVC runtime.
     println!("cargo:rustc-link-arg=delayimp.lib");
 }
