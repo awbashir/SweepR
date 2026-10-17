@@ -8,6 +8,10 @@ fn main() {
     if !dist.exists() {
         let _ = fs::create_dir_all(&dist);
     }
+    // The frontend is embedded into the binary at compile time. Without this, cargo does not
+    // notice that `npm run build` changed `dist/`, so a binary built while `dist/` was empty keeps
+    // serving nothing ("asset not found: index.html") until the crate is touched.
+    println!("cargo:rerun-if-changed=../dist");
     // Declare the app's own IPC commands so they go through Tauri's ACL: only commands
     // granted in `capabilities/` (as `allow-<command>`) are callable from the webview.
     let attributes =
