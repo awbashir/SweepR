@@ -13,9 +13,8 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs, io,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::Path,
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,6 +23,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(not(windows))]
+use std::{fs, path::Path};
 
 use anyhow::{anyhow, bail, Context, Result};
 use pnet::datalink::{self, Channel, DataLinkSender};
@@ -123,7 +124,7 @@ const NEIGHBOR_UPDATE_INTERVAL_MS: u64 = 5_000;
 /// Errors the engine reacts to (e.g. by falling back to unprivileged ICMP probing).
 #[derive(Debug, thiserror::Error)]
 pub enum L2Error {
-    #[error("raw packet access requires root: run with sudo ({0})")]
+    #[error("raw packet access requires {req} ({0})", req = crate::platform::RAW_ACCESS_REQUIREMENT)]
     PermissionDenied(String),
     #[error("interface {0} has no Ethernet link layer; layer-2 probing is not possible on it")]
     NoLinkLayer(String),
@@ -149,9 +150,9 @@ impl L2Error {
     }
 }
 
+/// Root on Unix, an elevated token on Windows.
 fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() == 0 }
+    crate::platform::is_privileged()
 }
 
 /// Map an OS error from opening a raw channel to [`L2Error::PermissionDenied`] when appropriate.
@@ -176,6 +177,7 @@ fn map_pcap_error(err: pcap::Error, what: &str) -> anyhow::Error {
     if lower.contains("permission")
         || lower.contains("not permitted")
         || lower.contains("bpf device")
+        || lower.contains("access is denied")
     {
         L2Error::PermissionDenied(format!("{what}: {text}")).into()
     } else {
@@ -250,6 +252,25 @@ fn push_addr(v: &mut Vec<IpAddr>, ip: IpAddr) {
 /// Enumerate local interfaces, classified and annotated with OS VLAN configuration.
 /// The default-route interface sorts first.
 pub fn list_interfaces() -> Vec<InterfaceInfo> {
+    let mut out = os_interfaces();
+    if !out.iter().any(|i| i.is_default) {
+        if let Some(idx) = heuristic_default(&out) {
+            out[idx].is_default = true;
+        }
+    }
+    out.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then(b.is_up.cmp(&a.is_up))
+            .then(kind_rank(a.kind).cmp(&kind_rank(b.kind)))
+            .then(a.name.cmp(&b.name))
+    });
+    out
+}
+
+/// macOS / Linux: `getifaddrs` (through pnet) plus `ifconfig` / `/proc` / `networksetup`.
+#[cfg(not(windows))]
+fn os_interfaces() -> Vec<InterfaceInfo> {
     let raw = datalink::interfaces();
     let default = default_interface_name();
     let link = os_link_info();
@@ -261,8 +282,7 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
         HashMap::new()
     };
 
-    let mut out: Vec<InterfaceInfo> = raw
-        .into_iter()
+    raw.into_iter()
         .map(|ni| {
             let vlan = link
                 .vlans
@@ -301,43 +321,119 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
                 name: ni.name,
             }
         })
-        .collect();
+        .collect()
+}
 
-    if !out.iter().any(|i| i.is_default) {
-        if let Some(idx) = heuristic_default(&out) {
-            out[idx].is_default = true;
+/// Windows: `GetAdaptersAddresses` (no Npcap needed). Interfaces are named by their
+/// connection name ("Ethernet", "Wi-Fi"); [`capture_device`] maps that to the Npcap device
+/// (`\Device\NPF_{GUID}`) when raw access is needed. A NIC-level `VlanID` driver setting
+/// makes the adapter a VLAN interface (the NIC tags everything it sends).
+#[cfg(windows)]
+fn os_interfaces() -> Vec<InterfaceInfo> {
+    let adapters = crate::win::adapters();
+    let vlans: HashMap<String, u16> = crate::win::nic_vlan_ids().into_iter().collect();
+    let default = windows_default_route(&adapters).map(|(name, _)| name);
+    adapters
+        .into_iter()
+        .filter(|a| !a.friendly_name.is_empty())
+        .map(|a| {
+            let vlan = vlans.get(&a.guid).copied();
+            let kind = classify_windows_adapter(
+                a.if_type,
+                &a.description,
+                &a.friendly_name,
+                vlan.is_some(),
+            );
+            InterfaceInfo {
+                is_default: default.as_deref() == Some(a.friendly_name.as_str()),
+                index: a.index,
+                description: Some(a.description.clone()).filter(|d| !d.is_empty()),
+                mac: a.mac.filter(is_real_mac).map(|m| format_mac(&m)),
+                addrs: a
+                    .addrs
+                    .iter()
+                    .map(|(ip, prefix)| IfAddr {
+                        ip: *ip,
+                        prefix: *prefix,
+                    })
+                    .collect(),
+                is_up: a.up,
+                kind,
+                vlan_id: vlan,
+                parent: None,
+                name: a.friendly_name,
+            }
+        })
+        .collect()
+}
+
+/// The Windows default route as `(adapter name, gateway)`: the lowest-metric active
+/// `0.0.0.0/0` row of `route print -4 0.0.0.0`, matched to the adapter owning its interface
+/// address; failing that, the up adapter with an IPv4 gateway and the lowest metric.
+#[cfg(windows)]
+fn windows_default_route(adapters: &[crate::win::Adapter]) -> Option<(String, Option<Ipv4Addr>)> {
+    let route = command_stdout(
+        crate::platform::system32_tool("ROUTE.EXE"),
+        &["print", "-4", "0.0.0.0"],
+    )
+    .and_then(|t| parse_route_print_default(&t));
+    if let Some(r) = route {
+        let owner = adapters
+            .iter()
+            .find(|a| a.addrs.iter().any(|(ip, _)| *ip == IpAddr::V4(r.interface)));
+        if let Some(a) = owner {
+            return Some((a.friendly_name.clone(), r.gateway));
         }
     }
-    out.sort_by(|a, b| {
-        b.is_default
-            .cmp(&a.is_default)
-            .then(b.is_up.cmp(&a.is_up))
-            .then(kind_rank(a.kind).cmp(&kind_rank(b.kind)))
-            .then(a.name.cmp(&b.name))
-    });
-    out
+    adapters
+        .iter()
+        .filter(|a| a.up)
+        .filter_map(|a| {
+            let gw = a.gateways.iter().find_map(|g| match g {
+                IpAddr::V4(v4) if !v4.is_unspecified() => Some(*v4),
+                _ => None,
+            })?;
+            Some((a.ipv4_metric, a.friendly_name.clone(), gw))
+        })
+        .min()
+        .map(|(_, name, gw)| (name, Some(gw)))
 }
 
 /// Name of the interface carrying the default IPv4 route, if it can be determined.
 pub fn default_interface_name() -> Option<String> {
-    if cfg!(target_os = "linux") {
-        fs::read_to_string("/proc/net/route")
-            .ok()
-            .and_then(|t| parse_proc_net_route(&t))
-    } else {
-        command_stdout("/sbin/route", &["-n", "get", "default"]).and_then(|t| parse_route_get(&t))
+    #[cfg(windows)]
+    {
+        windows_default_route(&crate::win::adapters()).map(|(name, _)| name)
+    }
+    #[cfg(not(windows))]
+    {
+        if cfg!(target_os = "linux") {
+            fs::read_to_string("/proc/net/route")
+                .ok()
+                .and_then(|t| parse_proc_net_route(&t))
+        } else {
+            command_stdout("/sbin/route", &["-n", "get", "default"])
+                .and_then(|t| parse_route_get(&t))
+        }
     }
 }
 
 /// The default IPv4 gateway, if it can be determined (used to prioritize SNMP polling).
 pub fn default_gateway_v4() -> Option<Ipv4Addr> {
-    if cfg!(target_os = "linux") {
-        fs::read_to_string("/proc/net/route")
-            .ok()
-            .and_then(|t| parse_proc_net_route_gateway(&t))
-    } else {
-        command_stdout("/sbin/route", &["-n", "get", "default"])
-            .and_then(|t| parse_route_get_gateway(&t))
+    #[cfg(windows)]
+    {
+        windows_default_route(&crate::win::adapters()).and_then(|(_, gw)| gw)
+    }
+    #[cfg(not(windows))]
+    {
+        if cfg!(target_os = "linux") {
+            fs::read_to_string("/proc/net/route")
+                .ok()
+                .and_then(|t| parse_proc_net_route_gateway(&t))
+        } else {
+            command_stdout("/sbin/route", &["-n", "get", "default"])
+                .and_then(|t| parse_route_get_gateway(&t))
+        }
     }
 }
 
@@ -373,17 +469,22 @@ pub fn parse_proc_net_route_gateway(text: &str) -> Option<Ipv4Addr> {
 /// Choose an interface by name, or the best default when `name` is `None`.
 pub fn select_interface(all: &[InterfaceInfo], name: Option<&str>) -> Result<InterfaceInfo> {
     match name {
-        Some(n) => all.iter().find(|i| i.name == n).cloned().ok_or_else(|| {
-            L2Error::InterfaceNotFound {
-                name: n.to_string(),
-                available: all
-                    .iter()
-                    .map(|i| i.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            }
-            .into()
-        }),
+        // Windows connection names are case-insensitive ("ethernet" = "Ethernet").
+        Some(n) => all
+            .iter()
+            .find(|i| i.name == n || (cfg!(windows) && i.name.eq_ignore_ascii_case(n)))
+            .cloned()
+            .ok_or_else(|| {
+                L2Error::InterfaceNotFound {
+                    name: n.to_string(),
+                    available: all
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }
+                .into()
+            }),
         None => all
             .iter()
             .find(|i| i.is_default && i.is_up && i.primary_ipv4().is_some())
@@ -399,7 +500,9 @@ pub fn select_interface(all: &[InterfaceInfo], name: Option<&str>) -> Result<Int
 /// unprivileged processes get a placeholder MAC for every interface (filtered out by
 /// [`list_interfaces`], so Ethernet / Wi-Fi interfaces end up without a MAC).
 pub fn macs_hidden(all: &[InterfaceInfo]) -> bool {
-    !is_root()
+    // Windows always reports adapter MACs.
+    !cfg!(windows)
+        && !is_root()
         && all.iter().any(|i| {
             matches!(i.kind, InterfaceKind::Ethernet | InterfaceKind::Wifi) && i.mac.is_none()
         })
@@ -446,8 +549,8 @@ fn kind_rank(kind: InterfaceKind) -> u8 {
     }
 }
 
-fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd)
+fn command_stdout(cmd: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Option<String> {
+    let out = crate::platform::hide_console_std(&mut Command::new(cmd))
         .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -458,6 +561,7 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+#[cfg(not(windows))]
 fn is_wireless(name: &str, hw_port: Option<&str>) -> bool {
     if let Some(port) = hw_port {
         let p = port.to_ascii_lowercase();
@@ -607,6 +711,133 @@ pub fn parse_proc_net_route(text: &str) -> Option<String> {
         .map(|(_, iface)| iface)
 }
 
+/// The active IPv4 default route of Windows `route print -4 0.0.0.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsDefaultRoute {
+    /// `None` for an on-link default route.
+    pub gateway: Option<Ipv4Addr>,
+    /// The address of the interface the route leaves through.
+    pub interface: Ipv4Addr,
+    pub metric: u32,
+}
+
+/// Parse Windows `route print -4 0.0.0.0` and return the lowest-metric active default route.
+/// Rows look like `0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.23  25`. Headers and the
+/// "On-link" gateway label are localized (and may be several words), so rows are recognized
+/// by shape only: destination and mask `0.0.0.0`, an IPv4 interface address and a numeric
+/// metric at the end. Persistent-route rows (no interface column) never match.
+pub fn parse_route_print_default(text: &str) -> Option<WindowsDefaultRoute> {
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 5 || f.len() > 8 || f[0] != "0.0.0.0" || f[1] != "0.0.0.0" {
+                return None;
+            }
+            let metric: u32 = f[f.len() - 1].parse().ok()?;
+            let interface: Ipv4Addr = f[f.len() - 2].parse().ok()?;
+            let gateway = match &f[2..f.len() - 2] {
+                [one] => one.parse::<Ipv4Addr>().ok().filter(|g| !g.is_unspecified()),
+                _ => None,
+            };
+            Some(WindowsDefaultRoute {
+                gateway,
+                interface,
+                metric,
+            })
+        })
+        .min_by_key(|r| r.metric)
+}
+
+/// Classify a Windows adapter from its IANA ifType, driver description and connection name.
+/// Pure; see tests.
+pub fn classify_windows_adapter(
+    if_type: u32,
+    description: &str,
+    friendly_name: &str,
+    vlan: bool,
+) -> InterfaceKind {
+    const ETHERNET: u32 = 6;
+    const PPP: u32 = 23;
+    const LOOPBACK: u32 = 24;
+    const PROP_VIRTUAL: u32 = 53;
+    const IEEE80211: u32 = 71;
+    const TUNNEL: u32 = 131;
+    const IEEE1394: u32 = 144;
+
+    if if_type == LOOPBACK {
+        return InterfaceKind::Loopback;
+    }
+    if vlan {
+        return InterfaceKind::Vlan;
+    }
+    let text = format!("{description} {friendly_name}").to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    // IPv6 transition pseudo-interfaces and debug / Wi-Fi Direct adapters.
+    if has(&[
+        "teredo",
+        "isatap",
+        "6to4",
+        "ip-https",
+        "kernel debug",
+        "wi-fi direct",
+        "wan miniport",
+    ]) {
+        return InterfaceKind::Virtual;
+    }
+    if matches!(if_type, PPP | TUNNEL)
+        || has(&[
+            "wireguard",
+            "wintun",
+            "tap-windows",
+            "openvpn",
+            "tailscale",
+            "zerotier",
+            "anyconnect",
+            "secure client",
+            "globalprotect",
+            "pangp",
+            "fortinet",
+            "forticlient",
+            "juniper",
+            "pulse secure",
+            "nordlynx",
+            "vpn",
+        ])
+    {
+        return InterfaceKind::Vpn;
+    }
+    if if_type == IEEE80211 {
+        return InterfaceKind::Wifi;
+    }
+    // Hyper-V virtual switch host adapters ("vEthernet (...)") and network bridges.
+    if has(&[
+        "hyper-v virtual ethernet",
+        "vethernet",
+        "network bridge",
+        "mac bridge",
+    ]) {
+        return InterfaceKind::Bridge;
+    }
+    if matches!(if_type, PROP_VIRTUAL | IEEE1394)
+        || has(&[
+            "virtualbox",
+            "vmware",
+            "virtual",
+            "loopback",
+            "bluetooth",
+            "docker",
+            "npcap",
+        ])
+    {
+        return InterfaceKind::Virtual;
+    }
+    if if_type == ETHERNET {
+        InterfaceKind::Ethernet
+    } else {
+        InterfaceKind::Unknown
+    }
+}
+
 /// The placeholder macOS reports to unentitled processes instead of the real link address.
 const MASKED_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0];
 
@@ -624,6 +855,7 @@ pub struct OsLinkInfo {
     pub ethers: HashMap<String, [u8; 6]>,
 }
 
+#[cfg(not(windows))]
 fn os_link_info() -> OsLinkInfo {
     if cfg!(target_os = "linux") {
         let vlans = fs::read_to_string("/proc/net/vlan/config")
@@ -1823,8 +2055,57 @@ impl PassiveAggregator {
     }
 }
 
+/// The libpcap device for `if_name`: the name itself on macOS / Linux; on Windows the Npcap
+/// device (`\Device\NPF_{GUID}`) of the adapter with that connection name. Fails with
+/// [`L2Error::PermissionDenied`] when the capture driver is missing (Windows without Npcap),
+/// before any libpcap / Packet.dll function is called.
+pub fn capture_device(if_name: &str) -> Result<String> {
+    crate::platform::capture_driver_status().map_err(L2Error::PermissionDenied)?;
+    #[cfg(windows)]
+    let device = if if_name.starts_with(r"\Device\") {
+        Some(if_name.to_string())
+    } else {
+        crate::win::adapters()
+            .into_iter()
+            .find(|a| {
+                a.friendly_name.eq_ignore_ascii_case(if_name)
+                    || a.guid.eq_ignore_ascii_case(if_name)
+            })
+            .map(|a| a.npf_name())
+    };
+    #[cfg(not(windows))]
+    let device = Some(if_name.to_string());
+    device.ok_or_else(|| anyhow!("interface {if_name} disappeared"))
+}
+
+/// The pnet datalink interface used to transmit on `if_name` (whose MAC is `src_mac`).
+fn datalink_interface(if_name: &str, src_mac: [u8; 6]) -> Result<datalink::NetworkInterface> {
+    #[cfg(windows)]
+    {
+        // pnet's Windows backend only needs the Npcap device name to open the adapter.
+        let [a, b, c, d, e, f] = src_mac;
+        Ok(datalink::NetworkInterface {
+            name: capture_device(if_name)?,
+            description: String::new(),
+            index: 0,
+            mac: Some(datalink::MacAddr::new(a, b, c, d, e, f)),
+            ips: Vec::new(),
+            flags: 0,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = src_mac;
+        datalink::interfaces()
+            .into_iter()
+            .find(|i| i.name == if_name)
+            .ok_or_else(|| anyhow!("interface {if_name} disappeared"))
+    }
+}
+
 fn open_capture(if_name: &str, promisc: bool) -> Result<pcap::Capture<pcap::Active>> {
-    let cap = pcap::Capture::from_device(if_name)
+    let device = capture_device(if_name)?;
+    let cap = pcap::Capture::from_device(device.as_str())
         .map_err(|e| map_pcap_error(e, &format!("cannot open {if_name} for capture")))?
         .promisc(promisc)
         .immediate_mode(true)
@@ -2149,9 +2430,14 @@ enum SendOutcome {
     Dropped,
 }
 
-/// `true` for "transmit queue full" errors, which are back-pressure, not failures.
+/// `true` for "transmit queue full" errors, which are back-pressure, not failures. On Windows
+/// (Npcap's `PacketSendPacket`) that is `ERROR_NO_SYSTEM_RESOURCES` or Winsock's `WSAENOBUFS`.
 fn is_backpressure(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ENOBUFS)
+    const ERROR_NO_SYSTEM_RESOURCES: i32 = 1450;
+    const WSAENOBUFS: i32 = 10055;
+    let code = e.raw_os_error();
+    code == Some(libc::ENOBUFS)
+        || (cfg!(windows) && matches!(code, Some(ERROR_NO_SYSTEM_RESOURCES | WSAENOBUFS)))
         || matches!(
             e.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
@@ -2454,10 +2740,7 @@ pub async fn run_l2_scan(
     // Open both handles up front so permission problems surface before anything is sent.
     let name = iface.name.clone();
     let (mut sender, mut capture) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let ni = datalink::interfaces()
-            .into_iter()
-            .find(|i| i.name == name)
-            .ok_or_else(|| anyhow!("interface {name} disappeared"))?;
+        let ni = datalink_interface(&name, src_mac)?;
         let config = datalink::Config {
             read_buffer_size: 1 << 16,
             write_buffer_size: 1 << 12,
@@ -3525,10 +3808,10 @@ mod tests {
         }
         assert_eq!(pacer.interval, base, "rate recovers");
 
-        // EAGAIN behaves the same.
+        // EAGAIN (Windows: WSAEWOULDBLOCK) behaves the same.
         let mut s = MockSender {
             fail_first: 2,
-            errno: libc::EAGAIN,
+            errno: if cfg!(windows) { 10035 } else { libc::EAGAIN },
             calls: 0,
             sent: 0,
         };
@@ -3549,7 +3832,9 @@ mod tests {
             send_frame(&mut s, &[0; 60], &mut pacer, &cancel).unwrap(),
             SendOutcome::Dropped
         );
-        assert!(started.elapsed() < BACKOFF_BUDGET * 3);
+        // The budget counts the nominal back-off steps; the bound only proves the drop ends
+        // (generous: loaded CI runners overshoot every one of those sleeps).
+        assert!(started.elapsed() < BACKOFF_BUDGET * 20);
         assert_eq!(pacer.interval, MAX_PACE_INTERVAL);
 
         // Cancellation ends the back-off immediately.
@@ -3766,7 +4051,177 @@ mod tests {
                   Hardware Port: Wi-Fi\nDevice: en1\nEthernet Address: 00:11:22:33:44:66\n";
         let ports = parse_networksetup_ports(ns);
         assert_eq!(ports.get("en1").map(String::as_str), Some("Wi-Fi"));
+        #[cfg(not(windows))]
         assert!(is_wireless("en1", ports.get("en1").map(String::as_str)));
+    }
+
+    /// `route print -4 0.0.0.0` from Windows 11 (English), with a second, higher-metric
+    /// default route (VPN) and a persistent route.
+    const ROUTE_PRINT_EN: &str = "\
+===========================================================================
+Interface List
+ 18...00 15 5d 2a 81 07 ......Hyper-V Virtual Ethernet Adapter
+  7...a4 bb 6d 11 22 33 ......Intel(R) Ethernet Connection (7) I219-LM
+ 23...........................WireGuard Tunnel
+  1...........................Software Loopback Interface 1
+===========================================================================
+
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.23     25
+          0.0.0.0          0.0.0.0         On-link        10.66.0.2      5281
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address  Metric
+          0.0.0.0          0.0.0.0      192.168.1.254  Default
+===========================================================================
+";
+
+    #[test]
+    fn windows_route_print_default_route() {
+        assert_eq!(
+            parse_route_print_default(ROUTE_PRINT_EN),
+            Some(WindowsDefaultRoute {
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                interface: Ipv4Addr::new(192, 168, 1, 23),
+                metric: 25,
+            })
+        );
+        // German: localized headers and a two-word "On-link"; only the on-link route exists.
+        let de = "Aktive Routen:\n     Netzwerkziel    Netzwerkmaske          Gateway    Schnittstelle Metrik\n\
+                  \x20         0.0.0.0          0.0.0.0   Auf Verbindung      172.20.10.4     35\n\
+                  Ständige Routen:\n  Keine\n";
+        assert_eq!(
+            parse_route_print_default(de),
+            Some(WindowsDefaultRoute {
+                gateway: None,
+                interface: Ipv4Addr::new(172, 20, 10, 4),
+                metric: 35,
+            })
+        );
+        // No default route at all (only the persistent table), or garbage.
+        let none = "Active Routes:\n  None\nPersistent Routes:\n  0.0.0.0  0.0.0.0  10.0.0.1  1\n";
+        assert_eq!(parse_route_print_default(none), None);
+        assert_eq!(parse_route_print_default(""), None);
+        assert_eq!(
+            parse_route_print_default("0.0.0.0 0.0.0.0 10.0.0.1 not-an-ip 25\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_adapter_classification() {
+        use InterfaceKind::*;
+        let c = classify_windows_adapter;
+        assert_eq!(
+            c(
+                6,
+                "Intel(R) Ethernet Connection (7) I219-LM",
+                "Ethernet",
+                false
+            ),
+            Ethernet
+        );
+        assert_eq!(c(71, "Intel(R) Wi-Fi 6 AX201 160MHz", "Wi-Fi", false), Wifi);
+        assert_eq!(
+            c(
+                71,
+                "Microsoft Wi-Fi Direct Virtual Adapter #2",
+                "Local Area Connection* 2",
+                false
+            ),
+            Virtual
+        );
+        assert_eq!(
+            c(
+                24,
+                "Software Loopback Interface 1",
+                "Loopback Pseudo-Interface 1",
+                false
+            ),
+            Loopback
+        );
+        assert_eq!(
+            c(
+                6,
+                "Hyper-V Virtual Ethernet Adapter",
+                "vEthernet (WSL)",
+                false
+            ),
+            Bridge
+        );
+        assert_eq!(c(53, "WireGuard Tunnel", "wg0", false), Vpn);
+        assert_eq!(c(6, "TAP-Windows Adapter V9", "OpenVPN TAP", false), Vpn);
+        assert_eq!(
+            c(131, "Teredo Tunneling Pseudo-Interface", "Teredo", false),
+            Virtual
+        );
+        assert_eq!(
+            c(
+                6,
+                "VirtualBox Host-Only Ethernet Adapter",
+                "Ethernet 3",
+                false
+            ),
+            Virtual
+        );
+        assert_eq!(
+            c(
+                6,
+                "Bluetooth Device (Personal Area Network)",
+                "Bluetooth Network Connection",
+                false
+            ),
+            Virtual
+        );
+        assert_eq!(
+            c(6, "Intel(R) Ethernet Connection I219-LM", "Ethernet", true),
+            Vlan
+        );
+        assert_eq!(
+            c(243, "Generic Mobile Broadband Adapter", "Cellular", false),
+            Unknown
+        );
+    }
+
+    /// On Windows interfaces carry connection names, a description and real MACs; nothing in
+    /// the listing needs Npcap.
+    #[cfg(windows)]
+    #[test]
+    fn windows_interfaces_use_connection_names() {
+        let all = list_interfaces();
+        assert!(!all.is_empty());
+        assert!(
+            all.iter().all(|i| !i.name.starts_with(r"\Device\")),
+            "{all:?}"
+        );
+        assert!(
+            all.iter().any(|i| i.kind == InterfaceKind::Loopback),
+            "{all:?}"
+        );
+        assert!(!macs_hidden(&all));
+        let first = &all[0].name;
+        let upper = first.to_uppercase();
+        assert_eq!(&select_interface(&all, Some(&upper)).unwrap().name, first);
+    }
+
+    /// Without Npcap, raw capture fails cleanly as "raw access unavailable" (the engine then
+    /// falls back to the ICMP sweep) instead of crashing on a missing DLL.
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_without_npcap_is_a_clean_l2_error() {
+        let all = list_interfaces();
+        let name = &all[0].name;
+        match crate::platform::capture_driver_status() {
+            Err(_) => {
+                let e = capture_device(name).unwrap_err();
+                assert!(L2Error::is_l2_unavailable(&e), "{e:#}");
+                assert!(format!("{e:#}").contains("Npcap"), "{e:#}");
+            }
+            Ok(()) => assert!(capture_device(name).unwrap().starts_with(r"\Device\NPF_")),
+        }
     }
 
     #[test]

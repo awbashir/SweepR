@@ -2,8 +2,9 @@
 //! (ARP) cache.
 //!
 //! Used for targets outside the interface's connected subnet and as the fallback when raw
-//! layer-2 access is denied. `surge-ping` opens an unprivileged `SOCK_DGRAM` ICMP socket where
-//! the OS allows it (macOS, Linux with `net.ipv4.ping_group_range`) and a raw socket otherwise.
+//! layer-2 access is denied. Echoes go through [`crate::icmp`]: `surge-ping` opens an
+//! unprivileged `SOCK_DGRAM` ICMP socket where the OS allows it (macOS, Linux with
+//! `net.ipv4.ping_group_range`) and a raw socket otherwise; Windows uses the ICMP helper API.
 
 use std::{
     collections::HashSet,
@@ -15,7 +16,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use surge_ping::{Client, Config, PingIdentifier, PingSequence};
 use tokio::{
     sync::{mpsc::Sender, Semaphore},
     task::JoinSet,
@@ -23,6 +23,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    icmp::{EchoClient, Family},
     models::{
         format_mac, now_ms, parse_mac, Device, DiscoverySource, Ipv4Range, ScanConfig, ScanEvent,
         MAX_CONCURRENCY,
@@ -69,10 +70,12 @@ pub async fn run_icmp_sweep(
     tx: Sender<ScanEvent>,
     cancel: CancellationToken,
 ) -> Result<SweepReport> {
-    let client = Client::new(&Config::default()).context(
+    let client = EchoClient::new(Family::V4).context(if cfg!(windows) {
+        "cannot open the Windows ICMP service (IcmpCreateFile)"
+    } else {
         "cannot open an ICMP socket (unprivileged ICMP may be disabled: on Linux check \
-         net.ipv4.ping_group_range, or run with sudo)",
-    )?;
+         net.ipv4.ping_group_range, or run with sudo)"
+    })?;
     let total: u64 = targets.iter().map(Ipv4Range::count).sum();
     let semaphore = Arc::new(Semaphore::new(cfg.concurrency.clamp(1, MAX_CONCURRENCY)));
     let alive: Arc<Mutex<HashSet<Ipv4Addr>>> = Arc::default();
@@ -80,7 +83,7 @@ pub async fn run_icmp_sweep(
     let retries = u16::from(cfg.retries);
     let iface: Option<String> = iface_name.map(str::to_string);
     // The identifier only needs to distinguish us from other pingers on this host.
-    let ident = PingIdentifier((std::process::id() as u16) ^ (now_ms() as u16));
+    let ident = (std::process::id() as u16) ^ (now_ms() as u16);
     // What the cache held before we probed: those entries may be stale.
     let cache_before: HashSet<(Ipv4Addr, String)> =
         tokio::task::spawn_blocking(read_neighbor_cache)
@@ -192,29 +195,30 @@ fn count(set: &Mutex<HashSet<Ipv4Addr>>) -> u64 {
 
 /// Ping `ip` up to `retries + 1` times; returns the first round-trip time.
 async fn ping_host(
-    client: &Client,
+    client: &EchoClient,
     ip: Ipv4Addr,
-    ident: PingIdentifier,
+    ident: u16,
     timeout: Duration,
     retries: u16,
 ) -> Option<Duration> {
-    let mut pinger = client.pinger(IpAddr::V4(ip), ident).await;
-    pinger.timeout(timeout);
+    let mut pinger = client.pinger(IpAddr::V4(ip), ident, timeout).await;
     for seq in 0..=retries {
-        if let Ok((_, rtt)) = pinger.ping(PingSequence(seq), PING_PAYLOAD).await {
+        if let Some(rtt) = pinger.ping(seq, PING_PAYLOAD).await {
             return Some(rtt);
         }
     }
     None
 }
 
-/// Read the OS IPv4 neighbor cache (`/proc/net/arp` on Linux, `arp -an` elsewhere).
-/// Incomplete, broadcast and multicast entries are skipped.
+/// Read the OS IPv4 neighbor cache (`/proc/net/arp` on Linux, `arp -a` on Windows, `arp -an`
+/// elsewhere). Incomplete, broadcast and multicast entries are skipped.
 pub fn read_neighbor_cache() -> Vec<NeighborEntry> {
     if cfg!(target_os = "linux") {
         fs::read_to_string("/proc/net/arp")
             .map(|t| parse_proc_net_arp(&t))
             .unwrap_or_default()
+    } else if cfg!(windows) {
+        windows_neighbor_cache()
     } else {
         Command::new("/usr/sbin/arp")
             .arg("-an")
@@ -226,6 +230,77 @@ pub fn read_neighbor_cache() -> Vec<NeighborEntry> {
             .map(|o| parse_arp_an(&String::from_utf8_lossy(&o.stdout)))
             .unwrap_or_default()
     }
+}
+
+/// Windows `arp -a`, with each entry's interface address replaced by the adapter's
+/// connection name (the name [`crate::arp_vlan::list_interfaces`] uses).
+#[cfg(windows)]
+fn windows_neighbor_cache() -> Vec<NeighborEntry> {
+    let out = crate::platform::hide_console_std(&mut Command::new(crate::platform::system32_tool(
+        "ARP.EXE",
+    )))
+    .arg("-a")
+    .stdin(Stdio::null())
+    .stderr(Stdio::null())
+    .output();
+    let Some(text) = out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    else {
+        return Vec::new();
+    };
+    let adapters = crate::win::adapters();
+    parse_arp_a_windows(&text)
+        .into_iter()
+        .map(|mut e| {
+            let local: Option<IpAddr> = e.interface.as_deref().and_then(|s| s.parse().ok());
+            e.interface = local.and_then(|ip| {
+                adapters
+                    .iter()
+                    .find(|a| a.addrs.iter().any(|(addr, _)| *addr == ip))
+                    .map(|a| a.friendly_name.clone())
+            });
+            e
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn windows_neighbor_cache() -> Vec<NeighborEntry> {
+    Vec::new()
+}
+
+/// Parse Windows `arp -a` output. Each table starts with `Interface: <local IPv4> --- 0x<idx>`
+/// (the label is localized, e.g. `Schnittstelle:`), followed by rows of
+/// `<IPv4>  <aa-bb-cc-dd-ee-ff>  <type>` (type localized too: dynamic / dynamisch / ...).
+/// Entries carry the *interface address* in `interface`; rows that do not have that shape,
+/// and zero / broadcast / multicast MACs, are skipped.
+pub fn parse_arp_a_windows(text: &str) -> Vec<NeighborEntry> {
+    let mut current: Option<String> = None;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().take(8).collect();
+        if let Some(dash) = tokens.iter().position(|t| *t == "---") {
+            current = dash
+                .checked_sub(1)
+                .and_then(|i| tokens[i].parse::<Ipv4Addr>().ok())
+                .map(|ip| ip.to_string());
+            continue;
+        }
+        let (Some(ip), Some(mac)) = (tokens.first(), tokens.get(1)) else {
+            continue;
+        };
+        let (Ok(ip), Some(mac)) = (ip.parse::<Ipv4Addr>(), usable_mac(mac)) else {
+            continue;
+        };
+        out.push(NeighborEntry {
+            ip,
+            mac,
+            interface: current.clone(),
+        });
+    }
+    out
 }
 
 /// Canonicalize a cache MAC, rejecting zero, broadcast and multicast addresses.
@@ -309,6 +384,56 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// `arp -a` from Windows 11 (English) with two interfaces, and a German one.
+    #[test]
+    fn parses_windows_arp_output() {
+        let text = "\r\nInterface: 192.168.1.23 --- 0x7\r\n\
+                    \x20 Internet Address      Physical Address      Type\r\n\
+                    \x20 192.168.1.1           a4-91-b1-0c-0d-0e     dynamic   \r\n\
+                    \x20 192.168.1.42          00-1a-2b-03-04-05     dynamic   \r\n\
+                    \x20 192.168.1.255         ff-ff-ff-ff-ff-ff     static    \r\n\
+                    \x20 224.0.0.22            01-00-5e-00-00-16     static    \r\n\
+                    \x20 239.255.255.250       01-00-5e-7f-ff-fa     static    \r\n\
+                    \r\nInterface: 172.29.32.1 --- 0x12\r\n\
+                    \x20 Internet Address      Physical Address      Type\r\n\
+                    \x20 172.29.40.7           00-15-5d-aa-bb-cc     dynamic   \r\n\
+                    \x20 172.29.47.255         ff-ff-ff-ff-ff-ff     static    \r\n";
+        let e = parse_arp_a_windows(text);
+        let got: Vec<(String, String, Option<String>)> = e
+            .iter()
+            .map(|e| (e.ip.to_string(), e.mac.clone(), e.interface.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "192.168.1.1".into(),
+                    "a4:91:b1:0c:0d:0e".into(),
+                    Some("192.168.1.23".into())
+                ),
+                (
+                    "192.168.1.42".into(),
+                    "00:1a:2b:03:04:05".into(),
+                    Some("192.168.1.23".into())
+                ),
+                (
+                    "172.29.40.7".into(),
+                    "00:15:5d:aa:bb:cc".into(),
+                    Some("172.29.32.1".into())
+                ),
+            ]
+        );
+        let de = "Schnittstelle: 192.168.178.20 --- 0xb\n\
+                  \x20 Internetadresse       Physische Adresse     Typ\n\
+                  \x20 192.168.178.1         3c-a6-2f-12-34-56     dynamisch\n\
+                  \x20 192.168.178.9         00-00-00-00-00-00     ungültig\n";
+        let e = parse_arp_a_windows(de);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].mac, "3c:a6:2f:12:34:56");
+        assert_eq!(e[0].interface.as_deref(), Some("192.168.178.20"));
+        assert!(parse_arp_a_windows("No ARP Entries Found.\r\n").is_empty());
     }
 
     #[test]

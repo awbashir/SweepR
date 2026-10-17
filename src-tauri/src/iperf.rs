@@ -54,7 +54,8 @@ fn is_executable(p: &Path) -> bool {
 
 /// Path of the `iperf3` binary: `PATH` first, then Homebrew (`/opt/homebrew/bin`,
 /// `/usr/local/bin`) and system directories. GUI apps launched from Finder get a minimal
-/// `PATH`, hence the explicit locations.
+/// `PATH`, hence the explicit locations. On Windows `iperf3.exe` is looked up on `PATH`, in
+/// the winget / Scoop / Chocolatey shim directories and in `Program Files\iperf3`.
 pub fn find_iperf3() -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| {
@@ -63,6 +64,27 @@ pub fn find_iperf3() -> Option<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
+    if cfg!(windows) {
+        let env_dir = |var: &str, rest: &[&str]| {
+            std::env::var_os(var)
+                .map(|base| rest.iter().fold(PathBuf::from(base), |p, r| p.join(r)))
+        };
+        dirs.extend(
+            [
+                env_dir("LOCALAPPDATA", &["Microsoft", "WinGet", "Links"]),
+                env_dir("USERPROFILE", &["scoop", "shims"]),
+                env_dir("ProgramData", &["chocolatey", "bin"]),
+                env_dir("ProgramFiles", &["iperf3"]),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        return dirs
+            .into_iter()
+            .filter(|d| d.is_absolute())
+            .map(|d| d.join("iperf3.exe"))
+            .find(|p| is_executable(p));
+    }
     for d in [
         "/opt/homebrew/bin",
         "/usr/local/bin",
@@ -81,6 +103,9 @@ pub fn find_iperf3() -> Option<PathBuf> {
 pub fn install_hint() -> &'static str {
     if cfg!(target_os = "macos") {
         "install it with `brew install iperf3`"
+    } else if cfg!(windows) {
+        "install it with `scoop install iperf3` or `choco install iperf3`, or put iperf3.exe \
+         on PATH"
     } else {
         "install it with your package manager, e.g. `sudo apt install iperf3` or `sudo dnf install iperf3`"
     }
@@ -119,7 +144,7 @@ pub async fn availability() -> IperfAvailability {
     };
     let out = tokio::time::timeout(
         Duration::from_secs(3),
-        Command::new(&path)
+        crate::platform::hide_console(&mut Command::new(&path))
             .arg("--version")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -406,7 +431,8 @@ pub async fn run_iperf(
                 .unwrap_or_else(|| format!("iperf3 is not available; {}", install_hint()))
         );
     };
-    let mut child = Command::new(path)
+    let mut cmd = Command::new(path);
+    let mut child = crate::platform::hide_console(&mut cmd)
         .args(build_args(ip, opts, avail.streaming))
         .env("LC_ALL", "C")
         .stdin(Stdio::null())

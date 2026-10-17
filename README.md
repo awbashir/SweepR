@@ -4,11 +4,11 @@
 
 **See everything on your network: every host, every VLAN, every switch port.**
 
-A fast IPv4/IPv6 network scanner for macOS and Linux, built for enterprise networks.
+A fast IPv4/IPv6 network scanner for macOS, Linux and Windows, built for enterprise networks.
 Live discovery, 802.1Q VLAN scanning, CDP/LLDP and SNMP infrastructure mapping, service
 discovery and a one-click security audit report, in a native desktop app and a scriptable CLI.
 
-[Install](#install) · [Features](#features) · [CLI usage](#cli-usage) · [Audit report](#audit-report) · [Building](#building)
+[Install](#install) · [Platform support](#platform-support) · [Features](#features) · [CLI usage](#cli-usage) · [Audit report](#audit-report) · [Build from source](#build-from-source-and-install-to-path)
 
 <img src="docs/images/devices-dark.png" alt="SweepR main window: 168 discovered devices with role, vendor and DNS name" width="100%">
 
@@ -47,58 +47,152 @@ discovery and a one-click security audit report, in a native desktop app and a s
 
 ## Install
 
-### macOS (disk image)
+SweepR is one self-contained binary, `sweepr` (`sweepr.exe` on Windows): the desktop app and
+the command-line tool in one file. Download it for your platform, check its SHA-256, and put
+it on your `PATH`.
 
-1. Download `SweepR_<version>_universal.dmg` (Apple Silicon and Intel) from the
-   [Releases](../../releases) page, or build it yourself (see [Building](#building)).
-2. Open the disk image and double-click **Install SweepR.command**. Terminal opens and asks
-   for your administrator password (`sudo`). The installer:
-   - copies **SweepR** and **SweepR (Administrator)** to `/Applications`,
-   - removes the download quarantine flag (the app is ad-hoc signed, not notarized),
-   - links the command-line tool to `/usr/local/bin/sweepr`,
-   - optionally gives your user read/write access to the packet-capture devices
-     (`/dev/bpf*`) at every boot, so passive VLAN / CDP / LLDP / DHCP listening works
-     without `sudo` (the same mechanism as Wireshark's *ChmodBPF*).
-3. Open **SweepR (Administrator)** for full scans. It asks for your password and starts
-   SweepR as root, which raw ARP, 802.1Q and IPv6 neighbor-discovery probes require.
-   Plain **SweepR** runs without root (ICMP sweep and neighbor cache only).
+- **Releases**: tagged versions are on the [Releases](../../releases) page.
+- **Latest build**: every pull request and push to `main` also builds all platforms. Open the
+  newest run of [Build binaries](../../actions/workflows/build-binaries.yml) (signed in to
+  GitHub) and download the archive from *Artifacts*; GitHub wraps each one in an extra zip.
 
-If macOS refuses to open the installer ("cannot be verified"), right-click it and choose
-**Open**, allow it under *System Settings → Privacy & Security*, or run it from Terminal:
+| Archive | For |
+| --- | --- |
+| `sweepr-<version>-macos-arm64.tar.gz` | macOS 11+ on Apple Silicon |
+| `sweepr-<version>-macos-universal.tar.gz` | macOS 11+ on Apple Silicon and Intel (one universal binary) |
+| `sweepr-<version>-linux-x86_64.tar.gz` | 64-bit Linux with glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 36+) |
+| `sweepr-<version>-linux-aarch64.tar.gz` | arm64 Linux with glibc 2.35+ |
+| `sweepr-<version>-windows-x86_64.zip` | Windows 10 / 11, x64 |
+
+Each archive holds the binary and an `INSTALL.txt` with the steps below. `SHA256SUMS` lists
+the checksum of every archive (each archive also has its own `.sha256` file):
 
 ```sh
-bash "/Volumes/SweepR 0.1.0/Install SweepR.command"           # asks about packet capture
-bash "/Volumes/SweepR 0.1.0/Install SweepR.command" --bpf     # grant it without asking
+sha256sum -c SHA256SUMS --ignore-missing        # Linux
+shasum -a 256 -c SHA256SUMS --ignore-missing    # macOS
 ```
 
-You can also drag the apps onto the *Applications* link in the disk image; then clear the
-quarantine flag yourself with `xattr -dr com.apple.quarantine /Applications/SweepR.app`.
-**Uninstall SweepR.command** removes the apps, the CLI link and the boot job (settings and
-hostname overrides are kept).
+```powershell
+# Windows: compare with the line for the zip in SHA256SUMS
+(Get-FileHash .\sweepr-0.1.0-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+```
 
-Files SweepR creates while running as root (exports, reports, the hostname-overrides store)
-are handed back to the user who started it (`SUDO_UID` / `SUDO_GID`), so they never end up
-owned by root in your home folder. This applies to `sudo sweepr ...` on Linux too.
+### macOS
+
+```sh
+tar -xzf sweepr-0.1.0-macos-arm64.tar.gz        # Intel Mac: sweepr-0.1.0-macos-universal.tar.gz
+cd sweepr-0.1.0-macos-arm64
+xattr -d com.apple.quarantine sweepr 2>/dev/null
+sudo install -m 755 sweepr /usr/local/bin/sweepr
+sweepr --version
+```
+
+- `macos-arm64` is a native Apple Silicon build. `macos-universal` holds Apple Silicon and
+  Intel code in one file (`lipo -info sweepr` shows both); use it on Intel Macs or when one
+  binary must serve both.
+- The binaries are ad-hoc signed, not notarized. A file downloaded with a browser carries the
+  quarantine flag, and macOS refuses to run it ("cannot be verified", "is damaged");
+  `xattr -d com.apple.quarantine sweepr` clears the flag (no output when there was none).
+- Without `sudo`: `mkdir -p ~/.local/bin && install -m 755 sweepr ~/.local/bin/sweepr`, and
+  add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`.
+- `sweepr` starts the desktop app; `sudo sweepr --gui` starts it with raw packet access, and
+  `sudo sweepr scan` scans from the terminal. See [Privileges](#privileges).
 
 ### Linux
 
-Build from source (see [Building](#building)): `npm run tauri:build` produces `.deb` and
-`.AppImage` packages. Run with `sudo`, or grant the binary raw-socket capabilities once:
-`sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/sweepr`.
+```sh
+sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libpcap0.8   # runtime libraries (Debian / Ubuntu)
+# Fedora: sudo dnf install webkit2gtk4.1 gtk3 libpcap
+tar -xzf sweepr-0.1.0-linux-x86_64.tar.gz
+sudo install -m 755 sweepr-0.1.0-linux-x86_64/sweepr /usr/local/bin/sweepr
+sudo setcap cap_net_raw,cap_net_admin=eip /usr/local/bin/sweepr   # raw scans without sudo
+sweepr --version
+```
+
+- The capabilities let `sweepr` (CLI and GUI) send raw ARP / 802.1Q / NDP frames and capture
+  without `sudo`. Replacing the file drops them: run `setcap` again after every update. The
+  alternative is `sudo sweepr scan ...` (a GUI started with `sudo` also needs access to your
+  display, so `setcap` is the better choice for the desktop app).
+- Without root for the copy: `install -m 755 .../sweepr ~/.local/bin/sweepr` (most
+  distributions put `~/.local/bin` on `PATH`). `setcap` still needs `sudo`, and the file
+  system must not be mounted `nosuid`.
+
+### Windows
+
+1. Install **Npcap** from [npcap.com](https://npcap.com) (the default options are fine;
+   "WinPcap API-compatible mode" is optional, SweepR loads Npcap from `System32\Npcap`
+   either way). It provides raw ARP, 802.1Q, IPv6 NDP and CDP / LLDP / DHCP capture.
+   Without it SweepR still runs and falls back to an ICMP sweep.
+2. Unzip the archive and put `sweepr.exe` on your user `PATH` (PowerShell, no administrator
+   rights needed):
+
+   ```powershell
+   Expand-Archive .\sweepr-0.1.0-windows-x86_64.zip -DestinationPath .
+   $dir = "$env:LOCALAPPDATA\Programs\SweepR"
+   New-Item -ItemType Directory -Force $dir | Out-Null
+   Copy-Item .\sweepr-0.1.0-windows-x86_64\sweepr.exe $dir
+   $path = [Environment]::GetEnvironmentVariable("Path", "User")
+   if (($path -split ";") -notcontains $dir) {
+     [Environment]::SetEnvironmentVariable("Path", "$path;$dir", "User")
+   }
+   ```
+
+   Open a new terminal and run `sweepr --version`. The same can be done in *Settings →
+   System → About → Advanced system settings → Environment Variables → Path*, or with
+   `setx PATH "%PATH%;%LOCALAPPDATA%\Programs\SweepR"` in `cmd` (careful: `setx` writes the
+   combined machine + user `PATH` into the user variable and truncates it at 1024 characters).
+3. The desktop app uses the Microsoft Edge **WebView2** runtime, which is part of Windows 11
+   and current Windows 10. If the window does not open, install the Evergreen runtime from
+   [Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/).
+4. Run `sweepr` (desktop app) or `sweepr scan` in a terminal. Interfaces carry their Windows
+   connection names: `sweepr interfaces`, `sweepr scan -i "Ethernet"`. If Npcap was installed
+   with *Restrict Npcap driver's access to Administrators only*, start SweepR from an
+   elevated terminal (*Run as administrator*).
+
+The executable is not code-signed: SmartScreen may show "Windows protected your PC" for a
+downloaded copy (*More info → Run anyway*, or `Unblock-File .\sweepr.exe`). Windows Defender
+Firewall may ask once whether `sweepr.exe` may receive discovery replies (SSDP, WS-Discovery,
+mDNS); allow it on private networks.
 
 ## How it runs
 
 The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`):
 
-- **GUI**: run it with no arguments, with `--gui`, or open the `.app`. This starts the Tauri
-  desktop app.
+- **GUI**: run it with no arguments or with `--gui`. This starts the Tauri desktop app. (On
+  Windows a start from Explorer or a shortcut closes the console window that comes with it; a
+  start from a terminal keeps the terminal attached for log output, `start sweepr` detaches.)
 - **CLI**: run it with a subcommand (`sweepr scan ...`). It scans in the terminal and exits.
+
+## Platform support
+
+Everything except raw layer-2 access works unprivileged on all three systems. The Windows
+build is compiled, unit-tested and smoke-tested in CI; raw capture through Npcap is not
+exercised there (the runners have no Npcap).
+
+| Feature | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| Desktop app | WKWebView | WebKitGTK 4.1 | WebView2 |
+| Interfaces, OS VLAN interfaces | `ifconfig` (`vlanN`) | `/proc/net/vlan` | connection names; NIC driver *VLAN ID* setting |
+| Raw ARP sweep | root | root or `CAP_NET_RAW` | Npcap |
+| 802.1Q tagged probing / tag discovery | root; NIC must pass tags | root / capabilities; NIC must pass tags | Npcap; best effort: many Windows NIC drivers strip VLAN tags on receive |
+| IPv6 NDP (`-6`) | root | root / capabilities | Npcap |
+| Passive capture: CDP, LLDP, VTP, DTP, DHCP fingerprints | root, or BPF access | root / capabilities | Npcap |
+| ICMP sweep, `ping`, latency monitor | unprivileged ICMP socket | `ping_group_range` or root | ICMP helper API, no elevation |
+| Traceroute (`trace`) | raw ICMP as root, else `traceroute` | raw ICMP with root / `CAP_NET_RAW`, else `traceroute` / `tracepath` | `tracert` (three probes per hop and round) |
+| Wake-on-LAN | yes (`IP_BOUND_IF`) | yes (`SO_BINDTODEVICE` with `CAP_NET_RAW`) | yes (`IP_UNICAST_IF`) |
+| SNMP, DNS / mDNS / NetBIOS, TCP ports, SSDP / WS-Discovery / SIP, web / TLS identity | yes | yes | yes |
+| iPerf3 | `iperf3` (Homebrew) | `iperf3` (package) | `iperf3.exe` (PATH, Scoop, Chocolatey) |
+| Reports and exports | yes | yes | yes (symbolic links and junctions refused) |
+| Files created under `sudo` handed back to the user | yes | yes | not applicable |
 
 ## Features
 
 - **Interfaces**: finds every interface and labels it Ethernet, Wi-Fi, 802.1Q
   sub-interface (`vlan0`, `en0.100`, `eth0.10`), VPN, bridge/virtual or loopback. The
-  default-route interface is marked.
+  default-route interface is marked. On Windows interfaces carry their connection name
+  (`Ethernet`, `Wi-Fi`, `vEthernet (WSL)`, case-insensitive with `-i`), the default route
+  comes from `route print`, and an adapter whose driver has a *VLAN ID* set counts as a VLAN
+  interface.
 - **Local IPv4 discovery**: sends broadcast ARP over the interface's connected subnet. Sending
   is rate-limited (`--rate-pps`), unanswered addresses get extra passes (`--retries`), and
   each result shows up as soon as it is found.
@@ -135,7 +229,7 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
   configuration cannot be read they are skipped (never sent to a public resolver).
   All enrichment and SNMP sockets share one process-wide budget sized from the open-file
   limit, which SweepR raises at startup toward `min(hard limit, 10240)` (macOS defaults to
-  256). A connect that still fails with "too many open files" is retried and, if it keeps
+  256; Windows has no such limit). A connect that still fails with "too many open files" is retried and, if it keeps
   failing, reported as unknown — never as closed.
 - **Role hints for quiet network gear** (`src/role_hints.rs`): small business switches
   (Cisco Business / Small Business CBS / SG, Ruijie Reyee, TP-Link JetStream, Netgear
@@ -223,10 +317,12 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
   - **Wake-on-LAN** (`sweepr wake`, GUI `wake_device`): sends the magic packet (6 x `0xFF`
     + the MAC 16 times, optional 6-byte SecureOn password) over UDP (port 9 by default) to
     the interface's subnet broadcast and `255.255.255.255`, from a socket bound to that
-    interface with `SO_BROADCAST`. `--broadcast` sends to one address instead (e.g. the
+    interface with `SO_BROADCAST` (and pinned to it with `IP_BOUND_IF` on macOS,
+    `IP_UNICAST_IF` on Windows). `--broadcast` sends to one address instead (e.g. the
     directed broadcast of a remote subnet).
   - **Latency monitor** (`sweepr ping`, GUI `start_latency_monitor`): pings hosts every
-    0.5-10 s with unprivileged ICMP / ICMPv6 and keeps the last 120 samples per host (last /
+    0.5-10 s with unprivileged ICMP / ICMPv6 (on Windows through the ICMP helper API,
+    `IcmpSendEcho`, which needs no elevation) and keeps the last 120 samples per host (last /
     avg / min / max / jitter / loss, plus a sparkline history). Hosts that never answer ICMP
     fall back to TCP connect round trips (SYN → SYN-ACK or RST) on a known open port or on
     443 / 80 / 8080 (never SSH / SMB by default, so authentication logs stay quiet). Port
@@ -236,8 +332,10 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
     best / worst latency over several rounds, with reverse-DNS hop names. As root (or with
     `CAP_NET_RAW`) it sends raw ICMP echo probes with increasing TTL; otherwise it runs the
     system tool once per round (`traceroute -n -q 1 -w 1 -m <max>`; macOS ships a setuid
-    `/usr/sbin/traceroute` / `traceroute6`, Linux needs `traceroute` or `tracepath`). Only IP
-    literals are accepted and arguments are never passed through a shell.
+    `/usr/sbin/traceroute` / `traceroute6`, Linux needs `traceroute` or `tracepath`). Windows
+    always uses `tracert -d -w 1000 -h <max>` (no elevation; three probes per hop and round,
+    `<1 ms` counts as 0.5 ms). Only IP literals are accepted and arguments are never passed
+    through a shell.
   - **Web identity** (`sweepr web`, GUI `grab_web_identity`, and automatically during scans
     for devices with 80 / 443 / 8443 / 8080 / 8000 / 10443 open; `--no-web` disables it):
     the HTML `<title>`, `Server` header and TLS certificate (subject / SANs / issuer /
@@ -254,11 +352,13 @@ The `sweepr` binary has two front-ends that share one Rust engine (`sweepr_core`
     plain hosts or carrying a low-confidence guess. Expired, soon-to-expire (< 30 days), not-yet-valid and self-signed
     certificates are listed in `warnings`.
   - **iPerf3** (`sweepr iperf`, GUI `start_iperf`): runs the installed `iperf3` client
-    (looked up on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`) with validated arguments
+    (looked up on `PATH`, `/opt/homebrew/bin`, `/usr/local/bin`; on Windows `iperf3.exe` on
+    `PATH` or in the Scoop / Chocolatey / winget shim folders) with validated arguments
     (IP literal, port, 1-60 s, 1-16 streams, TCP or UDP with a numeric bitrate) and reports
     per-second intervals and the summary (throughput, retransmits, UDP jitter / loss, CPU).
     iperf3 3.17+ streams intervals live (`--json-stream`); older versions report them at
-    the end. Without iperf3 it says how to install it (`brew install iperf3`).
+    the end. Without iperf3 it says how to install it (`brew install iperf3`, the distribution
+    package, or `scoop install iperf3` / `choco install iperf3` on Windows).
 
 ## CLI usage
 
@@ -320,6 +420,9 @@ sweepr web 10.0.0.10 -p 443,8006 -o json
 sweepr iperf 10.0.0.20 -t 10 -P 4
 sweepr iperf 10.0.0.20 -R --udp -b 100M
 ```
+
+On Windows run the same commands without `sudo` (raw access comes from Npcap) and name
+interfaces by connection name, e.g. `sweepr scan -i "Ethernet" --vlan 10,20`.
 
 `ping` exits with status 1 when a host never answered (and 130 after Ctrl-C, like the other
 commands). The SecureOn password for `wake --password` can also come from
@@ -398,8 +501,10 @@ PoE, ...) is picked up when present; malformed records are skipped and counted.
 Output files (`-o`, `scan --report`, and GUI saves) are never written through a symbolic
 link and only when the target is (or becomes) a regular file: an existing file is opened
 with `O_NOFOLLOW | O_NONBLOCK` and checked on the open descriptor before it is truncated, a
-new one is created with `O_EXCL`. `--logo` must be a regular PNG / JPEG file of at most 1 MiB
-(enforced while reading).
+new one is created with `O_EXCL`. On Windows the file is opened with
+`FILE_FLAG_OPEN_REPARSE_POINT` and refused when it is a symbolic link or junction (reparse
+point) or not a regular file, before anything is truncated. `--logo` must be a regular PNG /
+JPEG file of at most 1 MiB (enforced while reading).
 
 Rules (stable IDs, CWE / CIS Controls reference text, thresholds in the appendix): Telnet,
 FTP, TFTP, r-services, SMB / NetBIOS on infrastructure and broad SMB exposure, RDP, VNC,
@@ -435,90 +540,199 @@ for trying the report.
 
 ## Privileges
 
-Raw frames (ARP, 802.1Q tags, NDP) and passive capture (CDP, LLDP, VTP, DTP) need raw
+Raw frames (ARP, 802.1Q tags, NDP) and passive capture (CDP, LLDP, VTP, DTP, DHCP) need raw
 packet access.
 
-- **Linux**: run with `sudo`, or give the binary capabilities:
-  `sudo setcap cap_net_raw,cap_net_admin=eip ./sweepr`.
-- **macOS**: open **SweepR (Administrator)** (installed from the disk image; it asks for your
-  password and starts the GUI as root) or run `sudo sweepr ...` in Terminal. Giving your user
-  access to `/dev/bpf*` (the installer's optional packet-capture step, or Wireshark's
-  *ChmodBPF*) is enough for passive capture, but recent macOS versions hide interface MAC
-  addresses from unprivileged processes (`sweepr interfaces` then shows no MACs and says
-  so), and active ARP/802.1Q/NDP probes need the real MAC, so active layer-2 scans require
-  root.
+- **Linux**: run with `sudo`, or give the binary capabilities once (again after every
+  update): `sudo setcap cap_net_raw,cap_net_admin=eip "$(command -v sweepr)"`.
+- **macOS**: run `sudo sweepr ...` in Terminal (the desktop app: `sudo sweepr --gui`).
+  Giving your user access to `/dev/bpf*` (e.g. Wireshark's *ChmodBPF*) is enough for passive
+  capture, but recent macOS versions hide interface MAC addresses from unprivileged
+  processes (`sweepr interfaces` then shows no MACs and says so), and active ARP/802.1Q/NDP
+  probes need the real MAC, so active layer-2 scans require root.
+- **Windows**: install [Npcap](https://npcap.com). By default Npcap lets every user capture,
+  so no elevation is needed; if it was installed with *Restrict Npcap driver's access to
+  Administrators only*, run SweepR from an elevated terminal (*Run as administrator*). ICMP
+  (sweep, `ping`, latency monitor) and `tracert` never need elevation on Windows.
 
-Files created while running as root under `sudo` (or the administrator launcher) are given
-back to the invoking user (`SUDO_UID` / `SUDO_GID`); files that already existed keep their
-owner.
+Files created while running as root under `sudo` are given back to the invoking user
+(`SUDO_UID` / `SUDO_GID`); files that already existed keep their owner.
 
-Without these privileges SweepR does not stop. It prints a warning and falls back to an
+Without raw access SweepR does not stop. It prints a warning and falls back to an
 unprivileged ICMP sweep plus the OS neighbor cache, so hosts that block ICMP can be missed.
 Tagged VLAN probing, IPv6 NDP and passive listening are skipped. Routed ranges always use
 ICMP. On Linux, unprivileged ICMP needs `net.ipv4.ping_group_range` to include your group.
 
 The NIC and driver must pass 802.1Q tags through for tagged scanning and tag discovery to
 work. Capture is promiscuous, and libpcap re-inserts tags that Linux moves into packet
-metadata. Some NICs, especially on macOS, still strip tags in hardware.
+metadata. Some NICs, especially on macOS, still strip tags in hardware. On Windows most NIC
+drivers strip tags on receive unless VLAN offload (often *Priority & VLAN*) is disabled or the
+driver is configured for it (see the Npcap and NIC vendor documentation); tagged replies then
+cannot be attributed to their VLAN, and SweepR warns about it.
 
-## Building
+## Build from source and install to PATH
 
 You need:
 
-- Rust 1.90 or newer (`rustup`); this is the MSRV of Tauri 2.12 and its plugins
-- libpcap: ships with macOS. On Debian/Ubuntu, install `libpcap-dev`.
-- Tauri v2 system dependencies on Linux: `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
-  `librsvg2-dev`, `libayatana-appindicator3-dev`
-- Node.js 20 or newer for the React frontend
+- **Rust** 1.90 or newer (the MSRV of Tauri 2.12 and its plugins) from
+  [rustup](https://rustup.rs):
+  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`, then
+  `source "$HOME/.cargo/env"` (or open a new shell).
+- **Node.js** LTS for the React frontend; `npm test` runs the TypeScript tests natively and
+  needs Node 22.18 or newer.
+- **macOS**: the Xcode command-line tools (`xcode-select --install`); libpcap ships with
+  macOS.
+- **Linux** (Debian / Ubuntu): the Tauri v2 system libraries and libpcap:
+
+  ```sh
+  sudo apt install build-essential pkg-config libssl-dev libpcap-dev \
+    libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+  ```
+
+  Fedora: `sudo dnf install gcc pkgconf-pkg-config openssl-devel libpcap-devel
+  webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel librsvg2-devel`.
+- **Windows**: see [Windows](#building-on-windows) below.
+
+Build the frontend, then the release binary with the frontend embedded, and install it:
 
 ```sh
-# CLI / engine only (the frontend is not needed for cargo builds)
+git clone https://github.com/awbashir/SweepR.git
+cd SweepR
+npm ci
+npm run build                                     # React frontend -> dist/
 cd src-tauri
-cargo build --release
-./target/release/sweepr --help
-
-# Tests and lints
-cargo test
-cargo clippy --all-targets -- -D warnings
-
-# Desktop app (from the repository root)
-npm install
-npm run tauri:dev      # development
-npm run tauri:build    # .app/.dmg (macOS), .deb/.AppImage (Linux)
-
-# Run the GUI straight from cargo with the embedded frontend (no dev server):
-npm run build
-cd src-tauri && cargo run --features custom-protocol -- --gui
+cargo build --release --locked --features custom-protocol
+./target/release/sweepr --version
+sudo install -m 755 target/release/sweepr /usr/local/bin/sweepr   # or ~/.local/bin, no sudo
 ```
 
-### macOS installer disk image
-
-On a Mac with the prerequisites above (Xcode command-line tools included):
+Or let cargo build and install it in one step, from the repository root after
+`npm ci && npm run build`:
 
 ```sh
-npm install
-npm run dmg              # this Mac's architecture
-npm run dmg:universal    # Apple Silicon + Intel (adds the two Rust targets via rustup)
-# -> src-tauri/target/dmg/SweepR_<version>_<arch>.dmg
+cargo install --path src-tauri --locked --features custom-protocol   # -> ~/.cargo/bin/sweepr
 ```
 
-`packaging/macos/build-dmg.sh` builds the `.app` with Tauri, compiles the
-**SweepR (Administrator)** launcher (`admin-launcher.applescript`), adds the installer and
-uninstaller scripts and packs everything with `hdiutil`. The *macOS DMG* GitHub Actions
-workflow (`.github/workflows/macos-dmg.yml`) does the same on a macOS runner: pull requests
-that touch the app get the image as a workflow artifact, and pushing a `v*` tag (or running
-the workflow from the Actions tab with a `tag` such as `v0.1`) publishes it as a GitHub
-release, creating the tag if needed. The app is ad-hoc
-signed (`signingIdentity: "-"`); set Tauri's `APPLE_SIGNING_IDENTITY` / `APPLE_CERTIFICATE`
-environment variables to sign with a Developer ID instead.
+rustup puts `~/.cargo/bin` on `PATH`. After pulling changes, run `npm run build` again and
+repeat the command with `--force`. On Linux, add the capabilities from
+[Privileges](#privileges) to the installed file.
 
-Without `--features custom-protocol`, a debug binary loads `devUrl` (http://localhost:1420) and
-shows a blank window unless `npm run dev` is running. `tauri build` enables the feature for you.
+- **Build the frontend first.** `--features custom-protocol` embeds `dist/` into the binary
+  at compile time; a binary built without `npm run build` opens an empty window ("asset not
+  found: index.html"). `build.rs` rebuilds the binary whenever `dist/` changes.
+- Without `--features custom-protocol` the binary loads the Vite dev server
+  (http://localhost:1420) and shows a blank window unless `npm run dev` is running; that mode
+  is what `npm run tauri:dev` uses.
+- **Never build with `sudo cargo ...`.** It leaves root-owned files in `src-tauri/target/`
+  and `~/.cargo`, and every later build as your user fails with "Permission denied". Build
+  as yourself and use `sudo` only to install or run. To repair it:
+  `sudo chown -R "$(id -un)" src-tauri/target ~/.cargo`.
+- **`src-tauri/Cargo.lock` is committed and required.** `rust_xlsxwriter` depends on `zip`
+  8.x, whose releases are all yanked on crates.io, so only the locked version resolves.
+  Build with `--locked` and update dependencies one at a time (`cargo update -p <crate>`); a
+  bare `cargo update` fails until `rust_xlsxwriter` moves on.
+- `npm run tauri:build` does the same as the `cargo build` line (it runs `npm run build`
+  first). Bundling is off, so it produces only `src-tauri/target/release/sweepr`.
 
-`src-tauri/Cargo.lock` is committed and required: `rust_xlsxwriter` depends on `zip` 8.x,
-whose releases are all yanked on crates.io, so only the locked version resolves. Build with
-the lockfile (`cargo build --locked`) and update dependencies one at a time
-(`cargo update -p <crate>`); a bare `cargo update` fails until `rust_xlsxwriter` moves on.
+Development:
+
+```sh
+npm run tauri:dev                 # desktop app with hot reload (Vite dev server)
+npm run dev                       # frontend only, in a browser, with the built-in demo network
+npm test                          # frontend unit tests
+cd src-tauri
+cargo test --locked               # engine tests
+cargo clippy --all-targets -- -D warnings
+cargo run -- interfaces           # CLI from cargo
+cargo run --features custom-protocol -- --gui   # GUI with the embedded frontend (after npm run build)
+```
+
+### Universal macOS binary
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cd src-tauri
+cargo build --release --locked --features custom-protocol --target aarch64-apple-darwin
+cargo build --release --locked --features custom-protocol --target x86_64-apple-darwin
+lipo -create -output sweepr \
+  target/aarch64-apple-darwin/release/sweepr target/x86_64-apple-darwin/release/sweepr
+codesign --sign - --force sweepr   # ad-hoc signature (required to run on Apple Silicon)
+lipo -info sweepr                  # Architectures in the fat file: sweepr are: x86_64 arm64
+```
+
+### Building on Windows
+
+Install, once:
+
+1. **Visual Studio Build Tools** with the *Desktop development with C++* workload (MSVC
+   compiler and Windows SDK):
+   `winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`
+2. **Rust** with the MSVC toolchain (rustup's default on Windows):
+   `winget install Rustlang.Rustup`, then in a new terminal
+   `rustup default stable-x86_64-pc-windows-msvc`.
+3. **Node.js** LTS: `winget install OpenJS.NodeJS.LTS`.
+4. The **Npcap SDK** (import libraries `wpcap.lib` / `Packet.lib` for linking) from
+   [npcap.com](https://npcap.com/#download), e.g. `npcap-sdk-1.16.zip` unpacked to
+   `C:\npcap-sdk`.
+5. **Npcap** itself, to use the raw-capture features of the binary you build.
+
+Build in PowerShell:
+
+```powershell
+git clone https://github.com/awbashir/SweepR.git
+cd SweepR
+$env:LIBPCAP_LIBDIR = "C:\npcap-sdk\Lib\x64"   # Npcap SDK import libraries (x64)
+$env:LIBPCAP_VER = "1.10.5"                    # libpcap version Npcap is based on
+npm ci
+npm run build
+cd src-tauri
+cargo build --release --locked --features custom-protocol
+.\target\release\sweepr.exe --version
+```
+
+Then copy `target\release\sweepr.exe` to `%LOCALAPPDATA%\Programs\SweepR` and add that
+folder to `PATH` as in [Install → Windows](#windows), or run
+`cargo install --path . --locked --features custom-protocol` (to
+`%USERPROFILE%\.cargo\bin`, which rustup puts on `PATH`; keep the two variables set).
+`LIBPCAP_LIBDIR` puts the SDK folder on the linker search path (setting `LIB` works too);
+`LIBPCAP_VER` tells the `pcap` crate which libpcap APIs Npcap provides. `wpcap.dll` and
+`Packet.dll` are delay-loaded, so `sweepr.exe` starts on machines without Npcap and loads it
+from `System32\Npcap` on the first capture.
+
+## CI and releases
+
+[`.github/workflows/build-binaries.yml`](.github/workflows/build-binaries.yml) runs on pull
+requests, pushes to `main`, `v*` tags and manual runs:
+
+| Job | Runner | Binary |
+| --- | --- | --- |
+| `macos-arm64` | `macos-latest` (Apple Silicon) | `aarch64-apple-darwin`, ad-hoc signed |
+| `macos-universal` | `macos-latest` | `aarch64` + `x86_64` joined with `lipo`, ad-hoc signed |
+| `linux-x86_64` | `ubuntu-22.04` | `x86_64-unknown-linux-gnu`, glibc 2.35 baseline |
+| `linux-aarch64` | `ubuntu-22.04-arm` | `aarch64-unknown-linux-gnu`, glibc 2.35 baseline |
+| `windows-x86_64` | `windows-latest` | `x86_64-pc-windows-msvc`, linked against the Npcap SDK (download checksum-pinned) |
+
+Every job builds the frontend and the release binary
+(`cargo build --release --locked --features custom-protocol`), runs `cargo test --locked`
+(not repeated for the universal build), smoke-runs `sweepr --version`, `--help` and
+`interfaces`, and uploads `sweepr-<version>-<platform>` (archive + `.sha256`, built by
+`scripts/package-binary.sh`). A final job checks the checksums and uploads `SHA256SUMS`.
+
+To publish a release:
+
+1. Set the new version in `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json` and
+   `package.json`, run `cargo check` in `src-tauri` (it updates the version in
+   `Cargo.lock`, which `--locked` builds require), and commit.
+2. Tag the commit and push the tag:
+
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+The workflow then publishes the five archives and `SHA256SUMS` as the GitHub release
+"SweepR v0.2.0" with generated release notes. A tag that does not match the version in
+`Cargo.toml` fails the build. Alternatively run the workflow from the Actions tab with
+`release` set to the tag; the tag is then created on the commit that was built.
 
 ## Layout
 
@@ -550,14 +764,16 @@ src-tauri/
   src/iperf.rs     iperf3 client runner and JSON parsers
   src/jobs.rs      registry of running utility jobs (monitors, traces, iperf3 runs)
   src/owner.rs     hands files created under sudo back to the invoking user
+  src/icmp.rs      ICMP echo client (surge-ping; the ICMP helper API on Windows)
+  src/platform.rs  privilege checks, per-OS hints, console-less child processes, open flags
+  src/win.rs       Windows only: adapters, ICMP API, Npcap loading, elevation, NIC VLAN IDs
+  build.rs         embeds dist/, declares the IPC commands, delay-loads Npcap on Windows
   data/oui.tsv     embedded IEEE OUI database (generated by scripts/build_oui_db.py)
   data/dhcp_fingerprints.tsv  embedded DHCP signature table (best-effort heuristics)
-packaging/macos/
-  build-dmg.sh     builds the installer disk image (macOS only)
-  install.sh       "Install SweepR.command": sudo installer (apps, CLI link, BPF access)
-  uninstall.sh     "Uninstall SweepR.command"
-  admin-launcher.applescript  "SweepR (Administrator)": starts the GUI as root
-  ReadMe.txt       "Read Me.txt" shown in the disk image
+scripts/
+  build_oui_db.py  regenerates data/oui.tsv
+  package-binary.sh  packages a built binary: archive + INSTALL.txt + .sha256
+.github/workflows/build-binaries.yml  CI builds, tests, artifacts and releases
 docs/images/       README screenshots
 ```
 

@@ -1048,8 +1048,10 @@ impl ScanCollector {
 /// Open `path` for writing without following a symlink at the final component and only if
 /// it is (or will be) a regular file, without races: an existing file is opened with
 /// `O_NOFOLLOW | O_NONBLOCK` (a FIFO cannot block us), checked with `fstat` on the open
-/// descriptor and only then truncated; a new file is created with `O_EXCL | O_NOFOLLOW`. Used
-/// for GUI save-dialog paths and `sweepr scan --report` / `sweepr report -o`.
+/// descriptor and only then truncated; a new file is created with `O_EXCL | O_NOFOLLOW`. On
+/// Windows `FILE_FLAG_OPEN_REPARSE_POINT` opens a symbolic link or junction itself, which is
+/// then refused (reparse point) before anything is truncated. Used for GUI save-dialog paths
+/// and `sweepr scan --report` / `sweepr report -o`.
 fn open_regular_no_follow(path: &Path) -> Result<File> {
     for _ in 0..3 {
         let mut opts = OpenOptions::new();
@@ -1059,11 +1061,23 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.custom_flags(crate::platform::FILE_FLAG_OPEN_REPARSE_POINT);
+        }
         match opts.open(path) {
             Ok(file) => {
                 let meta = file
                     .metadata()
                     .with_context(|| format!("cannot inspect {}", path.display()))?;
+                #[cfg(windows)]
+                if crate::platform::is_reparse_point(&meta) {
+                    bail!(
+                        "refusing to write {}: it is a symbolic link or junction",
+                        path.display()
+                    );
+                }
                 if !meta.is_file() {
                     bail!("refusing to write {}: not a regular file", path.display());
                 }
@@ -1078,6 +1092,11 @@ fn open_regular_no_follow(path: &Path) -> Result<File> {
                 {
                     use std::os::unix::fs::OpenOptionsExt;
                     create.custom_flags(libc::O_NOFOLLOW);
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    create.custom_flags(crate::platform::FILE_FLAG_OPEN_REPARSE_POINT);
                 }
                 match create.open(path) {
                     Ok(f) => {
@@ -1460,6 +1479,31 @@ mod tests {
             std::os::unix::fs::symlink(dir.join("target.html"), &dangling).unwrap();
             assert!(write_file_no_follow(&dangling, b"x").is_err());
             assert!(!dir.join("target.html").exists());
+        }
+        // Windows: symbolic links need Developer Mode or Administrator rights (CI runners
+        // have them); when one can be created, writing through it is refused.
+        #[cfg(windows)]
+        {
+            let link = dir.join("link.html");
+            if std::os::windows::fs::symlink_file(&ok, &link).is_ok() {
+                assert!(write_to_chosen_path(b"x", ReportFormat::Html, &link).is_err());
+                assert_eq!(std::fs::read(&ok).unwrap(), b"<html>");
+                let dangling = dir.join("dangling.html");
+                std::os::windows::fs::symlink_file(dir.join("target.html"), &dangling).unwrap();
+                assert!(write_file_no_follow(&dangling, b"x").is_err());
+                assert!(!dir.join("target.html").exists());
+                let export_link = dir.join("link.csv");
+                std::os::windows::fs::symlink_file(&ok, &export_link).unwrap();
+                assert!(crate::export::export_to_chosen_path(
+                    &[],
+                    crate::export::ExportFormat::Csv,
+                    &export_link
+                )
+                .is_err());
+                assert_eq!(std::fs::read(&ok).unwrap(), b"<html>");
+            }
+            // Reserved device names are not regular files.
+            assert!(write_file_no_follow(Path::new(r"\\.\NUL"), b"x").is_err());
         }
         // Overwriting an existing regular file truncates it.
         write_file_no_follow(&ok, b"<p>").unwrap();

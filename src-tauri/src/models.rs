@@ -1952,6 +1952,15 @@ pub struct ScanSummary {
 }
 
 /// This machine's host name (sanitized), for report metadata.
+#[cfg(windows)]
+pub fn local_hostname() -> Option<String> {
+    crate::win::computer_name()
+        .map(|n| sanitize_text(&n))
+        .filter(|n| !n.is_empty())
+}
+
+/// This machine's host name (sanitized), for report metadata.
+#[cfg(not(windows))]
 pub fn local_hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is valid for `buf.len()` bytes; gethostname NUL-terminates on success
@@ -2155,9 +2164,10 @@ pub struct LatencyUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceMethod {
-    /// Raw ICMP echo probes with increasing TTL (needs root / CAP_NET_RAW).
+    /// Raw ICMP echo probes with increasing TTL (needs root / CAP_NET_RAW; not on Windows).
     Raw,
-    /// The system `traceroute` / `traceroute6` / `tracepath` binary, run once per round.
+    /// The system `traceroute` / `traceroute6` / `tracepath` binary (Windows: `tracert`), run
+    /// once per round.
     System,
 }
 
